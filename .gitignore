@@ -1,0 +1,23 @@
+# Dependencies.
+# No trailing slash: `node_modules/` matches a directory but not a *symlink* to
+# one, which is how a symlink pointing at an absolute path on one machine can
+# end up committed.
+node_modules
+
+# Build output
+dist/
+src-tauri/target/
+*.dmg
+
+# macOS
+.DS_Store
+
+# Local env — never commit secrets
+.env
+.env.local
+
+# Swift helper binary — rebuilt automatically by `npm run dev` / `npm run build`
+overlay-helper/voicedumps-overlay
+
+# Speech models — fetched with scripts/fetch-models.sh, too large for git
+models/

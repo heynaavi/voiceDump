@@ -1,0 +1,83 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "VoiceDumps",
+  "version": "0.1.0",
+  "identifier": "dev.heynaavi.voicedump",
+  "build": {
+    "beforeDevCommand": "npm run dev:vite",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "VoiceDumps",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 720,
+        "minHeight": 520,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "dragDropEnabled": true
+      },
+      {
+        "label": "overlay",
+        "title": "VoiceDumps Dictation",
+        "url": "index.html?overlay=1",
+        "width": 260,
+        "height": 60,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "acceptFirstMouse": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": [
+            "**"
+          ],
+          "requireLiteralLeadingDot": false
+        }
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../overlay-helper/voicedumps-overlay": "voicedumps-overlay",
+      "../models/ggml-small-q5_1.bin": "models/ggml-small-q5_1.bin",
+      "../models/ggml-medium-q5_0.bin": "models/ggml-medium-q5_0.bin",
+      "../src/assets/fonts/SpaceGrotesk.ttf": "fonts/SpaceGrotesk.ttf",
+      "../src/assets/fonts/JetBrainsMono.ttf": "fonts/JetBrainsMono.ttf"
+    },
+    "macOS": {
+      "signingIdentity": "-",
+      "entitlements": "Entitlements.plist"
+    },
+    "shortDescription": "Local speech to text",
+    "longDescription": "Transcribe audio and video, record from the microphone, and dictate anywhere with the globe key. Everything runs on your Mac \u2014 nothing is uploaded, and there is nothing to sign in to.",
+    "copyright": "Naveen",
+    "category": "Productivity"
+  }
+}

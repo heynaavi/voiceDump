@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the signed app.
+
+  The bundle is ad-hoc signed (see bundle.macOS.signingIdentity). Signing at all
+  is what makes Accessibility stick: macOS identifies an app to TCC by its code
+  signature, and an unsigned bundle has no identity to record a grant against,
+  so the permission is asked for again on every launch and the globe-key event
+  tap never receives an event.
+
+  Signing may bring the hardened runtime with it, and under the hardened runtime
+  microphone access needs an explicit entitlement — without this file, granting
+  the permission would stop being enough and recording would fail. There is
+  deliberately no app-sandbox key: the app reads media the user points it at and
+  writes to its own Application Support directory.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

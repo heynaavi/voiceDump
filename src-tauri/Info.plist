@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Merged into the bundled app's Info.plist by Tauri.
+
+  macOS refuses microphone access outright — no prompt, just a denial — unless
+  the executable declares why it wants it. Recording therefore only works from a
+  bundled build (`npm run tauri build`); under `tauri dev` the raw binary has no
+  Info.plist to read.
+-->
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>VoiceDumps records audio from your microphone so it can transcribe it on this Mac. Nothing is uploaded.</string>
+</dict>
+</plist>
