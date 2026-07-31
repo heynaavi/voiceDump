@@ -46,9 +46,20 @@ if (outTime !== null && outTime >= srcTime) {
   process.exit(0); // up to date
 }
 
+// Pin the deployment target instead of inheriting whichever SDK happens to be
+// installed. Left unpinned, swiftc stamps the *build machine's* macOS version
+// into the binary, so a release cut on a new OS ships a helper that claims to
+// require it. Nothing enforces that claim — dyld ignores a future minos on a
+// main executable — but the real value is the compile-time check: Swift refuses
+// to build against an API newer than the target, so this line is what stops
+// someone quietly using a macOS 26-only call and breaking older Macs silently.
+// 11.0 is the floor because that is what the first Apple Silicon Mac shipped
+// with, and the app is arm64-only.
+const TARGET = "arm64-apple-macos11.0";
+
 console.log("[overlay] compiling dictation overlay…");
 try {
-  execFileSync("swiftc", ["-O", ...sources, "-o", out], { stdio: "inherit" });
+  execFileSync("swiftc", ["-O", "-target", TARGET, ...sources, "-o", out], { stdio: "inherit" });
   console.log("[overlay] built overlay-helper/voicedumps-overlay");
 } catch (err) {
   // Don't take the whole dev server down: everything except the floating pill
