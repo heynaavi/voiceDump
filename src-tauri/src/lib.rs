@@ -338,6 +338,11 @@ pub fn run() {
                 eprintln!("[tray] could not install: {e}");
             }
 
+            // …which is precisely why the model has to be given back when it
+            // isn't in use: living in the menu bar means "not quitting" is the
+            // normal state, so a model held until quit is a model held all day.
+            engine::start_idle_unload(app.handle().clone());
+
             // Off the main thread so the window paints immediately.
             let handle = app.handle().clone();
             std::thread::spawn(move || {

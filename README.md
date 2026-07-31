@@ -302,6 +302,16 @@ skipped when it is not; transcription never depends on it.
 Nothing is transmitted. There is no telemetry, no crash reporting and no update
 check in this build.
 
+**Memory is given back.** The model loads on first use, not at launch, and is
+released after five idle minutes — measured on an M1 Pro, that returns 512 MB of
+the 578 MB `medium` costs. This matters because the app lives in the menu bar:
+closing the window deliberately keeps the globe key alive, so "not quitting" is
+the normal state, and a model held until quit is a model held all day.
+
+Reloading costs ~560 ms and is free in practice, because dictation warms the
+model on key *down* — the reload happens while you are still speaking. Set
+`VOICEDUMPS_IDLE_UNLOAD_SECS=0` if you would rather spend the memory.
+
 </details>
 
 <details>
@@ -313,6 +323,7 @@ check in this build.
 | --- | --- |
 | `VOICEDUMPS_MODEL_SIZE` | `small` or `medium`, overriding the memory-based choice |
 | `VOICEDUMPS_MODEL_DIR` | Where to find the weights, ahead of the bundled resources |
+| `VOICEDUMPS_IDLE_UNLOAD_SECS` | Seconds of disuse before the model is released. Default `300`; `0` keeps it loaded forever |
 | `TEST_AUDIO` | Audio file for the engine tests and `scripts/bench.sh` |
 
 </details>
@@ -329,17 +340,14 @@ The interesting ones need real inputs and skip loudly without them:
 | --- | --- |
 | `transcribes_real_audio` | A file decodes and transcribes with no Python and no `ffmpeg` in the path |
 | `exits_cleanly_with_a_model_loaded` | Quitting with a model resident does not abort |
+| `idle_policy` | A model in active use is never collected; `0` disables collection |
+| `reaper_frees_a_live_model_off_thread` | Freeing a live Metal context from a worker thread doesn't abort, the memory actually returns, and the engine still reloads. `#[ignore]`d — needs the weights |
 | `benchmark_latency` | The numbers above. `#[ignore]`d — it is a measurement, not an assertion |
 
 ## Known gaps
 
 Stated plainly, because a README that only lists wins is not worth reading:
 
-- **The model is not released while the app idles.** It loads on demand and stays
-  resident until quit — roughly 600 MB for `medium`. `engine_unload` exists and
-  works, but nothing calls it on an idle timer yet, so a menu-bar app that sits
-  on 600 MB all day is currently exactly what this is. Fixing it is the next
-  thing worth doing.
 - **Apple Silicon only.** The arm64 build does not run on Intel Macs, and Windows
   and Linux are not supported.
 - **No licence yet.** There is no `LICENSE` file in this repo, which means the
@@ -348,7 +356,6 @@ Stated plainly, because a README that only lists wins is not worth reading:
 
 ## Roadmap
 
-- Release the model after an idle period, rather than at quit
 - Watch a folder for auto-transcription
 - Local audio enhancement — podcast-grade cleanup, tunable
 

@@ -160,6 +160,11 @@ pub struct IngestProgress {
 #[derive(Default)]
 pub struct EngineState {
     inner: Mutex<Option<Loaded>>,
+    /// When the model was last wanted. `None` means never.
+    ///
+    /// Always locked *after* `inner`, everywhere, so the reaper and a running
+    /// transcription can't deadlock against each other.
+    last_use: Mutex<Option<std::time::Instant>>,
 }
 
 struct Loaded {
@@ -175,6 +180,79 @@ impl EngineState {
     pub fn loaded_size(&self) -> Option<ModelSize> {
         self.inner.lock().unwrap().as_ref().map(|l| l.size)
     }
+
+    /// Mark the model as wanted right now, resetting the idle clock.
+    fn touch(&self) {
+        *self.last_use.lock().unwrap() = Some(std::time::Instant::now());
+    }
+}
+
+/// How long the model may sit unused before it is dropped.
+///
+/// Overridable mainly so the test below doesn't have to wait five minutes;
+/// `0` disables the reaper entirely for anyone who would rather spend the
+/// memory than ever wait.
+fn idle_timeout() -> Option<std::time::Duration> {
+    let secs = std::env::var("VOICEDUMPS_IDLE_UNLOAD_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Drop the model once nobody has used it for a while.
+///
+/// A loaded medium model is ~590 MB resident (measured — see
+/// `benchmark_latency`), and this is a menu-bar app: closing the window keeps
+/// the globe key alive, so without this the memory is held from the first
+/// dictation until quit. One dictation at 9am used to cost 590 MB all day.
+///
+/// It is nearly free to give back. Reloading costs ~560 ms, and dictation warms
+/// the model on key *down* — so the reload overlaps with the user still
+/// speaking, exactly like a first-ever cold load does. The only case that pays
+/// for it is a sub-second utterance that is also the first one after an idle
+/// spell.
+///
+/// Safety comes from taking the same lock `run` holds for the entire length of
+/// a transcription: the reaper simply blocks until the work is finished, so it
+/// can never drop a context out from under whisper. The idle check happens
+/// *after* the lock is acquired, so it can't act on a stale reading either.
+pub fn start_idle_unload(app: tauri::AppHandle) {
+    use tauri::Manager;
+
+    let Some(timeout) = idle_timeout() else {
+        return;
+    };
+    // Poll rather than schedule: an unused model costing a few extra seconds of
+    // residency is not worth a timer that has to be cancelled and rearmed on
+    // every dictation.
+    let tick = (timeout / 4).clamp(
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(30),
+    );
+
+    std::thread::spawn(move || loop {
+        std::thread::sleep(tick);
+
+        let state = app.state::<EngineState>();
+        let mut guard = state.inner.lock().unwrap();
+        if guard.is_none() {
+            continue;
+        }
+        let idle_for = state
+            .last_use
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed())
+            .unwrap_or(timeout);
+        if idle_for >= timeout {
+            *guard = None;
+            eprintln!(
+                "[engine] model released after {}s idle",
+                idle_for.as_secs()
+            );
+        }
+    });
 }
 
 /// Put `wanted` in the slot, loading it only if what's there isn't already it.
@@ -445,6 +523,7 @@ pub fn transcribe(
     report("Loading model", 0.12);
     let mut guard = state.inner.lock().unwrap();
     ensure_loaded(app, &mut guard, wanted)?;
+    state.touch();
     let loaded = guard.as_ref().expect("model just loaded");
 
     report("Transcribing", 0.2);
@@ -507,6 +586,10 @@ pub fn transcribe(
             0.2 + 0.75 * ((i + 1) as f64 / n.max(1) as f64),
         );
     }
+    // Again on the way out: a long file can transcribe for minutes, and dating
+    // the model's last use from when the job *started* would make an hour-long
+    // recording look idle the moment it finished.
+    state.touch();
     drop(guard);
 
     let paragraphs = build_paragraphs(&segments);
@@ -734,6 +817,124 @@ mod tests {
             .join(" ");
         eprintln!("TRANSCRIPT: {}", text.trim());
         assert!(!text.trim().is_empty(), "empty transcript");
+    }
+
+    /// The idle policy itself, without needing a Tauri app or the weights.
+    ///
+    /// `start_idle_unload` needs an AppHandle, so what is checked here is the
+    /// decision it makes — the timeout parse and the "has it been idle long
+    /// enough" comparison — plus the guarantee that matters most: a touch
+    /// resets the clock, so a model in active use is never collected.
+    #[test]
+    fn idle_policy() {
+        use std::time::{Duration, Instant};
+
+        // Default is five minutes; 0 means never.
+        std::env::remove_var("VOICEDUMPS_IDLE_UNLOAD_SECS");
+        assert_eq!(idle_timeout(), Some(Duration::from_secs(300)));
+        std::env::set_var("VOICEDUMPS_IDLE_UNLOAD_SECS", "0");
+        assert_eq!(idle_timeout(), None, "0 must disable the reaper entirely");
+        std::env::set_var("VOICEDUMPS_IDLE_UNLOAD_SECS", "45");
+        assert_eq!(idle_timeout(), Some(Duration::from_secs(45)));
+        std::env::remove_var("VOICEDUMPS_IDLE_UNLOAD_SECS");
+
+        let state = EngineState::default();
+        // Never used: `last_use` is None, which the reaper treats as "idle for
+        // at least the timeout" so a model loaded and then abandoned still goes.
+        assert!(state.last_use.lock().unwrap().is_none());
+
+        state.touch();
+        let after_touch = state.last_use.lock().unwrap().expect("touched");
+        assert!(
+            after_touch.elapsed() < Duration::from_secs(1),
+            "touch must reset the idle clock"
+        );
+
+        // The comparison the reaper makes, against a deliberately stale clock.
+        let timeout = Duration::from_millis(50);
+        *state.last_use.lock().unwrap() = Some(Instant::now() - Duration::from_secs(60));
+        let idle_for = state.last_use.lock().unwrap().map(|t| t.elapsed()).unwrap();
+        assert!(idle_for >= timeout, "a stale model must be collectable");
+
+        state.touch();
+        let fresh = state.last_use.lock().unwrap().map(|t| t.elapsed()).unwrap();
+        assert!(fresh < timeout, "a just-used model must survive");
+    }
+
+    /// The reaper drops a real model from a background thread.
+    ///
+    /// This is the part that could actually break. A `WhisperContext` owns
+    /// Metal buffers and residency sets, and the existing `unload` is only ever
+    /// called from the run-event thread on quit. Freeing one from a worker
+    /// thread instead is what the idle reaper does on every collection, so it
+    /// is worth proving rather than assuming — a ggml assertion here would
+    /// abort the process and read to the user as a random crash while the app
+    /// sat untouched in the menu bar.
+    ///
+    /// Ignored by default: it needs the weights.
+    #[test]
+    #[ignore = "needs VOICEDUMPS_MODEL_DIR"]
+    fn reaper_frees_a_live_model_off_thread() {
+        let Ok(models) = std::env::var("VOICEDUMPS_MODEL_DIR") else {
+            eprintln!("skipping: set VOICEDUMPS_MODEL_DIR");
+            return;
+        };
+        // Measure whatever this machine would actually run, so the numbers
+        // describe the real saving rather than the cheapest case.
+        let want = auto_model();
+        let file = match want {
+            ModelSize::Medium => format!("{models}/ggml-medium-q5_0.bin"),
+            ModelSize::Small => format!("{models}/ggml-small-q5_1.bin"),
+        };
+        println!("model: {}", want.label());
+
+        let before = rss_mb();
+        let state = std::sync::Arc::new(EngineState::default());
+        *state.inner.lock().unwrap() = Some(Loaded {
+            size: want,
+            ctx: WhisperContext::new_with_params(&file, WhisperContextParameters::default())
+                .expect("load"),
+        });
+        assert!(state.inner.lock().unwrap().is_some());
+        let loaded = rss_mb();
+
+        // Exactly what the reaper does, on exactly the kind of thread it does
+        // it on.
+        let s = state.clone();
+        std::thread::spawn(move || {
+            let mut guard = s.inner.lock().unwrap();
+            *guard = None;
+        })
+        .join()
+        .expect("the reaper thread must not panic or abort");
+
+        assert!(
+            state.inner.lock().unwrap().is_none(),
+            "the model should be gone"
+        );
+
+        // The point of the whole feature: the memory has to come back, not just
+        // the Rust value.
+        let freed = rss_mb();
+        println!(
+            "rss  before {before:.0} MB -> loaded {loaded:.0} MB -> after collection {freed:.0} MB \
+             (returned {:.0} MB of {:.0} MB)",
+            loaded - freed,
+            loaded - before
+        );
+        assert!(
+            freed < before + (loaded - before) * 0.5,
+            "collection must return most of the model's memory, not just drop the handle"
+        );
+
+        // And the slot is reusable afterwards — an idle collection must not
+        // leave the engine permanently broken.
+        *state.inner.lock().unwrap() = Some(Loaded {
+            size: want,
+            ctx: WhisperContext::new_with_params(&file, WhisperContextParameters::default())
+                .expect("reload after collection"),
+        });
+        assert!(state.inner.lock().unwrap().is_some());
     }
 
     /// Quitting with a model loaded must not abort.
