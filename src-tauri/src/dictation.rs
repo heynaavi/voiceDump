@@ -426,6 +426,89 @@ fn stop(app: &tauri::AppHandle) {
     });
 }
 
+/// The app the dictated text is about to land in.
+///
+/// Read from the window list rather than `NSWorkspace`, because the window list
+/// is already a core-graphics dependency and gives the answer in one call. Only
+/// `kCGWindowOwnerName` is used: window *titles* would need Screen Recording
+/// permission, and asking for that to draw a chart would be a poor trade — the
+/// owner name has never needed it.
+///
+/// The list comes back front-to-back, so the first layer-0 window is the
+/// frontmost ordinary one. Higher layers are menu-bar extras, the Dock and our
+/// own dictation pill, none of which are where anyone is typing.
+#[cfg(target_os = "macos")]
+fn frontmost_app() -> Option<String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_graphics::window::{
+        copy_window_info, kCGNullWindowID, kCGWindowLayer, kCGWindowListExcludeDesktopElements,
+        kCGWindowListOptionOnScreenOnly, kCGWindowOwnerName,
+    };
+
+    let windows = copy_window_info(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID,
+    )?;
+
+    for i in 0..windows.len() {
+        let raw = *windows.get(i)?;
+        let dict: CFDictionary = unsafe { CFDictionary::wrap_under_get_rule(raw as _) };
+
+        let layer = dict
+            .find(unsafe { kCGWindowLayer } as *const _)
+            .map(|v| unsafe { CFNumber::wrap_under_get_rule(*v as _) })
+            .and_then(|n| n.to_i64())
+            .unwrap_or(-1);
+        if layer != 0 {
+            continue;
+        }
+
+        let name = dict
+            .find(unsafe { kCGWindowOwnerName } as *const _)
+            .map(|v| unsafe { CFString::wrap_under_get_rule(*v as _) })
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        // Skip ourselves: if our window happens to be front the user is
+        // dictating into the app itself, which is worth recording as such,
+        // but an empty name tells us nothing.
+        if name.is_empty() {
+            continue;
+        }
+        return Some(name);
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn frontmost_app() -> Option<String> {
+    None
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod app_name_tests {
+    /// Exercises the raw CoreFoundation casts in `frontmost_app`.
+    ///
+    /// The point is the unsafe block, not the answer: a wrong `wrap_under_*`
+    /// rule or a bad pointer cast shows up as a crash or an over-release, and
+    /// this runs it for real against the live window server. The returned name
+    /// depends on whatever is on screen, so it is printed rather than asserted.
+    #[test]
+    fn reading_the_frontmost_app_is_memory_safe() {
+        for _ in 0..50 {
+            let name = super::frontmost_app();
+            assert!(
+                name.as_deref() != Some(""),
+                "empty names must be skipped, not returned"
+            );
+        }
+        println!("frontmost app: {:?}", super::frontmost_app());
+    }
+}
+
 fn finish(app: &tauri::AppHandle, cap: Capture) -> Result<(), String> {
     let path = stop_capture(cap)?;
 
@@ -442,6 +525,11 @@ fn finish(app: &tauri::AppHandle, cap: Capture) -> Result<(), String> {
         // Nothing said. Don't paste an empty string over a selection.
         return Err("no speech detected".into());
     }
+
+    // Read before pasting: the paste synthesises ⌘V, and if anything about that
+    // shifts focus we'd be recording where the text went afterwards rather than
+    // where it was aimed.
+    let target = frontmost_app();
 
     paste(&text)?;
 
@@ -460,6 +548,15 @@ fn finish(app: &tauri::AppHandle, cap: Capture) -> Result<(), String> {
     )?;
 
     // Scratch capture; the library holds the normalised copy now.
+    if let Some(name) = target {
+        use tauri::Manager;
+        let store = app.state::<crate::store::Store>();
+        let conn = store.0.lock().unwrap();
+        // Best-effort: the note is already saved, and losing the app label is
+        // not worth failing a dictation over.
+        let _ = crate::store::set_app_name(&conn, &id, &name);
+    }
+
     let _ = std::fs::remove_file(&path);
 
     let _ = app.emit("ingest-done", id);

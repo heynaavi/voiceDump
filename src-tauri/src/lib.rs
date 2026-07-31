@@ -1,3 +1,4 @@
+mod analytics;
 mod background;
 #[cfg(target_os = "macos")]
 mod dictation;
@@ -411,5 +412,6 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         delete_transcript,
         write_text_file,
         save_recording,
+        analytics::analytics_summary,
     ]
 }

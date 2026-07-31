@@ -17,6 +17,8 @@ type Props = {
   ingest: IngestProgress | null;
   /** Ids the AI is currently generating a title for. */
   namingIds: Set<string>;
+  insightsOpen: boolean;
+  onInsights: () => void;
 };
 
 /**
@@ -53,6 +55,8 @@ export function Sidebar({
   onNew,
   ingest,
   namingIds,
+  insightsOpen,
+  onInsights,
 }: Props) {
   const [tab, setTab] = useState<TabKey>("all");
   const { theme, toggle } = useTheme();
@@ -134,6 +138,21 @@ export function Sidebar({
           <span className="micro text-surface transition-colors group-hover:text-ink">
             NEW TRANSCRIPTION
           </span>
+        </button>
+
+        {/* Insights sits with the actions rather than in the list: it describes
+            the whole history, so it isn't one more row to scroll past. */}
+        <button
+          onClick={onInsights}
+          aria-pressed={insightsOpen}
+          className={`mt-2 flex w-full items-center gap-2 border px-3 py-2 text-left transition-colors ${
+            insightsOpen
+              ? "border-sage-dim bg-sage-dim/15 text-ink"
+              : "border-hairline text-grey hover:border-sage-dim hover:text-ink"
+          }`}
+        >
+          <PixelCluster pattern={CLUSTERS.search} size={3} />
+          <span className="micro">INSIGHTS</span>
         </button>
 
         <label className="mt-3 flex items-center gap-2 border border-hairline bg-panel px-2.5 py-1.5 focus-within:border-sage-dim">

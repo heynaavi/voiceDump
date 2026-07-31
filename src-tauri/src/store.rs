@@ -114,6 +114,17 @@ pub fn open(dir: &PathBuf) -> rusqlite::Result<Connection> {
     )
     .ok();
 
+    // Which app had focus when a dictation was spoken — the one number that
+    // turns "you dictated 4,000 words" into something worth knowing. Only the
+    // hotkey path fills it; everything else stays empty rather than guessing,
+    // and Insights reports the blanks instead of quietly dropping them.
+    conn.execute(
+        "ALTER TABLE transcripts ADD COLUMN app_name TEXT NOT NULL DEFAULT ''",
+        [],
+    )
+    .ok();
+
+
     Ok(conn)
 }
 
@@ -262,6 +273,19 @@ pub fn set_peaks(
     conn.execute(
         "UPDATE transcripts SET peaks = ?2 WHERE id = ?1",
         params![id, peaks.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Record which app was focused when this note was dictated.
+///
+/// Set separately from `insert` rather than threaded through it: only the
+/// hotkey path has an answer, and `insert` already carries eleven arguments
+/// shared by four call sites that would all have to pass `None`.
+pub fn set_app_name(conn: &Connection, id: &str, app: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE transcripts SET app_name = ?2 WHERE id = ?1",
+        params![id, app],
     )?;
     Ok(())
 }

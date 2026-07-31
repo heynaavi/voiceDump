@@ -220,3 +220,59 @@ export async function deleteTranscript(id: string): Promise<void> {
 export async function writeTextFile(path: string, contents: string): Promise<void> {
   return invoke("write_text_file", { path, contents });
 }
+
+// -- insights ---------------------------------------------------------------
+
+/** One row of a grouped breakdown (by app, by source, by language). */
+export type Count = {
+  label: string;
+  notes: number;
+  words: number;
+  seconds: number;
+};
+
+export type DayCount = { date: string; notes: number; words: number };
+
+/** Named `WordCount` because `Word` above is already a transcript word. */
+export type WordCount = { word: string; count: number };
+
+export type Vocabulary = {
+  unique_words: number;
+  total_words: number;
+  variety: number;
+  top_words: WordCount[];
+  fillers: WordCount[];
+  filler_rate: number;
+  avg_sentence_words: number;
+  longest_sentence_words: number;
+};
+
+export type Speaking = {
+  words_per_minute: number;
+  /** Audio the rate was computed from. Small samples make the rate a rumour. */
+  sample_seconds: number;
+  sample_notes: number;
+};
+
+export type Insights = {
+  total_notes: number;
+  total_words: number;
+  total_seconds: number;
+  first_day: string | null;
+  last_day: string | null;
+  speaking: Speaking;
+  by_day: DayCount[];
+  current_streak: number;
+  longest_streak: number;
+  by_hour: number[];
+  by_source: Count[];
+  by_app: Count[];
+  /** Dictations with no recorded app — pre-dating capture, or unreadable. */
+  app_unknown: number;
+  by_language: Count[];
+  vocabulary: Vocabulary;
+};
+
+export async function analyticsSummary(): Promise<Insights> {
+  return invoke("analytics_summary");
+}

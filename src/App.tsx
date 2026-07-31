@@ -27,6 +27,7 @@ import {
 } from "./lib/format";
 
 import { DictationPill } from "./components/DictationPill";
+import { Insights } from "./components/Insights";
 import { DropZone } from "./components/DropZone";
 import { JobProgress } from "./components/JobProgress";
 import { Sidebar } from "./components/Sidebar";
@@ -44,6 +45,9 @@ export default function App() {
   const [ingest, setIngest] = useState<IngestProgress | null>(null);
   // Transcript ids the AI is currently naming, so cards can show it working.
   const [namingIds, setNamingIds] = useState<Set<string>>(new Set());
+  /** Insights replaces the main pane rather than opening a window, so it can be
+   *  read next to the list it describes and dismissed by picking any note. */
+  const [insights, setInsights] = useState(false);
 
   // Guards against a stale SSE stream writing over a newer job.
   const jobIdRef = useRef<string | null>(null);
@@ -226,6 +230,7 @@ export default function App() {
 
   const select = useCallback(async (id: string) => {
     setJob(null);
+    setInsights(false);
     setActiveId(id);
     try {
       setActive(await getTranscript(id));
@@ -276,6 +281,7 @@ export default function App() {
 
   const newTranscription = useCallback(() => {
     setJob(null);
+    setInsights(false);
     setActiveId(null);
     setActive(null);
   }, []);
@@ -293,10 +299,14 @@ export default function App() {
         onNew={newTranscription}
         ingest={ingest}
         namingIds={namingIds}
+        insightsOpen={insights}
+        onInsights={() => setInsights((v) => !v)}
       />
 
       <main className="relative min-w-0 flex-1">
-        {job ? (
+        {insights ? (
+          <Insights />
+        ) : job ? (
           <JobProgress job={job} onDismiss={() => setJob(null)} />
         ) : active ? (
           <TranscriptView
