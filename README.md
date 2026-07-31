@@ -33,8 +33,13 @@ Apple Silicon only. Building for Intel means recompiling whisper.cpp for
 - **Microphone recording** in the app, with a waveform.
 - **Drop a file** — mp3, m4a, wav, flac, ogg, mp4, mov. Video included; the
   audio track is pulled out and the rest ignored.
-- **A reader, not a text dump** — transcripts are broken into paragraphs, follow
-  along with playback word by word, and can be edited in place.
+- **A reader, not a text dump** — transcripts are broken into paragraphs, with
+  timestamps hung in the margin that seek when you click them, and can be edited
+  in place. Reading and listening are treated as different things: press play
+  and it follows the spoken word, dimming the rest; leave it paused and you get
+  an ordinary page at one size and full contrast, with nothing chasing you.
+  `⌘F` finds within the open transcript, `↑`/`↓` step by paragraph, `Space`
+  plays and pauses, `←`/`→` skip five seconds.
 - **Export** to PDF, Markdown or plain text. The PDF is typeset, not a printed
   screenshot.
 - **Search** across everything you have transcribed.

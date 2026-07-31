@@ -1,9 +1,9 @@
 @import "tailwindcss";
 
 /* ---------------------------------------------------------------------------
-   Field Notes design system — "Field Notes", adapted for a resizable app window.
+   "Field Notes" — a print design system, adapted for a resizable app window.
 
-   V2 is a print system: fixed 960x540pt pages, absolute measurements. What
+   It is a print system: fixed 960x540pt pages, absolute measurements. What
    carries over verbatim is the *language* — forest & sage, two families only,
    square everything, the emphasis ladder, mono-as-data. What doesn't carry
    over is the fixed canvas, so sizes here are screen px on a fluid layout.
@@ -210,6 +210,64 @@
     /* The light-mode amber goes muddy on forest, so lift it toward sand. */
     color: #d8a24a;
     box-shadow: inset 0 -1px 0 color-mix(in srgb, #d8a24a 40%, transparent);
+  }
+
+  /* The reading column and its timestamp gutter.
+
+     Hanging the stamps costs 54px to the left of the measure. That is cheap on
+     a wide window and ruinous at the app's minimum: 720px less a 270px sidebar
+     leaves a 450px pane, where the gutter plus padding would cut the line down
+     to about 33 characters. So it is a container query, not a viewport one —
+     what matters is the width of the pane, which the sidebar changes without
+     the window resizing at all. Under the threshold the stamp stops hanging
+     and becomes a small label above its paragraph. */
+  .reading-column {
+    container-type: inline-size;
+  }
+
+  .reading-body {
+    width: 100%;
+    max-width: 744px;
+    margin-inline: auto;
+    padding-inline: 2rem;
+  }
+
+  .para-stamp {
+    display: block;
+    margin-bottom: 0.3rem;
+  }
+
+  @container (min-width: 640px) {
+    .reading-body {
+      padding-left: 86px;
+    }
+
+    .para-stamp {
+      position: absolute;
+      left: -54px;
+      top: 4px;
+      width: 40px;
+      margin-bottom: 0;
+    }
+  }
+
+  /* Find-in-transcript. Two weights of the same colour rather than a second
+     hue: every hit gets a wash you can scan for, the one you're on gets the
+     solid fill. Sage on forest for the solid, per §3 — sage is never text on
+     paper. */
+  .find-hit {
+    background: color-mix(in srgb, var(--color-sage) 34%, transparent);
+    border-radius: 1px;
+  }
+
+  .find-hit-current {
+    background: var(--color-sage);
+    color: var(--color-forest);
+    border-radius: 1px;
+  }
+
+  :root[data-theme="dark"] .find-hit {
+    background: color-mix(in srgb, var(--color-sage) 26%, transparent);
   }
 
   .selectable {

@@ -17,6 +17,12 @@ type Props = {
   peaks: number[] | null;
   /** Fired every animation frame while playing so the transcript can follow. */
   onTime: (seconds: number) => void;
+  /**
+   * Whether audio is running. The transcript reads this to tell *following*
+   * from *reading*: chasing the spoken word and dimming everything else is
+   * right during playback and actively hostile when someone is just reading.
+   */
+  onPlayingChange?: (playing: boolean) => void;
   handleRef: React.MutableRefObject<PlayerHandle | null>;
 };
 
@@ -40,6 +46,7 @@ export function AudioPlayer({
   duration,
   peaks,
   onTime,
+  onPlayingChange,
   handleRef,
 }: Props) {
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -103,6 +110,10 @@ export function AudioPlayer({
   }, [seek, cancelResume, handleRef]);
 
   useEffect(() => cancelResume, [cancelResume]);
+
+  useEffect(() => {
+    onPlayingChange?.(playing);
+  }, [playing, onPlayingChange]);
 
   useEffect(() => {
     if (!playing) return;

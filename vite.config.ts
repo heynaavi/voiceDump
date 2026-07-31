@@ -20,9 +20,9 @@ export default defineConfig(async () => ({
     // @ts-expect-error process is a nodejs global
     hmr: host ? { protocol: "ws", host, port: (Number(process.env.VD_PORT) || 1420) + 1 } : undefined,
     watch: {
-      // `.claude/worktrees` holds full checkouts of this same project, so
-      // without this the dev server watches a second copy of its own source.
-      ignored: ["**/src-tauri/**", "**/sidecar/**", "**/.claude/**"],
+      // Rust sources and build output are not the dev server's business, and
+      // `src-tauri/target` alone is large enough to make the watcher struggle.
+      ignored: ["**/src-tauri/**", "**/models/**"],
     },
   },
 }));

@@ -177,6 +177,38 @@ impl EngineState {
     }
 }
 
+/// Put `wanted` in the slot, loading it only if what's there isn't already it.
+///
+/// Shared by `run` and [`warm`] so the two can't drift — a warm-up that loaded
+/// the model even slightly differently from the transcription it was warming
+/// for would be worse than no warm-up at all.
+///
+/// The caller holds the lock across the load on purpose. Two callers racing
+/// would otherwise each build a context, and one would be dropped seconds later
+/// having achieved nothing but a 1.5 GB spike.
+fn ensure_loaded(
+    app: &tauri::AppHandle,
+    guard: &mut Option<Loaded>,
+    wanted: ModelSize,
+) -> Result<(), String> {
+    if guard.as_ref().map(|l| l.size) == Some(wanted) {
+        return Ok(());
+    }
+    let file = model_path(app, wanted).ok_or_else(|| {
+        format!(
+            "The {} speech model is missing from this build.",
+            wanted.label()
+        )
+    })?;
+    let ctx = WhisperContext::new_with_params(
+        file.to_string_lossy().as_ref(),
+        WhisperContextParameters::default(),
+    )
+    .map_err(|e| format!("could not load the speech model: {e}"))?;
+    *guard = Some(Loaded { size: wanted, ctx });
+    Ok(())
+}
+
 // -- decoding ---------------------------------------------------------------
 
 /// Decode any supported media file to 16 kHz mono f32.
@@ -412,20 +444,7 @@ pub fn transcribe(
 
     report("Loading model", 0.12);
     let mut guard = state.inner.lock().unwrap();
-    if guard.as_ref().map(|l| l.size) != Some(wanted) {
-        let file = model_path(app, wanted).ok_or_else(|| {
-            format!(
-                "The {} speech model is missing from this build.",
-                wanted.label()
-            )
-        })?;
-        let ctx = WhisperContext::new_with_params(
-            file.to_string_lossy().as_ref(),
-            WhisperContextParameters::default(),
-        )
-        .map_err(|e| format!("could not load the speech model: {e}"))?;
-        *guard = Some(Loaded { size: wanted, ctx });
-    }
+    ensure_loaded(app, &mut guard, wanted)?;
     let loaded = guard.as_ref().expect("model just loaded");
 
     report("Transcribing", 0.2);
@@ -632,22 +651,16 @@ pub fn engine_unload(state: tauri::State<EngineState>) {
 pub fn warm(app: &tauri::AppHandle) {
     use tauri::Manager;
     let app = app.clone();
+    // Off the calling thread: the load blocks for a couple of seconds, and the
+    // caller is the one driving the event tap.
     std::thread::spawn(move || {
         let wanted = auto_model();
         let state = app.state::<EngineState>();
         let mut guard = state.inner.lock().unwrap();
-        if guard.as_ref().map(|l| l.size) == Some(wanted) {
-            return;
-        }
-        let Some(file) = model_path(&app, wanted) else {
-            return;
-        };
-        if let Ok(ctx) = WhisperContext::new_with_params(
-            file.to_string_lossy().as_ref(),
-            WhisperContextParameters::default(),
-        ) {
-            *guard = Some(Loaded { size: wanted, ctx });
-        }
+        // Deliberately silent. This is an optimisation, not a step: if it
+        // fails, `run` attempts the same load and reports the failure in the
+        // place the user can act on it.
+        let _ = ensure_loaded(&app, &mut guard, wanted);
     });
 }
 
