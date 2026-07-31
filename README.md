@@ -158,6 +158,23 @@ The pill is its own accessory process
 cannot float over another app's full-screen Space, an `NSPanel` can. The level
 bars are the real signal: CoreAudio RMS, metered every 50 ms.
 
+**The words appear while you are still speaking**, in a second panel above the
+pill. Whisper has no incremental decode, so this transcribes *forward* — a
+cursor marks what has been read, each pass takes only what is new, and chunks
+are cut at the quietest moment in their tail so boundaries land between words.
+Pass cost is bounded by the chunk rather than by how long you have been
+talking, which is what keeps the lag flat instead of compounding.
+
+It runs on `small` while the real transcription stays on `medium`: the preview
+is thrown away the moment the authoritative pass lands, so it wants speed far
+more than accuracy. Newly-arrived words are brighter and ease back to match the
+rest, so a reading edge follows your voice.
+
+Nothing is typed into your document until you let go. Inserting progressively
+would mean *retracting* text when the transcript revises itself — firing
+backspaces into whatever you were writing — so the preview stays in the panel
+and the paste happens once, from one clean read of the whole recording.
+
 </td>
 <td width="50%">
 

@@ -10,7 +10,8 @@
 //! a runtime download or a system binary is out, however convenient.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -160,6 +161,17 @@ pub struct IngestProgress {
 #[derive(Default)]
 pub struct EngineState {
     inner: Mutex<Option<Loaded>>,
+    /// A second, smaller model kept for live preview only.
+    ///
+    /// The preview wants speed far more than accuracy — its text is thrown
+    /// away the moment the real transcription lands — and `small` runs roughly
+    /// four times quicker, which is the difference between words appearing as
+    /// you speak and words appearing after you have stopped.
+    ///
+    /// Only populated when the main engine is running `medium`; on a machine
+    /// small enough to be using `small` anyway there is nothing to gain and a
+    /// second copy would be pure waste.
+    preview: Mutex<Option<WhisperContext>>,
     /// When the model was last wanted. `None` means never.
     ///
     /// Always locked *after* `inner`, everywhere, so the reaper and a running
@@ -175,6 +187,7 @@ struct Loaded {
 impl EngineState {
     pub fn unload(&self) {
         *self.inner.lock().unwrap() = None;
+        *self.preview.lock().unwrap() = None;
     }
 
     pub fn loaded_size(&self) -> Option<ModelSize> {
@@ -247,6 +260,7 @@ pub fn start_idle_unload(app: tauri::AppHandle) {
             .unwrap_or(timeout);
         if idle_for >= timeout {
             *guard = None;
+            *state.preview.lock().unwrap() = None;
             eprintln!(
                 "[engine] model released after {}s idle",
                 idle_for.as_secs()
@@ -285,6 +299,166 @@ fn ensure_loaded(
     .map_err(|e| format!("could not load the speech model: {e}"))?;
     *guard = Some(Loaded { size: wanted, ctx });
     Ok(())
+}
+
+/// Whether a segment is whisper narrating the audio rather than transcribing it.
+///
+/// whisper emits `[BLANK_AUDIO]` for silence, and `[MUSIC]`, `(upbeat music)`,
+/// `*door creaks*` and friends for anything else it hears but cannot render as
+/// speech. They are useful in subtitles and actively wrong here: this app
+/// pastes its output into whatever the user was typing in, and nobody wants
+/// `[BLANK_AUDIO]` in the middle of their message. Four had already reached the
+/// database before this existed.
+///
+/// The test is structural rather than a list of known strings — any segment
+/// wholly wrapped in brackets, parentheses or asterisks is the model describing
+/// a sound, because real speech does not arrive fully parenthesised.
+fn is_non_speech(s: &str) -> bool {
+    let s = s.trim();
+    if s.len() < 2 {
+        return false;
+    }
+    let b = s.as_bytes();
+    let wrapped = matches!(
+        (b[0], b[b.len() - 1]),
+        (b'[', b']') | (b'(', b')') | (b'*', b'*')
+    );
+    // Only if the wrapper encloses the whole thing: "(as I said) we shipped"
+    // is speech that happens to open with a bracket.
+    wrapped
+        && !s[1..s.len() - 1].contains('[')
+        && !s[1..s.len() - 1].contains('(')
+}
+
+/// A live-preview session: one whisper state, reused for every pass.
+///
+/// The state is the expensive part, not the context. `whisper_init_state`
+/// allocates the KV caches and compute buffers — about 530 MB for `medium` —
+/// so creating one per pass, several times a second, is not a slow version of
+/// this. It is a broken one: the first preview lands and every later pass dies
+/// trying to allocate another half-gigabyte, which reads to the user as the
+/// transcript freezing on its opening line.
+///
+/// Held for the length of one dictation and dropped on key-up, so the final
+/// pass never allocates its own alongside a live one.
+pub struct Preview {
+    state: whisper_rs::WhisperState,
+}
+
+impl Preview {
+    /// Borrow the loaded model long enough to build a state.
+    ///
+    /// `None` while the engine is busy or still warming — the caller simply
+    /// tries again on its next turn rather than blocking the recording.
+    pub fn start(app: &tauri::AppHandle) -> Option<Self> {
+        use tauri::Manager;
+        let state = app.state::<EngineState>();
+
+        // If the main engine is already on `small` there is nothing faster to
+        // switch to, so share its context rather than loading a second copy.
+        {
+            let guard = state.inner.try_lock().ok()?;
+            if let Some(loaded) = guard.as_ref() {
+                if loaded.size == ModelSize::Small {
+                    return Some(Preview {
+                        state: loaded.ctx.create_state().ok()?,
+                    });
+                }
+            }
+        }
+
+        let mut slot = state.preview.try_lock().ok()?;
+        if slot.is_none() {
+            let file = model_path(app, ModelSize::Small)?;
+            *slot = WhisperContext::new_with_params(
+                file.to_string_lossy().as_ref(),
+                WhisperContextParameters::default(),
+            )
+            .ok();
+        }
+        Some(Preview {
+            state: slot.as_ref()?.create_state().ok()?,
+        })
+    }
+
+    /// Transcribe what has been said so far, abandoning the attempt the moment
+    /// `cancel` is set.
+    ///
+    /// This is the disposable half of dictation. Its output is shown while the
+    /// user is still speaking and then thrown away — what gets pasted always
+    /// comes from one clean pass over the complete audio in [`run`], because a
+    /// stitched sequence of partials is measurably worse than a single read of
+    /// the whole thing, and the pasted text is not the place to trade accuracy
+    /// for feel.
+    ///
+    /// Cancellation is checked around the pass, not inside it.
+    ///
+    /// whisper-rs 0.16's `set_abort_callback_safe` cannot be used: it boxes the
+    /// closure as `Box<dyn FnMut() -> bool>`, boxes that again, and hands out a
+    /// `*mut Box<dyn FnMut>` — but installs `trampoline::<F>`, which casts the
+    /// pointer back to `*mut F`, the original closure type. Calling it
+    /// reinterprets a fat-pointer box as the closure struct and returns
+    /// whatever happens to be in those bytes. When that is truthy ggml aborts
+    /// the graph, which is exactly the `failed to encode` storm this used to
+    /// produce.
+    ///
+    /// Checking between passes is enough now that a pass covers seconds rather
+    /// than the whole recording: the worst key-up delay is one short chunk.
+    pub fn step(&mut self, samples: &[f32], cancel: Arc<AtomicBool>) -> Option<String> {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        // Below about a second whisper invents words rather than admitting it
+        // heard nothing, and a panel that flashes a hallucinated sentence
+        // before the real one is worse than one that stays quiet a moment
+        // longer.
+        if samples.len() < SAMPLE_RATE as usize {
+            return None;
+        }
+
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_translate(false);
+        params.set_print_special(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_n_threads((num_threads() as i32).max(1));
+        // No token timestamps: the panel shows words, not a scrubber, and they
+        // cost real time to compute.
+        params.set_token_timestamps(false);
+
+        // A failed pass is not worth surfacing — the final transcription is
+        // what the user actually receives.
+        self.state.full(params, samples).ok()?;
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let n = self.state.full_n_segments();
+        let mut out = String::new();
+        for i in 0..n {
+            let Some(seg) = self.state.get_segment(i) else {
+                continue;
+            };
+            let piece = seg.to_str_lossy().unwrap_or_default();
+            let piece = piece.trim();
+            if piece.is_empty() || is_non_speech(piece) {
+                continue;
+            }
+            out.push_str(piece);
+            out.push(' ');
+        }
+        let out = out.trim().to_string();
+        (!out.is_empty()).then_some(out)
+    }
+}
+
+/// Resample arbitrary-rate mono audio to what whisper expects.
+///
+/// Exposed for live preview, which reads the microphone at whatever rate the
+/// device runs at rather than going through a decoded file.
+pub fn to_engine_rate(input: &[f32], src_rate: u32) -> Vec<f32> {
+    resample_to_16k(input, src_rate)
 }
 
 // -- decoding ---------------------------------------------------------------
@@ -550,7 +724,7 @@ pub fn transcribe(
         let Some(seg) = st.get_segment(i) else { continue };
         let text = seg.to_str_lossy().unwrap_or_default().into_owned();
         let trimmed = text.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || is_non_speech(trimmed) {
             continue;
         }
         // whisper.cpp reports timestamps in centiseconds.
@@ -817,6 +991,39 @@ mod tests {
             .join(" ");
         eprintln!("TRANSCRIPT: {}", text.trim());
         assert!(!text.trim().is_empty(), "empty transcript");
+    }
+
+    /// The markers that were reaching real transcripts.
+    ///
+    /// `[BLANK_AUDIO]` was pasted into four saved notes before this existed —
+    /// whisper narrating silence, in the middle of somebody's message.
+    #[test]
+    fn non_speech_markers_are_dropped() {
+        for s in [
+            "[BLANK_AUDIO]",
+            "[ Silence ]",
+            "(upbeat music)",
+            "*door creaks*",
+            "[MUSIC PLAYING]",
+        ] {
+            assert!(is_non_speech(s), "{s:?} should be dropped");
+        }
+    }
+
+    /// Real speech is never dropped, including speech that merely contains or
+    /// begins with a bracket — the wrapper has to enclose the whole segment.
+    #[test]
+    fn speech_survives_the_filter() {
+        for s in [
+            "Ship the build tonight.",
+            "(as I said) we shipped it",
+            "the array is a[0] and b[1]",
+            "I said (roughly) forty",
+            "a",
+            "",
+        ] {
+            assert!(!is_non_speech(s), "{s:?} should be kept");
+        }
     }
 
     /// The idle policy itself, without needing a Tauri app or the weights.

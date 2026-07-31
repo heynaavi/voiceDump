@@ -39,7 +39,7 @@ pub struct DictationState {
 /// active full-screen Space, however it's configured (measured exhaustively). A
 /// standalone accessory `NSPanel` can, so the pill lives in this tiny process
 /// and we drive it over its stdin. Protocol: one command per line —
-/// `show`, `transcribing`, `level <0..1>`, `hide`, `quit`.
+/// `show`, `transcribing`, `level <0..1>`, `text <partial>`, `hide`, `quit`.
 mod overlay {
     use std::io::Write;
     use std::path::Path;
@@ -106,6 +106,17 @@ mod overlay {
         send(&format!("level {v:.3}"));
     }
 
+    /// Show what has been heard so far. Newlines would break the line-per-command
+    /// protocol, so they are flattened rather than escaped — the pill is one
+    /// running line of text anyway.
+    pub fn text(s: &str) {
+        let flat: String = s
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .collect();
+        send(&format!("text {}", flat.trim()));
+    }
+
     /// Ask the helper to quit, on app shutdown.
     pub fn shutdown() {
         send("quit");
@@ -123,6 +134,24 @@ mod overlay {
 struct Capture {
     stop: Arc<AtomicBool>,
     done: std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+    /// Mono samples, at `rate`, streamed to the live preview as they arrive.
+    ///
+    /// A channel rather than a shared buffer. The first version had the audio
+    /// callback `try_lock` a `Vec` and *skip the batch* when the preview held
+    /// it — silently dropping audio, so the preview fell permanently behind
+    /// real time no matter how fast it transcribed. A send never blocks the
+    /// audio thread and never drops.
+    ///
+    /// Separate from the WAV writer rather than re-reading the file: the header
+    /// is only finalized on stop, so a half-written WAV cannot be decoded
+    /// mid-recording.
+    audio: Mutex<Option<std::sync::mpsc::Receiver<Vec<f32>>>>,
+    /// The microphone's own rate, which is whatever the device runs at — only
+    /// known once the stream is open, hence the atomic.
+    rate: Arc<AtomicU32>,
+    /// Set on key-up. Checked around each preview pass, so the worst the final
+    /// transcription ever waits is one short chunk.
+    preview_cancel: Arc<AtomicBool>,
 }
 
 /// Start the native overlay helper at launch.
@@ -174,20 +203,41 @@ fn start_capture(app: &tauri::AppHandle, dir: &Path) -> Result<Capture, String> 
 
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, done) = std::sync::mpsc::channel();
+    let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+    let rate = Arc::new(AtomicU32::new(0));
 
     let app = app.clone();
     let thread_stop = stop.clone();
     let thread_path = path.clone();
+    let thread_rate = rate.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(capture_loop(&app, &thread_path, &thread_stop));
+        let _ = tx.send(capture_loop(
+            &app,
+            &thread_path,
+            &thread_stop,
+            audio_tx,
+            &thread_rate,
+        ));
     });
 
-    Ok(Capture { stop, done })
+    Ok(Capture {
+        stop,
+        done,
+        audio: Mutex::new(Some(audio_rx)),
+        rate,
+        preview_cancel: Arc::new(AtomicBool::new(false)),
+    })
 }
 
 /// Own the cpal stream for the life of one dictation: build it, meter every
 /// buffer, and finalize the WAV when `stop` is set.
-fn capture_loop(app: &tauri::AppHandle, path: &Path, stop: &AtomicBool) -> Result<PathBuf, String> {
+fn capture_loop(
+    app: &tauri::AppHandle,
+    path: &Path,
+    stop: &AtomicBool,
+    audio_tx: std::sync::mpsc::Sender<Vec<f32>>,
+    live_rate: &Arc<AtomicU32>,
+) -> Result<PathBuf, String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
@@ -201,6 +251,7 @@ fn capture_loop(app: &tauri::AppHandle, path: &Path, stop: &AtomicBool) -> Resul
     let channels = config.channels() as usize;
     let sample_rate = config.sample_rate().0;
     let cfg: cpal::StreamConfig = config.into();
+    live_rate.store(sample_rate, Ordering::SeqCst);
 
     let writer = hound::WavWriter::create(
         path,
@@ -230,6 +281,7 @@ fn capture_loop(app: &tauri::AppHandle, path: &Path, stop: &AtomicBool) -> Resul
             let writer = writer.clone();
             let peak = peak.clone();
             let app = app.clone();
+            let audio_tx = audio_tx.clone();
             let mut acc = 0f32;
             let mut n = 0usize;
             device
@@ -239,6 +291,9 @@ fn capture_loop(app: &tauri::AppHandle, path: &Path, stop: &AtomicBool) -> Resul
                         let conv = $to_f32;
                         let mut guard = writer.lock().unwrap();
                         let Some(w) = guard.as_mut() else { return };
+                        // Buffered locally and appended once per callback: the
+                        // audio thread must not contend on a lock per sample.
+                        let mut batch: Vec<f32> = Vec::with_capacity(data.len() / channels + 1);
                         for frame in data.chunks(channels) {
                             let mut s = 0f32;
                             for &samp in frame {
@@ -247,6 +302,7 @@ fn capture_loop(app: &tauri::AppHandle, path: &Path, stop: &AtomicBool) -> Resul
                             s /= channels as f32;
                             let i = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                             let _ = w.write_sample(i);
+                            batch.push(s);
                             peak.fetch_max(i.unsigned_abs() as u32, Ordering::Relaxed);
                             acc += s * s;
                             n += 1;
@@ -264,6 +320,9 @@ fn capture_loop(app: &tauri::AppHandle, path: &Path, stop: &AtomicBool) -> Resul
                                 n = 0;
                             }
                         }
+                        // Never blocks, never drops. A closed channel just
+                        // means the preview finished first.
+                        let _ = audio_tx.send(batch);
                     },
                     move |e| eprintln!("[dictation] capture stream error: {e}"),
                     None,
@@ -361,6 +420,141 @@ fn cues(app: &tauri::AppHandle) -> Option<crate::sound::Cues> {
     crate::sound::ensure(&dir).ok()
 }
 
+/// Stream the words out while the user is still speaking.
+///
+/// The first version re-transcribed the whole recording every pass, which is
+/// how most Whisper "live" demos work and is why they all feel sluggish: with
+/// `medium` a 30-second window costs several seconds, so the text lands further
+/// behind the longer you talk. Speaking for seventy seconds meant watching the
+/// opening sentence sit there.
+///
+/// So it transcribes forward instead. A cursor marks how much has been read;
+/// each pass takes only what has arrived since, appends the words, and moves
+/// the cursor on. Pass cost is bounded by the chunk, not by how long you have
+/// been going, so the lag stays flat instead of compounding.
+///
+/// The trade is context: whisper sees each chunk alone, so it cannot revise an
+/// earlier word once a later one clarifies it. For a preview that is the right
+/// side of the trade — this text is disposable, and what actually gets pasted
+/// still comes from one clean read of the complete recording in `engine::run`.
+///
+/// Chunks are cut at the quietest moment in their tail rather than on a fixed
+/// stride, so boundaries tend to land between words instead of slicing one in
+/// half.
+fn spawn_preview(app: &tauri::AppHandle, cap: &Capture) {
+    /// Wait for at least this much new speech before spending a pass on it.
+    const MIN_CHUNK_SECS: f32 = 2.5;
+    /// And never bite off more than this, so a pass stays quick.
+    const MAX_CHUNK_SECS: f32 = 8.0;
+
+    let Some(rx) = cap.audio.lock().unwrap().take() else {
+        return;
+    };
+    let app = app.clone();
+    let rate = cap.rate.clone();
+    let stop = cap.stop.clone();
+    let cancel = cap.preview_cancel.clone();
+
+    std::thread::spawn(move || {
+        // One state for the whole dictation. Building it costs ~530 MB of KV
+        // caches and compute buffers, so a fresh one per pass does not merely
+        // run slowly — the allocations fail and the transcript freezes on its
+        // opening line.
+        let mut session: Option<crate::engine::Preview> = None;
+        let mut buf: Vec<f32> = Vec::new();
+        let mut cursor = 0usize;
+        let mut text = String::new();
+
+        while !stop.load(Ordering::SeqCst) && !cancel.load(Ordering::Relaxed) {
+            // Drain whatever the microphone has produced. Blocking briefly here
+            // is what paces the loop; the channel is the clock.
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(batch) => buf.extend_from_slice(&batch),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => break,
+            }
+            while let Ok(batch) = rx.try_recv() {
+                buf.extend_from_slice(&batch);
+            }
+
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let src_rate = rate.load(Ordering::SeqCst);
+            if src_rate == 0 {
+                continue;
+            }
+
+            let min = (src_rate as f32 * MIN_CHUNK_SECS) as usize;
+            let max = (src_rate as f32 * MAX_CHUNK_SECS) as usize;
+            if buf.len() - cursor < min {
+                continue;
+            }
+
+            // Built on the first turn the engine is free — the model is still
+            // warming when recording starts, so this would otherwise be a race
+            // the preview always lost.
+            if session.is_none() {
+                session = crate::engine::Preview::start(&app);
+                if session.is_none() {
+                    continue;
+                }
+            }
+
+            let end = quietest_cut(&buf, cursor + min, (cursor + max).min(buf.len()), src_rate);
+            let audio = crate::engine::to_engine_rate(&buf[cursor..end], src_rate);
+
+            let Some(s) = session.as_mut() else { continue };
+            if let Some(piece) = s.step(&audio, cancel.clone()) {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&piece);
+                overlay::text(&text);
+                let _ = app.emit("dictation-partial", &text);
+            }
+            // Advance regardless: a chunk that transcribed to nothing was
+            // silence, and re-reading it forever would stall the cursor.
+            cursor = end;
+        }
+
+        // Explicit, and before the final pass allocates its own: two live
+        // states plus the model is over 1.6 GB on `medium`, and there is no
+        // reason for them to overlap.
+        drop(session);
+        overlay::text("");
+    });
+}
+
+/// Pick a chunk boundary that is unlikely to fall inside a word.
+///
+/// Scans 20 ms windows between `from` and `to` for the quietest one — a pause
+/// between words is the cheapest place to cut, and cutting mid-word makes the
+/// preview stutter out fragments. Falls back to `to` when everything is loud,
+/// which is the correct answer for someone talking without drawing breath.
+fn quietest_cut(buf: &[f32], from: usize, to: usize, rate: u32) -> usize {
+    if to <= from || to > buf.len() {
+        return to.min(buf.len()).max(from.min(buf.len()));
+    }
+    let win = ((rate as f32 * 0.02) as usize).max(1);
+    if to - from <= win {
+        return to;
+    }
+
+    let mut best = to;
+    let mut best_energy = f32::MAX;
+    let mut at = from;
+    while at + win <= to {
+        let energy: f32 = buf[at..at + win].iter().map(|s| s * s).sum();
+        if energy <= best_energy {
+            best_energy = energy;
+            best = at + win;
+        }
+        at += win;
+    }
+    best
+}
+
 fn start(app: &tauri::AppHandle) {
     let state = app.state::<DictationState>();
     if state.recording.load(Ordering::SeqCst) {
@@ -385,10 +579,18 @@ fn start(app: &tauri::AppHandle) {
             overlay::show();
             let _ = app.emit("dictation-state", "recording");
 
-            // Load the model while the user is still talking, so releasing
-            // the key feels instant instead of paying a cold load at the worst
-            // possible moment.
-            crate::engine::warm(app);
+            // Load the model while the user is still talking, so releasing the
+            // key feels instant instead of paying a cold load at the worst
+            // possible moment. On its own thread: the load blocks for half a
+            // second and this one is driving the event tap, so every keystroke
+            // on the machine would stall behind it.
+            let warming = app.clone();
+            std::thread::spawn(move || crate::engine::warm(&warming));
+
+            // Live preview reads the same audio the recording is capturing.
+            if let Some(c) = state.capture.lock().unwrap().as_ref() {
+                spawn_preview(app, c);
+            }
         }
         Err(e) => {
             let _ = app.emit("dictation-error", e);
@@ -403,6 +605,14 @@ fn stop(app: &tauri::AppHandle) {
     }
 
     let cap = state.capture.lock().unwrap().take();
+
+    // First thing, before anything slower: tell the preview to stop. It checks
+    // between passes, and a pass is a few seconds of audio rather than the
+    // whole recording, so the final transcription waits at most one chunk.
+    if let Some(c) = cap.as_ref() {
+        c.preview_cancel.store(true, Ordering::Relaxed);
+    }
+
     if let Some(c) = cues(app) {
         crate::sound::play(&c.stop);
     }
@@ -486,6 +696,51 @@ fn frontmost_app() -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 fn frontmost_app() -> Option<String> {
     None
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    /// The cut lands in the gap, not mid-word.
+    ///
+    /// A chunk boundary inside a word makes the preview stutter out fragments,
+    /// so the scan looks for the quietest moment in the tail of the range.
+    #[test]
+    fn cuts_at_the_quiet_part() {
+        let rate = 16_000u32;
+        // Half a second of loud, then a clear gap, then loud again.
+        let mut buf = vec![0.5f32; rate as usize / 2];
+        buf.extend(std::iter::repeat(0.0).take(rate as usize / 10));
+        buf.extend(std::iter::repeat(0.5).take(rate as usize / 2));
+
+        let cut = super::quietest_cut(&buf, 0, buf.len(), rate);
+        let gap_start = rate as usize / 2;
+        let gap_end = gap_start + rate as usize / 10;
+        assert!(
+            cut >= gap_start && cut <= gap_end + 1,
+            "cut at {cut} should land in the silent gap {gap_start}..{gap_end}"
+        );
+    }
+
+    /// Someone talking without drawing breath still has to be cut somewhere,
+    /// and the end of the range is the right answer.
+    #[test]
+    fn constant_speech_cuts_at_the_end() {
+        let rate = 16_000u32;
+        let buf = vec![0.4f32; rate as usize];
+        assert_eq!(super::quietest_cut(&buf, 0, buf.len(), rate), buf.len());
+    }
+
+    /// Degenerate ranges must not panic or walk off the buffer — this runs on
+    /// every dictation, including one-second ones.
+    #[test]
+    fn odd_ranges_are_safe() {
+        let rate = 16_000u32;
+        let buf = vec![0.1f32; 100];
+        assert!(super::quietest_cut(&buf, 0, 0, rate) <= buf.len());
+        assert!(super::quietest_cut(&buf, 50, 40, rate) <= buf.len());
+        assert!(super::quietest_cut(&buf, 0, 500, rate) <= buf.len());
+        assert!(super::quietest_cut(&[], 0, 0, rate) == 0);
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
