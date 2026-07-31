@@ -801,4 +801,109 @@ mod tests {
     /// Printed by the child once a model is loaded, so the parent can tell a
     /// real pass from a probe that never ran.
     const PROBE_READY: &str = "VD_EXIT_PROBE: model loaded";
+
+    fn rss_mb() -> f64 {
+        let pid = std::process::id().to_string();
+        std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok())
+            .map(|kb| kb / 1024.0)
+            .unwrap_or(0.0)
+    }
+
+    /// What the numbers in the README are made of.
+    ///
+    /// Ignored by default: it is a measurement, not an assertion, and it needs a
+    /// real audio file and the weights on disk. Run it with
+    ///
+    /// ```text
+    /// scripts/bench.sh
+    /// ```
+    ///
+    /// The split matters more than the total. Dictation warms the model while you
+    /// are still speaking (see `dictation::start`), so the load column is paid
+    /// during speech, not after it — the latency a user actually feels on key
+    /// release is decode + transcribe. Both are reported separately so neither
+    /// can be quietly folded into a flattering single figure.
+    #[test]
+    #[ignore = "benchmark: run via scripts/bench.sh"]
+    fn benchmark_latency() {
+        use std::time::Instant;
+
+        let (Ok(audio), Ok(models)) = (
+            std::env::var("TEST_AUDIO"),
+            std::env::var("VOICEDUMPS_MODEL_DIR"),
+        ) else {
+            eprintln!("skipping: set TEST_AUDIO and VOICEDUMPS_MODEL_DIR");
+            return;
+        };
+
+        let size = auto_model();
+        let threads = num_threads();
+
+        let t0 = Instant::now();
+        let samples = decode_mono_16k(Path::new(&audio)).expect("decode");
+        let decode = t0.elapsed();
+        let seconds = samples.len() as f64 / SAMPLE_RATE as f64;
+
+        let before = rss_mb();
+        let model = Path::new(&models).join(size.file_name());
+        let t1 = Instant::now();
+        let ctx = WhisperContext::new_with_params(
+            model.to_string_lossy().as_ref(),
+            WhisperContextParameters::default(),
+        )
+        .expect("load model");
+        let load = t1.elapsed();
+        let after_load = rss_mb();
+
+        // Two identical runs on the same context. The second is what a
+        // back-to-back dictation costs, with nothing left to load.
+        let run = || -> (std::time::Duration, usize) {
+            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            params.set_translate(false);
+            params.set_token_timestamps(true);
+            params.set_print_special(false);
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
+            params.set_n_threads(threads as i32);
+
+            let mut st = ctx.create_state().expect("state");
+            let t = Instant::now();
+            st.full(params, &samples).expect("transcribe");
+            let elapsed = t.elapsed();
+            let chars: usize = (0..st.full_n_segments())
+                .filter_map(|i| st.get_segment(i))
+                .filter_map(|s| s.to_str_lossy().ok().map(|c| c.trim().len()))
+                .sum();
+            (elapsed, chars)
+        };
+
+        let (first, chars) = run();
+        let (second, _) = run();
+        let peak_rss = rss_mb();
+
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let felt = ms(decode) + ms(first);
+
+        println!("\n--- voicedumps latency ---");
+        println!("model              {} ({} threads)", size.label(), threads);
+        println!("audio              {seconds:.2}s, {chars} chars transcribed");
+        println!("decode             {:.0} ms", ms(decode));
+        println!("model load (cold)  {:.0} ms", ms(load));
+        println!("transcribe         {:.0} ms", ms(first));
+        println!("transcribe (again) {:.0} ms", ms(second));
+        println!("felt on release    {felt:.0} ms   (decode + transcribe, model already warm)");
+        println!("realtime factor    {:.1}x   (audio seconds per second of compute)",
+            seconds / first.as_secs_f64());
+        println!("rss before load    {before:.0} MB");
+        println!("rss with model     {after_load:.0} MB");
+        println!("rss peak           {peak_rss:.0} MB");
+        println!("--- end ---\n");
+
+        assert!(chars > 0, "nothing was transcribed, so these numbers mean nothing");
+    }
 }
