@@ -74,9 +74,8 @@ a two-second "ship it Thursday" and a six-second sentence land in the same ~400 
 
 Three honest footnotes, because the table is flattering enough without them:
 
-- **These were measured on battery at 8% charge**, which throttles an M1 Pro. They
-  are a floor, not a best case. Run `scripts/bench.sh` plugged in and you should
-  do better.
+- **This is one laptop, not a spec sheet.** Thermal state, threads and what else
+  is running all move it. Run `scripts/bench.sh` and see what your machine does.
 - **The timings exclude model load on purpose, and that is legitimate.** Dictation
   calls `engine::warm` the instant the key goes *down*
   ([`dictation.rs`](src-tauri/src/dictation.rs)), so the load overlaps with you
@@ -105,11 +104,10 @@ Against that published figure, for a normal dictation utterance:
 | | Latency after you stop speaking |
 | --- | --- |
 | Wispr Flow (published, p99, cloud) | under 700 ms |
-| **VoiceDumps** (measured, worst of 3, local, throttled) | **429 ms** |
+| **VoiceDumps** (measured, worst of 3, local) | **429 ms** |
 
 That is roughly **39% faster** — and the comparison is deliberately stacked
-against us: their p99 versus our worst case, on a laptop at 8% battery, with the
-`small` model.
+against us: their p99 versus our worst case, on the `small` model.
 
 **Where that number stops being true.** Our latency scales with how long you
 spoke; theirs is a mostly fixed pipeline cost because it transcribes while you
@@ -155,25 +153,9 @@ instead of 13×.
 
 The pill is its own accessory process
 ([`overlay-helper/main.swift`](overlay-helper/main.swift)) — a Tauri webview
-cannot float over another app's full-screen Space, an `NSPanel` can. The level
-bars are the real signal: CoreAudio RMS, metered every 50 ms.
-
-**The words appear while you are still speaking**, in a second panel above the
-pill. Whisper has no incremental decode, so this transcribes *forward* — a
-cursor marks what has been read, each pass takes only what is new, and chunks
-are cut at the quietest moment in their tail so boundaries land between words.
-Pass cost is bounded by the chunk rather than by how long you have been
-talking, which is what keeps the lag flat instead of compounding.
-
-It runs on `small` while the real transcription stays on `medium`: the preview
-is thrown away the moment the authoritative pass lands, so it wants speed far
-more than accuracy. Newly-arrived words are brighter and ease back to match the
-rest, so a reading edge follows your voice.
-
-Nothing is typed into your document until you let go. Inserting progressively
-would mean *retracting* text when the transcript revises itself — firing
-backspaces into whatever you were writing — so the preview stays in the panel
-and the paste happens once, from one clean read of the whole recording.
+cannot float over another app's full-screen Space, an `NSPanel` can. **The words
+appear while you are still speaking**, in a second panel above it, and nothing
+reaches your document until you let go.
 
 </td>
 <td width="50%">
@@ -277,7 +259,7 @@ halving the download.
 | UI | `src/` | React + Tailwind. Reader, history, insights, drag-drop. |
 | Shell | `src-tauri/` | Tauri v2. Owns the SQLite history, the globe-key tap and the engine. |
 | Engine | `src-tauri/src/engine.rs` | whisper.cpp via `whisper-rs`, Metal-accelerated. In-process. |
-| Overlay | `overlay-helper/` | Swift `NSPanel` for the dictation pill and PDF typesetting. |
+| Overlay | `overlay-helper/` | Swift `NSPanel` for the dictation pill and PDF typesetting. Its level bars are the real signal — CoreAudio RMS, metered every 50 ms. |
 
 Transcription used to run in a Python sidecar on MLX. That worked but could
 never ship: it needed a 1 GB virtualenv, the `mlx` stack, and `ffmpeg` on the
@@ -295,6 +277,22 @@ owns, so a live context was still holding Metal residency sets when ggml-metal
 asserted they were all released — `abort()`, and macOS reporting a crash on an
 ordinary quit. There is a regression test that runs the exit in a child process,
 because the behaviour under test is what happens *during* exit.
+
+**The live preview transcribes forward.** Whisper has no incremental decode, so
+re-reading the whole recording every pass would compound the lag. A cursor marks
+what has been read, each pass takes only what is new, and chunks are cut at the
+quietest moment in their tail so boundaries land between words rather than
+inside them. Pass cost is bounded by the chunk rather than by how long you have
+been talking, which is what keeps the lag flat. It runs on `small` while the real
+transcription stays on `medium`: the preview is thrown away the moment the
+authoritative pass lands, so it wants speed far more than accuracy. In the panel,
+newly-arrived words are brighter and ease back to match the rest, so a reading
+edge follows your voice.
+
+**Nothing is inserted progressively.** Doing so would mean *retracting* text when
+the transcript revises itself — firing backspaces into whatever you were writing
+— so the preview stays in the panel and the paste happens once, from one clean
+read of the whole recording.
 
 **Text is pasted, not typed.** Synthetic keystrokes are slow and get mangled by
 autocorrect and input methods, so the transcript goes to the clipboard and the
