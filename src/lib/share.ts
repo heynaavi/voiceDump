@@ -62,6 +62,33 @@ function ink(rank: number): string {
 
 export type Placed = { text: string; x: number; y: number; size: number; rank: number };
 
+/**
+ * The site's entrance curve — `cubic-bezier(0.16, 1, 0.3, 1)`, the same one
+ * `video/src/lib/anim.ts` calls `EXPO_OUT`.
+ *
+ * Solved directly rather than through GSAP so `paint` stays a pure function of
+ * its `Reveal` and the still image can use it without a timeline. Newton on the
+ * bezier's x, which converges in three iterations over this range.
+ */
+export function ease(t: number): number {
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+  const cx = 3 * 0.16;
+  const bx = 3 * (0.3 - 0.16) - cx;
+  const ax = 1 - cx - bx;
+  const cy = 3 * 1;
+  const by = 3 * (1 - 1) - cy;
+  const ay = 1 - cy - by;
+  let x = t;
+  for (let i = 0; i < 5; i++) {
+    const err = ((ax * x + bx) * x + cx) * x - t;
+    const d = (3 * ax * x + 2 * bx) * x + cx;
+    if (Math.abs(d) < 1e-6) break;
+    x -= err / d;
+  }
+  return ((ay * x + by) * x + cy) * x;
+}
+
 /** Greedy line packing, centred, with the block centred vertically. */
 export function layout(
   ctx: CanvasRenderingContext2D,
@@ -234,17 +261,42 @@ export function paint(ctx: CanvasRenderingContext2D, data: CardData, at: Reveal)
   // -- the words -----------------------------------------------------------
   const placed = layout(ctx, data.words, 268, H - 330);
   placed.forEach((p, i) => {
-    const a = Math.max(0, Math.min(1, at.words - i));
-    if (a <= 0) return;
+    // Each word gets a whole unit of the counter to arrive in, and they
+    // overlap: at `words = 4.3`, word 4 is 30% in while 3 is still settling.
+    // Overlapping is what makes it read as a phrase assembling rather than a
+    // metronome placing one word at a time.
+    const raw = Math.max(0, Math.min(1, (at.words - i) / 1.6));
+    if (raw <= 0) return;
+    const a = ease(raw);
+
     ctx.save();
-    ctx.globalAlpha = a;
-    // Each word rises a little as it arrives, so the block assembles rather
-    // than blinking on. At a=1 the offset is zero and the still image is
-    // identical to a fully-revealed frame.
-    ctx.translate(0, (1 - a) * 26);
+    // The font has to be set before measuring, not after: `measureText` reads
+    // whatever `ctx.font` currently is, so measuring first silently returned
+    // the *previous* word's metrics — every underline came out the length of
+    // the word before it.
     ctx.font = `600 ${p.size}px ${SANS}`;
+    // Scale about the word's own centre so it grows into place instead of
+    // sliding out from its left edge.
+    const w = ctx.measureText(p.text).width;
+    const cx = p.x + w / 2;
+    ctx.translate(cx, p.y);
+    ctx.scale(0.86 + 0.14 * a, 0.86 + 0.14 * a);
+    ctx.translate(-cx, -p.y);
+    // A short rise, scaled to the type: a 172px word travelling the same
+    // distance as a 38px one looks like two different animations.
+    ctx.translate(0, (1 - a) * p.size * 0.22);
+    ctx.globalAlpha = a;
+
     ctx.fillStyle = ink(p.rank);
     ctx.fillText(p.text, p.x, p.y);
+
+    // The two headline words are underlined as they land, the rule drawing out
+    // from under the word with the same curve.
+    if (p.rank < 2) {
+      ctx.globalAlpha = a * 0.5;
+      ctx.fillStyle = SAGE_SOFT;
+      ctx.fillRect(p.x, p.y + p.size * 0.16, w * a, Math.max(3, p.size * 0.045));
+    }
     ctx.restore();
   });
 

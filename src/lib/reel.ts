@@ -20,18 +20,26 @@
 
 import gsap from "gsap";
 
+import { openScore } from "./score";
 import { board, paint, type CardData, type Reveal } from "./share";
 
 /** Frames per second. 30 is the floor for anything that looks deliberate. */
 const FPS = 30;
 
-/** In preference order: what Instagram takes first, what we can make second. */
+/**
+ * In preference order: what Instagram takes first, what we can make second.
+ *
+ * Audio codecs are named where the container needs them — a recorder handed an
+ * audio track with a video-only mimeType either drops the sound or refuses to
+ * start, and a silent reel that was supposed to have a score is a bug nobody
+ * notices until it's posted.
+ */
 const TYPES = [
-  "video/mp4;codecs=avc1.42E01E",
-  "video/mp4;codecs=h264",
+  "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+  "video/mp4;codecs=h264,aac",
   "video/mp4",
-  "video/webm;codecs=vp9",
-  "video/webm;codecs=vp8",
+  "video/webm;codecs=vp9,opus",
+  "video/webm;codecs=vp8,opus",
   "video/webm",
 ];
 
@@ -69,10 +77,17 @@ export async function renderReel(
   const at: Reveal = { grain: 0, header: 0, words: 0, footer: 0, brand: 0 };
   paint(ctx, data, at);
 
+  // The score shares the recording. `openScore` returns null where Web Audio
+  // is missing, and a silent reel is still worth making, so this is optional
+  // rather than fatal.
+  const score = openScore();
   const stream = canvas.captureStream(FPS);
+  if (score) stream.addTrack(score.track);
+
   const recorder = new MediaRecorder(stream, {
     mimeType: mime,
     videoBitsPerSecond: 12_000_000,
+    audioBitsPerSecond: 128_000,
   });
   const chunks: BlobPart[] = [];
   recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
@@ -107,15 +122,38 @@ export async function renderReel(
     // mark does — a logo that announces itself over the content gets cropped.
     .to(at, { brand: 1, duration: 0.9, ease: "power1.out" }, ">-0.2")
     // A beat on the finished card, which is also the still image.
-    .to({}, { duration: 1.2 });
+    .to({}, { duration: 1.9 });
 
   const total = tl.duration();
   const started = performance.now();
+
+  // Cues fire off the same numbers the picture is drawn from, never off a
+  // separate clock — the film kit's rule, and the reason its sound lands. A
+  // word's note plays the frame that word first has any opacity.
+  let sounded = -1;
+  let sweptAt = false;
+  let resolved = false;
+
   await new Promise<void>((resolve) => {
     const tick = setInterval(() => {
       const t = (performance.now() - started) / 1000;
       tl.time(Math.min(t, total));
       paint(ctx, data, at);
+
+      if (score) {
+        while (sounded < Math.floor(at.words) - 1 && sounded < words - 1) {
+          score.word(++sounded);
+        }
+        if (!sweptAt && at.footer > 0) {
+          sweptAt = true;
+          score.sweep();
+        }
+        if (!resolved && at.brand > 0) {
+          resolved = true;
+          score.resolve();
+        }
+      }
+
       onProgress?.(Math.min(1, t / total));
       if (t >= total) {
         clearInterval(tick);
@@ -124,10 +162,12 @@ export async function renderReel(
     }, 1000 / FPS);
   });
 
-  // A moment at the end so the last frames reach the encoder before it closes.
-  await new Promise((r) => setTimeout(r, 250));
+  // A moment at the end so the last frames — and the chord's tail — reach the
+  // encoder before it closes.
+  await new Promise((r) => setTimeout(r, 400));
   recorder.stop();
   stream.getTracks().forEach((t) => t.stop());
+  await score?.close();
 
   const blob = await done;
   return {

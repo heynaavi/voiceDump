@@ -262,6 +262,142 @@ function Speech({ v }: { v: Data["vocabulary"] }) {
   );
 }
 
+/**
+ * Filler rate, against the only published figure worth citing.
+ *
+ * Bortfeld et al. (2001) measured 192 speakers in recorded conversation and
+ * reported 3.04 fillers per 100 words for men and 2.07 for women — a real
+ * baseline rather than a number invented to be flattering.
+ *
+ * The caveat is on the card because it has to be: our detection is deliberately
+ * conservative — [`FILLERS`] counts eight unambiguous ones and skips "like",
+ * "just" and "so" precisely because they do ordinary work — so this counts fewer
+ * things than the study did. Everyone will therefore score low against it. Said
+ * plainly, that is context; unsaid, it would be flattery.
+ */
+function FillerRate({ v }: { v: Data["vocabulary"] }) {
+  const MAX = 6;
+  const at = (n: number) => `${Math.min(100, (n / MAX) * 100)}%`;
+
+  return (
+    <Panel title="HOW OFTEN YOU REACH FOR A FILLER">
+      <p className="mono-data text-[34px] leading-none text-ink">
+        {v.filler_rate.toFixed(1)}
+        <span className="ml-1 text-[13px] text-grey">per 100 words</span>
+      </p>
+
+      <div className="relative mt-6 h-8">
+        <span className="absolute left-0 right-0 top-[13px] h-[2px] bg-hairline-soft" />
+        {/* The published band, not a target. */}
+        <span
+          className="absolute top-[9px] h-[10px] bg-sage-dim/35"
+          style={{ left: at(2.07), width: at(3.04 - 2.07) }}
+        />
+        <span
+          className="absolute top-[4px] h-[20px] w-[2px] bg-sage-dim"
+          style={{ left: at(v.filler_rate) }}
+        />
+        <span
+          className="diagnostic absolute top-[26px] -translate-x-1/2 text-sage-dim"
+          style={{ left: at(v.filler_rate) }}
+        >
+          YOU
+        </span>
+        <span
+          className="diagnostic absolute top-[26px] text-faint"
+          style={{ left: at(2.2) }}
+        >
+          TYPICAL
+        </span>
+        <span className="diagnostic absolute left-0 top-[26px] text-faint">0</span>
+        <span className="diagnostic absolute right-0 top-[26px] text-faint">{MAX}</span>
+      </div>
+
+      <p className="mt-8 text-[12px] leading-relaxed text-grey">
+        Recorded conversation averages <b className="text-ink">2.07–3.04</b>{" "}
+        fillers per 100 words (Bortfeld et al., 2001, n=192). We count
+        conservatively — only unmistakable fillers, never “like” or “just” — so
+        this figure runs low against that study by design.
+      </p>
+    </Panel>
+  );
+}
+
+/**
+ * Whether you are getting better, measured against yourself.
+ *
+ * There is no other honest baseline: the app holds nobody else's speech and
+ * collects none. Two equal windows of your own history, the same measurements
+ * on each. It refuses to report anything until both windows carry enough words
+ * to be stable, because a filler rate off eighty words is noise and calling
+ * noise "progress" is what makes habit trackers untrustworthy.
+ */
+function Trend({ p }: { p: Data["progress"] }) {
+  const NAMES: Record<string, { label: string; fmt: (n: number) => string }> = {
+    filler_rate: { label: "FILLER RATE", fmt: (n) => `${n.toFixed(1)}/100w` },
+    variety: { label: "WORD VARIETY", fmt: (n) => `${Math.round(n * 100)}%` },
+    avg_sentence_words: { label: "SENTENCE LENGTH", fmt: (n) => `${n.toFixed(1)}w` },
+    words_per_minute: { label: "SPEAKING PACE", fmt: (n) => `${Math.round(n)} wpm` },
+  };
+
+  if (!p.ready) {
+    return (
+      <Panel title="ARE YOU IMPROVING" aside="NOT YET">
+        <p className="text-[12px] leading-relaxed text-grey">
+          This compares two equal stretches of your own history. There isn’t
+          enough speech in both yet — keep dictating and it fills itself in.
+        </p>
+        <p className="micro mt-2 text-faint">
+          {p.before_words.toLocaleString()} THEN · {p.after_words.toLocaleString()} NOW
+          · NEEDS 250 EACH
+        </p>
+      </Panel>
+    );
+  }
+
+  return (
+    <Panel title="ARE YOU IMPROVING" aside={`LAST ${p.window_days} DAYS VS THE ${p.window_days} BEFORE`}>
+      <ul className="grid gap-x-8 gap-y-4 sm:grid-cols-2">
+        {p.moves.map((m) => {
+          const meta = NAMES[m.key];
+          const delta = m.after - m.before;
+          const pct = m.before !== 0 ? (delta / m.before) * 100 : 0;
+          // No verdict where none is warranted: a longer sentence is not a
+          // better or worse one, so those are drawn neutral.
+          const judged = m.higher_is_better !== null && Math.abs(pct) >= 1;
+          const good = judged && delta > 0 === m.higher_is_better;
+          return (
+            <li key={m.key} className="flex items-baseline justify-between gap-3">
+              <span className="text-[12px] text-grey">{meta.label}</span>
+              <span className="flex items-baseline gap-2 whitespace-nowrap">
+                <span className="mono-data text-[11px] text-faint">
+                  {meta.fmt(m.before)}
+                </span>
+                <span className="text-faint">→</span>
+                <span className="mono-data text-[13px] text-ink">
+                  {meta.fmt(m.after)}
+                </span>
+                <span
+                  className={`mono-data text-[11px] ${
+                    !judged ? "text-faint" : good ? "text-sage-dim" : "text-amber"
+                  }`}
+                >
+                  {pct > 0 ? "+" : ""}
+                  {Math.abs(pct) < 1 ? "—" : `${Math.round(pct)}%`}
+                </span>
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+      <p className="micro mt-4 text-faint">
+        {p.before_words.toLocaleString()} WORDS THEN · {p.after_words.toLocaleString()} NOW
+        · COMPARED WITH YOURSELF, NOT WITH ANYONE ELSE
+      </p>
+    </Panel>
+  );
+}
+
 /** "2026-07-04" + "2026-08-01" → "Jul – Aug 2026". Shown on the share card. */
 function period(first: string | null, last: string | null): string {
   if (!first || !last) return "";
@@ -273,6 +409,19 @@ function period(first: string | null, last: string | null): string {
   const a = fmt(first);
   const b = fmt(last);
   return a === b ? a : `${a} – ${b}`;
+}
+
+/**
+ * `2026-08-01-1432`, for the export filename.
+ *
+ * Every save offered the same name, so the second one landed on a "replace?"
+ * prompt and the third overwrote a card someone had meant to keep. Local time
+ * rather than ISO/UTC: the file is named for the day the person had.
+ */
+function stamp(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
 }
 
 /** Words the user has struck off their own cloud, per this machine. */
@@ -360,7 +509,7 @@ function WordCloud({
     setError(null);
     setNote(null);
     const target = await save({
-      defaultPath: "what-i-talk-about.png",
+      defaultPath: `what-i-talk-about-${stamp()}.png`,
       filters: [{ name: "PNG image", extensions: ["png"] }],
     });
     if (!target) return;
@@ -383,7 +532,7 @@ function WordCloud({
     const kind = bestType();
     const ext = kind?.startsWith("video/mp4") ? "mp4" : "webm";
     const target = await save({
-      defaultPath: `what-i-talk-about.${ext}`,
+      defaultPath: `what-i-talk-about-${stamp()}.${ext}`,
       filters: [{ name: ext.toUpperCase() + " video", extensions: [ext] }],
     });
     if (!target) return;
@@ -648,6 +797,11 @@ export function Insights() {
           <Panel title="HOW YOU SPEAK">
             <Speech v={v} />
           </Panel>
+        </div>
+
+        <div data-row className="grid gap-3 md:grid-cols-2">
+          <FillerRate v={v} />
+          <Trend p={data.progress} />
         </div>
 
         <div data-row>

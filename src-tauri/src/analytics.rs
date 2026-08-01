@@ -72,6 +72,37 @@ pub struct Speaking {
     pub sample_notes: i64,
 }
 
+/// One measurement, then and now.
+#[derive(Serialize)]
+pub struct Move {
+    pub key: String,
+    pub before: f64,
+    pub after: f64,
+    /// Whether an increase is the good direction. Speaking faster is not
+    /// self-evidently better, so `None` means "reported, not judged".
+    pub higher_is_better: Option<bool>,
+}
+
+/// How the last stretch compares with the one before it.
+///
+/// Deliberately a comparison with **yourself**. The app has no other users'
+/// speech and will never collect any, so the only honest baseline is your own
+/// earlier recording — which is also the one that answers the question people
+/// actually have, which is whether they are getting better.
+///
+/// `ready` is false until both windows hold enough speech to mean anything. A
+/// filler rate computed from forty words is noise, and dressing noise up as
+/// progress is the failure mode of every habit tracker.
+#[derive(Serialize)]
+pub struct Progress {
+    pub ready: bool,
+    /// Days in each window — 30 unless the history is shorter.
+    pub window_days: i64,
+    pub before_words: i64,
+    pub after_words: i64,
+    pub moves: Vec<Move>,
+}
+
 #[derive(Serialize)]
 pub struct Summary {
     pub total_notes: i64,
@@ -96,6 +127,96 @@ pub struct Summary {
     pub by_language: Vec<Count>,
 
     pub vocabulary: Vocabulary,
+    pub progress: Progress,
+}
+
+/// Split the history at a midpoint and measure both halves the same way.
+///
+/// The window is 30 days where the history allows it and half the history
+/// otherwise, so someone two weeks in still gets a comparison rather than an
+/// empty panel — the panel says how long the window is, so a short one can be
+/// read for what it is.
+fn compare(rows: &[(i64, &str, f64, i64)], texts: &[String], now: i64) -> Progress {
+    /// Under this many words in a window, none of these numbers are stable.
+    const MIN_WORDS: i64 = 250;
+    const DAY_MS: i64 = 86_400_000;
+
+    let span_days = rows
+        .first()
+        .map(|r| ((now - r.0) / DAY_MS).max(1))
+        .unwrap_or(0);
+    let window_days = 30.min((span_days / 2).max(1));
+    let cut = now - window_days * DAY_MS;
+    let floor = cut - window_days * DAY_MS;
+
+    let pick = |from: i64, to: i64| -> (Vec<String>, i64, f64, i64) {
+        let mut text = Vec::new();
+        let (mut words, mut seconds, mut notes) = (0i64, 0.0, 0i64);
+        for (i, (at, source, duration, w)) in rows.iter().enumerate() {
+            if *at < from || *at >= to {
+                continue;
+            }
+            text.push(texts[i].clone());
+            words += w;
+            notes += 1;
+            if *source == "hotkey" || *source == "mic" {
+                seconds += duration;
+            }
+        }
+        (text, words, seconds, notes)
+    };
+
+    let (before_text, before_words, before_secs, _) = pick(floor, cut);
+    let (after_text, after_words, after_secs, _) = pick(cut, now + DAY_MS);
+
+    if before_words < MIN_WORDS || after_words < MIN_WORDS {
+        return Progress {
+            ready: false,
+            window_days,
+            before_words,
+            after_words,
+            moves: Vec::new(),
+        };
+    }
+
+    let a = analyse_text(&before_text);
+    let b = analyse_text(&after_text);
+    let wpm = |w: i64, s: f64| if s > 0.0 { w as f64 / (s / 60.0) } else { 0.0 };
+
+    Progress {
+        ready: true,
+        window_days,
+        before_words,
+        after_words,
+        moves: vec![
+            Move {
+                key: "filler_rate".into(),
+                before: a.filler_rate,
+                after: b.filler_rate,
+                higher_is_better: Some(false),
+            },
+            Move {
+                key: "variety".into(),
+                before: a.variety,
+                after: b.variety,
+                higher_is_better: Some(true),
+            },
+            // Neither direction is an improvement on its own — a long sentence
+            // can be well-built or a run-on — so this is shown without a verdict.
+            Move {
+                key: "avg_sentence_words".into(),
+                before: a.avg_sentence_words,
+                after: b.avg_sentence_words,
+                higher_is_better: None,
+            },
+            Move {
+                key: "words_per_minute".into(),
+                before: wpm(before_words, before_secs),
+                after: wpm(after_words, after_secs),
+                higher_is_better: None,
+            },
+        ],
+    }
 }
 
 // -- text analysis ----------------------------------------------------------
@@ -491,6 +612,14 @@ pub fn analytics_summary(app: tauri::AppHandle) -> Result<Summary, String> {
         app_unknown,
         by_language,
         vocabulary: analyse_text(&texts),
+        progress: compare(
+            &rows
+                .iter()
+                .map(|r| (r.created_at, r.source.as_str(), r.duration, r.words))
+                .collect::<Vec<_>>(),
+            &texts,
+            crate::now_ms(),
+        ),
     })
 }
 
@@ -571,6 +700,50 @@ mod tests {
         let top: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
         assert!(top.contains(&"sort"), "lost a real use of the word: {top:?}");
         assert!(v.fillers.is_empty());
+    }
+
+    /// A thin history reports no progress rather than inventing some.
+    ///
+    /// Two notes in each window would give a filler rate accurate to nothing,
+    /// and "your filler rate improved 60%" off eighty words is the failure mode
+    /// of every habit tracker. The panel stays quiet until both windows carry
+    /// enough speech to compare.
+    #[test]
+    fn progress_needs_enough_speech_in_both_windows() {
+        const DAY: i64 = 86_400_000;
+        let now = 60 * DAY;
+        let rows = vec![
+            (now - 50 * DAY, "hotkey", 30.0, 40),
+            (now - 5 * DAY, "hotkey", 30.0, 40),
+        ];
+        let texts = vec!["a short note".to_string(), "another short note".to_string()];
+        let p = compare(&rows, &texts, now);
+        assert!(!p.ready);
+        assert!(p.moves.is_empty());
+    }
+
+    /// With enough on both sides, each measure is reported for both windows.
+    #[test]
+    fn progress_compares_the_two_windows() {
+        const DAY: i64 = 86_400_000;
+        let now = 60 * DAY;
+        // 300 words a side, and the later window says "um" far less.
+        let noisy = format!("{}\n", "um the design is um good and the build is fine ".repeat(30));
+        let clean = format!("{}\n", "the design is good and the build is fine today ".repeat(30));
+        let rows = vec![
+            (now - 40 * DAY, "hotkey", 120.0, 300),
+            (now - 5 * DAY, "hotkey", 120.0, 300),
+        ];
+        let p = compare(&rows, &[noisy, clean], now);
+        assert!(p.ready, "expected a comparison, got {:?}", p.before_words);
+        let filler = p.moves.iter().find(|m| m.key == "filler_rate").unwrap();
+        assert!(
+            filler.after < filler.before,
+            "fillers should have fallen: {} → {}",
+            filler.before,
+            filler.after
+        );
+        assert_eq!(filler.higher_is_better, Some(false));
     }
 
     /// Contractions are function words, not topics.

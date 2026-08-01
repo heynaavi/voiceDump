@@ -300,6 +300,22 @@ export type Speaking = {
   sample_notes: number;
 };
 
+export type Move = {
+  key: "filler_rate" | "variety" | "avg_sentence_words" | "words_per_minute";
+  before: number;
+  after: number;
+  /** `null` where a direction isn't self-evidently an improvement. */
+  higher_is_better: boolean | null;
+};
+
+export type Progress = {
+  ready: boolean;
+  window_days: number;
+  before_words: number;
+  after_words: number;
+  moves: Move[];
+};
+
 export type Insights = {
   total_notes: number;
   total_words: number;
@@ -317,6 +333,7 @@ export type Insights = {
   app_unknown: number;
   by_language: Count[];
   vocabulary: Vocabulary;
+  progress: Progress;
 };
 
 export async function analyticsSummary(): Promise<Insights> {
