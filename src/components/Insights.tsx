@@ -351,6 +351,21 @@ const SPANS: { key: string; label: string; needs: string }[] = [
 ];
 
 /**
+ * How long each half is, said in the unit that distinguishes it.
+ *
+ * Printed on every span, not just ALL, because two spans can land on the same
+ * partition: two days of history makes ALL a 23-hour half, and if nothing was
+ * recorded in the hour between that cut and the 1D cut, both tabs group exactly
+ * the same notes and show exactly the same figures. That is arithmetic, not a
+ * bug — but without the window length on the card it reads as one tab ignoring
+ * you, so the card says where it cut.
+ */
+function halves(hours: number): string {
+  if (hours >= 48) return `${Math.round(hours / 24)}-DAY HALVES`;
+  return `${hours}-HOUR HALVES`;
+}
+
+/**
  * Whether you are getting better, measured against yourself.
  *
  * There is no other honest baseline: the app holds nobody else's speech and
@@ -495,10 +510,7 @@ function Trend({ windows }: { windows: Data["progress"] }) {
               className="micro mt-5 border-t border-hairline pt-3 text-faint"
             >
               {p.before_words.toLocaleString()} WORDS THEN ·{" "}
-              {p.after_words.toLocaleString()} NOW ·{" "}
-              {p.key === "all"
-                ? `${p.window_days}-DAY HALVES`
-                : "MEASURED AGAINST YOURSELF"}
+              {p.after_words.toLocaleString()} NOW · {halves(p.window_hours)}
             </p>
           </>
         )}

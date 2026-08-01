@@ -314,7 +314,9 @@ export type Progress = {
   /** False where the history is too short for this span. Shown disabled. */
   available: boolean;
   ready: boolean;
-  window_days: number;
+  /** Length of each half, in hours. Hours, so "all" over two days of history
+   *  reads as 23-hour halves rather than rounding into the 1D tab's label. */
+  window_hours: number;
   before_words: number;
   after_words: number;
   moves: Move[];

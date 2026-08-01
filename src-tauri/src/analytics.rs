@@ -103,8 +103,11 @@ pub struct Progress {
     /// every time you open it.
     pub available: bool,
     pub ready: bool,
-    /// Days in each window. For "all" this is half the history.
-    pub window_days: i64,
+    /// Length of each window in hours. Reported at this resolution because
+    /// "all" on a two-day history is a 23-hour half, not a one-day one, and
+    /// rounding it to a day made it print the same label as the 1D tab while
+    /// cutting the history in a different place.
+    pub window_hours: i64,
     pub before_words: i64,
     pub after_words: i64,
     pub moves: Vec<Move>,
@@ -140,6 +143,7 @@ pub struct Summary {
 }
 
 const DAY_MS: i64 = 86_400_000;
+const HOUR_MS: i64 = 3_600_000;
 
 /// The spans the panel offers, shortest first.
 ///
@@ -169,7 +173,7 @@ fn progress_windows(rows: &[(i64, &str, f64, i64)], texts: &[String], now: i64) 
                     floor,
                     cut,
                     end: now,
-                    days,
+                    hours: days * 24,
                     measure: available,
                 },
             )
@@ -192,7 +196,7 @@ fn progress_windows(rows: &[(i64, &str, f64, i64)], texts: &[String], now: i64) 
                 floor: first,
                 cut,
                 end: now,
-                days: ((now - cut) / DAY_MS).max(1),
+                hours: ((now - cut) / HOUR_MS).max(1),
                 measure: true,
             },
         )
@@ -207,8 +211,8 @@ struct Split {
     /// The boundary: earlier window ends here, later window starts here.
     cut: i64,
     end: i64,
-    /// Length of each window in days, for display.
-    days: i64,
+    /// Length of each window in hours, for display.
+    hours: i64,
     /// False for a span the history cannot support — see `compare`.
     measure: bool,
 }
@@ -222,7 +226,7 @@ fn compare(rows: &[(i64, &str, f64, i64)], texts: &[String], split: Split) -> Pr
     /// Under this many words in a window, none of these numbers are stable.
     const MIN_WORDS: i64 = 250;
 
-    let Split { floor, cut, end, days: window_days, measure } = split;
+    let Split { floor, cut, end, hours: window_hours, measure } = split;
 
     let pick = |from: i64, to: i64| -> (Vec<String>, i64, f64, i64) {
         let mut text = Vec::new();
@@ -249,7 +253,7 @@ fn compare(rows: &[(i64, &str, f64, i64)], texts: &[String], split: Split) -> Pr
             key: String::new(),
             available: measure,
             ready: false,
-            window_days,
+            window_hours,
             before_words,
             after_words,
             moves: Vec::new(),
@@ -264,7 +268,7 @@ fn compare(rows: &[(i64, &str, f64, i64)], texts: &[String], split: Split) -> Pr
         key: String::new(),
         available: true,
         ready: true,
-        window_days,
+        window_hours,
         before_words,
         after_words,
         moves: vec![
@@ -717,7 +721,7 @@ mod tests {
             floor: cut - 30 * DAY_MS,
             cut,
             end: now,
-            days: 30,
+            hours: 30 * 24,
             measure: true,
         }
     }
@@ -839,7 +843,7 @@ mod tests {
         assert!(!by("30").available);
         // Everything is always offered — it is whatever there is, halved.
         assert!(by("all").available);
-        assert_eq!(by("all").window_days, 5);
+        assert_eq!(by("all").window_hours, 5 * 24);
     }
 
     /// Two days in, yesterday against the day before is a real question.
