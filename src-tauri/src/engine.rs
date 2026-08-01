@@ -345,6 +345,77 @@ pub struct Preview {
     state: whisper_rs::WhisperState,
 }
 
+/// One word of the live preview, and how sure the model was of it.
+///
+/// The preview runs on `small`, which is fast and wrong more often than the
+/// model that produces the pasted text — so the overlay says which words it is
+/// standing behind rather than presenting every guess with equal confidence.
+pub struct Heard {
+    pub word: String,
+    /// 0…1. The geometric mean of the probabilities whisper assigned to the
+    /// tokens this word is made of — geometric because a word is only as
+    /// certain as its least certain piece, and an arithmetic mean lets one
+    /// confident token carry a doubtful one.
+    pub confidence: f32,
+}
+
+/// Reassemble whisper's tokens into words, carrying their probabilities.
+///
+/// Whisper's BPE emits the space that belongs *in front of* a token as part of
+/// it, so a leading space is exactly the signal that a new word has started —
+/// which is also why "graphify" arrives as `" graph"` + `"ify"` and must be
+/// joined back up rather than shown as two words with two confidences.
+fn words_with_confidence(seg: &whisper_rs::WhisperSegment<'_>, out: &mut Vec<Heard>) {
+    /// A word being built: its text so far, the sum of its tokens' ln(p), and
+    /// how many tokens went into it.
+    type Open = Option<(String, f32, u32)>;
+
+    fn flush(open: &mut Open, out: &mut Vec<Heard>) {
+        let Some((word, sum_ln, n)) = open.take() else {
+            return;
+        };
+        let word = word.trim().to_string();
+        if !word.is_empty() {
+            out.push(Heard {
+                confidence: (sum_ln / n.max(1) as f32).exp().clamp(0.0, 1.0),
+                word,
+            });
+        }
+    }
+
+    let mut open: Open = None;
+    for t in 0..seg.n_tokens() {
+        let Some(tok) = seg.get_token(t) else { continue };
+        let Ok(raw) = tok.to_str_lossy() else { continue };
+        // Whisper emits control tokens inline ([_BEG_], <|notimestamps|>…).
+        if raw.starts_with("[_") || raw.starts_with("<|") {
+            continue;
+        }
+        // A token that is nothing but space carries no letters but still ends
+        // whatever word was open.
+        if raw.trim().is_empty() {
+            flush(&mut open, out);
+            continue;
+        }
+        // `p` rather than `plog`: it is the field the decoder always fills, and
+        // clamping off zero keeps `ln` finite for a token the model gave no
+        // weight at all.
+        let ln = tok.token_data().p.clamp(1e-6, 1.0).ln();
+        match open.as_mut() {
+            Some(w) if !raw.starts_with(' ') => {
+                w.0.push_str(&raw);
+                w.1 += ln;
+                w.2 += 1;
+            }
+            _ => {
+                flush(&mut open, out);
+                open = Some((raw.trim_start().to_string(), ln, 1));
+            }
+        }
+    }
+    flush(&mut open, out);
+}
+
 impl Preview {
     /// Borrow the loaded model long enough to build a state.
     ///
@@ -404,7 +475,7 @@ impl Preview {
     ///
     /// Checking between passes is enough now that a pass covers seconds rather
     /// than the whole recording: the worst key-up delay is one short chunk.
-    pub fn step(&mut self, samples: &[f32], cancel: Arc<AtomicBool>) -> Option<String> {
+    pub fn step(&mut self, samples: &[f32], cancel: Arc<AtomicBool>) -> Option<Vec<Heard>> {
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
@@ -424,7 +495,9 @@ impl Preview {
         params.set_print_timestamps(false);
         params.set_n_threads((num_threads() as i32).max(1));
         // No token timestamps: the panel shows words, not a scrubber, and they
-        // cost real time to compute.
+        // cost real time to compute. Per-token *probabilities* are a different
+        // matter — the decoder has them either way, so the confidence the
+        // overlay draws with is free.
         params.set_token_timestamps(false);
 
         // A failed pass is not worth surfacing — the final transcription is
@@ -435,7 +508,7 @@ impl Preview {
         }
 
         let n = self.state.full_n_segments();
-        let mut out = String::new();
+        let mut out: Vec<Heard> = Vec::new();
         for i in 0..n {
             let Some(seg) = self.state.get_segment(i) else {
                 continue;
@@ -445,10 +518,8 @@ impl Preview {
             if piece.is_empty() || is_non_speech(piece) {
                 continue;
             }
-            out.push_str(piece);
-            out.push(' ');
+            words_with_confidence(&seg, &mut out);
         }
-        let out = out.trim().to_string();
         (!out.is_empty()).then_some(out)
     }
 }

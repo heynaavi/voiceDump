@@ -39,7 +39,7 @@ pub struct DictationState {
 /// active full-screen Space, however it's configured (measured exhaustively). A
 /// standalone accessory `NSPanel` can, so the pill lives in this tiny process
 /// and we drive it over its stdin. Protocol: one command per line —
-/// `show`, `transcribing`, `level <0..1>`, `text <partial>`, `hide`, `quit`.
+/// `show`, `transcribing`, `level <0..1>`, `text <words>`, `hide`, `quit`.
 mod overlay {
     use std::io::Write;
     use std::path::Path;
@@ -106,15 +106,62 @@ mod overlay {
         send(&format!("level {v:.3}"));
     }
 
-    /// Show what has been heard so far. Newlines would break the line-per-command
-    /// protocol, so they are flattened rather than escaped — the pill is one
-    /// running line of text anyway.
-    pub fn text(s: &str) {
-        let flat: String = s
-            .chars()
-            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-            .collect();
-        send(&format!("text {}", flat.trim()));
+    /// Show what has been heard so far, each word carrying how sure the model
+    /// was of it.
+    ///
+    /// The protocol is one command per line, so the words are encoded rather
+    /// than sent as JSON: each is prefixed with a single digit for its
+    /// confidence in ninths, `0` (a guess) to `9` (certain). Words were split on
+    /// whitespace upstream and any that survives inside one is stripped here, so
+    /// a space is still an unambiguous separator.
+    pub fn words(list: &[crate::engine::Heard]) {
+        let mut line = String::from("text");
+        for h in list {
+            let word: String = h.word.split_whitespace().collect();
+            if word.is_empty() {
+                continue;
+            }
+            line.push(' ');
+            line.push(confidence_digit(h.confidence));
+            line.push_str(&word);
+        }
+        send(&line);
+    }
+
+    /// Take the panel down to nothing.
+    pub fn clear() {
+        send("text");
+    }
+
+    fn confidence_digit(c: f32) -> char {
+        let d = (c * 9.0).round().clamp(0.0, 9.0) as u32;
+        char::from_digit(d, 10).unwrap_or('9')
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::confidence_digit;
+
+        /// The digit is the whole channel the overlay has for confidence, so
+        /// both ends of the range have to survive the round trip: a certain word
+        /// must not read as slightly doubtful, and a guess must reach `0` rather
+        /// than being rounded up into "fine".
+        #[test]
+        fn confidence_covers_the_whole_range() {
+            assert_eq!(confidence_digit(1.0), '9');
+            assert_eq!(confidence_digit(0.0), '0');
+            assert_eq!(confidence_digit(0.5), '5');
+        }
+
+        /// `exp()` of a sum of logs can land a hair outside 0…1, and a digit
+        /// outside 0…9 would be parsed as part of the word itself.
+        #[test]
+        fn out_of_range_confidence_still_yields_one_digit() {
+            for c in [-1.0, -0.001, 1.001, 42.0, f32::NAN] {
+                let d = confidence_digit(c);
+                assert!(d.is_ascii_digit(), "{c} produced {d:?}");
+            }
+        }
     }
 
     /// Ask the helper to quit, on app shutdown.
@@ -463,7 +510,7 @@ fn spawn_preview(app: &tauri::AppHandle, cap: &Capture) {
         let mut session: Option<crate::engine::Preview> = None;
         let mut buf: Vec<f32> = Vec::new();
         let mut cursor = 0usize;
-        let mut text = String::new();
+        let mut heard: Vec<crate::engine::Heard> = Vec::new();
 
         while !stop.load(Ordering::SeqCst) && !cancel.load(Ordering::Relaxed) {
             // Drain whatever the microphone has produced. Blocking briefly here
@@ -506,12 +553,13 @@ fn spawn_preview(app: &tauri::AppHandle, cap: &Capture) {
 
             let Some(s) = session.as_mut() else { continue };
             if let Some(piece) = s.step(&audio, cancel.clone()) {
-                if !text.is_empty() {
-                    text.push(' ');
-                }
-                text.push_str(&piece);
-                overlay::text(&text);
-                let _ = app.emit("dictation-partial", &text);
+                heard.extend(piece);
+                overlay::words(&heard);
+                // The window gets the plain sentence: confidence is a reading
+                // aid for the words floating over another app, and the app's own
+                // UI is not where you are looking while you dictate.
+                let words: Vec<&str> = heard.iter().map(|h| h.word.as_str()).collect();
+                let _ = app.emit("dictation-partial", words.join(" "));
             }
             // Advance regardless: a chunk that transcribed to nothing was
             // silence, and re-reading it forever would stall the cursor.
@@ -522,7 +570,7 @@ fn spawn_preview(app: &tauri::AppHandle, cap: &Capture) {
         // states plus the model is over 1.6 GB on `medium`, and there is no
         // reason for them to overlap.
         drop(session);
-        overlay::text("");
+        overlay::clear();
     });
 }
 

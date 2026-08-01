@@ -12,7 +12,7 @@
 // reads as a system error, a soft frosted pill reads as a quiet status HUD.
 //
 // Protocol — one command per line on stdin:
-//   show / transcribing / level <0..1> / hide / quit
+//   show / transcribing / level <0..1> / text <words> / hide / quit
 
 import Cocoa
 import QuartzCore
@@ -24,6 +24,13 @@ private let cBorder = NSColor(calibratedRed: 0.72, green: 0.83, blue: 0.64, alph
 private let cSage = NSColor(calibratedRed: 0.72, green: 0.83, blue: 0.64, alpha: 1)
 private let cSageDim = NSColor(calibratedRed: 0.56, green: 0.69, blue: 0.49, alpha: 1)
 private let cSageBright = NSColor(calibratedRed: 0.82, green: 0.90, blue: 0.76, alpha: 1)
+/// Deeper than `cSageDim`, and only used for the cells of an uncertain word.
+///
+/// Squares lay down more ink than the letters they replace, so a pixelated word
+/// drawn in the reading colour comes out *louder* than the sentence around it —
+/// which says the opposite of what it means. Pulled down to here it sits under
+/// its neighbours, and the eye reads it as something held back.
+private let cSageDeep = NSColor(calibratedRed: 0.40, green: 0.50, blue: 0.34, alpha: 1)
 
 // The brand mark — §4.4 pixel cluster, 3×3 with two cells knocked out.
 private let brand: [Bool] = [true, true, false, true, true, true, false, true, true]
@@ -195,6 +202,93 @@ final class PillView: NSView {
 
 // MARK: - Live transcript
 
+/// One word of the live transcript, and how sure the model was of it.
+struct Heard {
+    let word: String
+    /// 0…1. The wire carries one digit per word, so this arrives in ninths.
+    let confidence: CGFloat
+}
+
+/// Decode a `text` payload.
+///
+/// Words separated by spaces, each prefixed with a single digit for its
+/// confidence in ninths — see `overlay::words` on the Rust side. A field that
+/// is only a digit, or that starts with something else, is dropped rather than
+/// guessed at: a malformed line should cost one word, not the whole panel.
+func parseHeard(_ payload: String) -> [Heard] {
+    payload.split(separator: " ").compactMap { field in
+        guard field.count > 1, let digit = field.first?.wholeNumberValue,
+            (0...9).contains(digit)
+        else { return nil }
+        return Heard(word: String(field.dropFirst()), confidence: CGFloat(digit) / 9.0)
+    }
+}
+
+/// A TextKit stack for one string at one width.
+///
+/// Everything the panel needs — the size it wants, the lines it took, and where
+/// each word landed — comes out of the same layout, so the pixel cells drawn
+/// over an uncertain word cannot drift away from the glyphs they stand in for.
+final class Layout {
+    let storage: NSTextStorage
+    let manager = NSLayoutManager()
+    let container: NSTextContainer
+
+    init(_ s: NSAttributedString, width: CGFloat) {
+        storage = NSTextStorage(attributedString: s)
+        container = NSTextContainer(
+            size: NSSize(width: width, height: .greatestFiniteMagnitude))
+        container.lineFragmentPadding = 0
+        manager.usesFontLeading = true
+        manager.addTextContainer(container)
+        storage.addLayoutManager(manager)
+        manager.ensureLayout(for: container)
+    }
+
+    var glyphs: NSRange { manager.glyphRange(for: container) }
+
+    var size: NSSize {
+        let r = manager.usedRect(for: container)
+        return NSSize(width: ceil(r.maxX), height: ceil(r.maxY))
+    }
+
+    var lines: Int {
+        var n = 0
+        var i = 0
+        while i < manager.numberOfGlyphs {
+            var r = NSRange()
+            _ = manager.lineFragmentRect(forGlyphAt: i, effectiveRange: &r)
+            i = max(NSMaxRange(r), i + 1)
+            n += 1
+        }
+        return max(1, n)
+    }
+}
+
+/// A scratch view used only to rasterise one word so its ink can be measured.
+///
+/// A view rather than an image with focus locked on it: `cacheDisplay(in:to:)`
+/// renders at one sample per point regardless of which display the panel is on,
+/// so a word breaks into the same cells on a laptop and on an external monitor.
+final class WordCanvas: NSView {
+    var render: (() -> Void)?
+    override var isFlipped: Bool { true }
+    override func draw(_ dirtyRect: NSRect) { render?() }
+}
+
+/// One word broken into square cells, ready to be drawn instead of its glyphs.
+struct Grid {
+    let cols: Int
+    let rows: Int
+    /// Side of one cell, in points.
+    let cell: CGFloat
+    /// Ink coverage, 0…1, per cell — row 0 at the top.
+    let coverage: [CGFloat]
+    /// Top of the grid down to the text baseline, so the cells can be hung off
+    /// the same baseline the layout gave the glyphs.
+    let ascent: CGFloat
+}
+
 /// What has been heard so far, shown above the pill while you speak.
 ///
 /// A separate panel rather than more pill: the pill is a status light — logo,
@@ -213,11 +307,20 @@ final class TranscriptView: NSView {
     static let maxLines = 4
     static let padX: CGFloat = 16
     static let padY: CGFloat = 11
+    /// The dissolve needs vertical room to work in. At 13pt an x-height is
+    /// barely nine device pixels — three cells — and a short uncertain word
+    /// stops being a word rather than fraying at its edges. 16 gives it four or
+    /// five, and the panel is still a HUD rather than a document.
+    static let fontSize: CGFloat = 16
 
-    private(set) var text: String = ""
-    /// How much of `text` has finished arriving. Everything past this is the
-    /// newest chunk, and is what gets animated in.
+    private(set) var words: [Heard] = []
+    /// How many of `words` had finished arriving before the last update.
+    /// Everything past this is the newest chunk, and is what gets animated in.
     private var settled: Int = 0
+    /// The tail of `words` that fits in `maxLines`. Recomputed when the words
+    /// change rather than per frame: finding it costs a layout per candidate
+    /// word, and the panel repaints sixty times a second while text is landing.
+    private var shown: [Heard] = []
     private var arrivedAt = CFAbsoluteTimeGetCurrent()
     /// How long a freshly-transcribed chunk takes to arrive.
     private let revealDuration: CFTimeInterval = 0.34
@@ -248,99 +351,228 @@ final class TranscriptView: NSView {
     /// in fully formed on a single frame, which reads as a glitch rather than
     /// as speech being heard.
     var isAnimating: Bool {
-        !text.isEmpty
+        !words.isEmpty
             && CFAbsoluteTimeGetCurrent() - arrivedAt < revealDuration + settleDuration
     }
 
     override var isFlipped: Bool { true }
+
+    static var font: NSFont { NSFont.systemFont(ofSize: fontSize, weight: .regular) }
 
     static var attrs: [NSAttributedString.Key: Any] {
         let para = NSMutableParagraphStyle()
         para.lineBreakMode = .byWordWrapping
         para.lineSpacing = 3
         return [
-            .font: NSFont.systemFont(ofSize: 13, weight: .regular),
+            .font: font,
             // Base is the settled weight; the newest run overrides it.
             .foregroundColor: cSageDim.withAlphaComponent(0.66),
             .paragraphStyle: para,
         ]
     }
 
-    /// The tail of the transcript that fits in `maxLines`.
+    // MARK: Confidence
+
+    /// The side of one cell, in points.
+    ///
+    /// Fixed, and deliberately small: at 16pt type an x-height is a little over
+    /// four cells, which is enough to keep a word's shape and not enough to
+    /// pretend the letters are still there. Coarser cells were tried first and
+    /// they do not degrade a word, they delete it — "off" became a smudge.
+    static let cell: CGFloat = 2
+
+    /// How far below the line of trust a word has fallen: 0 keeps its glyphs,
+    /// 1 is as broken up as anything gets.
+    ///
+    /// Doubt drives how much a word erodes rather than how big its cells are.
+    /// Growing the cells destroys short words first, which is backwards — the
+    /// short ones are where the model's mistakes actually live.
+    ///
+    /// The 0.80 line was set by measuring a real dictation against what was
+    /// said: marking everything below it catches every word the model got
+    /// wrong, and the price is texturing roughly one correct word in nine.
+    /// Erring that way is deliberate — a false mark costs a glance, and a
+    /// missed error is the thing the preview is being distrusted for.
+    static func doubt(_ confidence: CGFloat) -> CGFloat {
+        guard confidence < 0.80 else { return 0 }
+        return min(1, (0.80 - confidence) / 0.55)
+    }
+
+    /// Stable per-cell jitter, so a word's fringe erodes unevenly.
+    ///
+    /// A flat threshold takes the same amount off every edge, which just makes
+    /// the word lighter — it reads as a thinner font rather than as something
+    /// coming apart. It is a hash rather than a random number because the panel
+    /// repaints sixty times a second and a word that boils is unreadable in a
+    /// way a word that has broken up is not.
+    private static func jitter(_ i: Int, _ salt: Int) -> CGFloat {
+        var h = UInt32(truncatingIfNeeded: (i &+ 1) &* 2_654_435_761 &+ salt &* 40_503)
+        h ^= h >> 15
+        h = h &* 2_246_822_519
+        h ^= h >> 13
+        return CGFloat(h % 1024) / 1024
+    }
+
+    /// Cell grids, keyed by the word they were measured from.
+    ///
+    /// A word's grid depends only on its letters and the size of a cell — not
+    /// on where it ended up — so it survives every rewrap and every repaint.
+    /// Without this the panel would rasterise the same handful of words sixty
+    /// times a second.
+    private static var grids: [String: Grid] = [:]
+
+    /// Break one word into cells of ink coverage.
+    ///
+    /// The word is laid out and rendered once, then read back and averaged over
+    /// squares. Coverage rather than a threshold, so a stroke that only clips a
+    /// cell still registers there — that is what lets the shape erode at its
+    /// edges instead of dropping out in whole blocks.
+    static func grid(for word: String) -> Grid? {
+        if let cached = grids[word] { return cached }
+
+        // White, so every sample read back is coverage and nothing else; the
+        // colour the word is actually drawn in is applied per cell later.
+        var ink = attrs
+        ink[.foregroundColor] = NSColor.white
+        let layout = Layout(NSAttributedString(string: word, attributes: ink), width: 10_000)
+        guard layout.manager.numberOfGlyphs > 0 else { return nil }
+
+        let used = layout.manager.usedRect(for: layout.container)
+        let w = max(1, ceil(used.maxX))
+        let h = max(1, ceil(used.maxY))
+        let frag = layout.manager.lineFragmentRect(forGlyphAt: 0, effectiveRange: nil)
+        let ascent = frag.minY + layout.manager.location(forGlyphAt: 0).y
+
+        let canvas = WordCanvas(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        canvas.render = { layout.manager.drawGlyphs(forGlyphRange: layout.glyphs, at: .zero) }
+        guard let rep = canvas.bitmapImageRepForCachingDisplay(in: canvas.bounds) else {
+            return nil
+        }
+        canvas.cacheDisplay(in: canvas.bounds, to: rep)
+
+        guard rep.bitsPerSample == 8, rep.samplesPerPixel == 4, let data = rep.bitmapData
+        else { return nil }
+
+        let wide = rep.pixelsWide
+        let high = rep.pixelsHigh
+        let step = max(1, Int((TranscriptView.cell * CGFloat(wide) / w).rounded()))
+        let cols = (wide + step - 1) / step
+        let rows = (high + step - 1) / step
+        let alphaAt = rep.bitmapFormat.contains(.alphaFirst) ? 0 : rep.samplesPerPixel - 1
+        let pixel = rep.bitsPerPixel / 8
+
+        var coverage = [CGFloat](repeating: 0, count: cols * rows)
+        for cy in 0..<rows {
+            for cx in 0..<cols {
+                var sum = 0
+                var n = 0
+                for y in (cy * step)..<min((cy + 1) * step, high) {
+                    let row = y * rep.bytesPerRow
+                    for x in (cx * step)..<min((cx + 1) * step, wide) {
+                        sum += Int(data[row + x * pixel + alphaAt])
+                        n += 1
+                    }
+                }
+                coverage[cy * cols + cx] = n > 0 ? CGFloat(sum) / CGFloat(n * 255) : 0
+            }
+        }
+
+        let built = Grid(
+            cols: cols, rows: rows, cell: TranscriptView.cell, coverage: coverage, ascent: ascent)
+        // A dictation's vocabulary is small, but the process outlives every
+        // dictation. Dropping the lot is fine — the words on screen are
+        // re-rasterised on the next frame and nothing else needs them.
+        if grids.count > 512 { grids.removeAll() }
+        grids[word] = built
+        return built
+    }
+
+    // MARK: Layout
+
+    /// The tail of the transcript that fits in `maxLines`, with an ellipsis in
+    /// front when anything was dropped.
     ///
     /// The tail, because while you are still talking the words that just
     /// arrived are the ones worth seeing; the opening has already done its job
     /// of telling you it heard you correctly.
-    func visible() -> String {
-        if text.isEmpty { return "" }
-        var words = text.split(separator: " ").map(String.init)
-        while !words.isEmpty {
-            let candidate = words.joined(separator: " ")
-            if TranscriptView.linesFor(candidate) <= TranscriptView.maxLines {
-                return candidate == text ? candidate : "… " + candidate
-            }
-            words.removeFirst()
+    private func fit() -> [Heard] {
+        guard !words.isEmpty else { return [] }
+        var best: [Heard] = []
+        var take = 1
+        while take <= words.count {
+            let tail = Array(words.suffix(take))
+            let dropped = take < words.count
+            let candidate = dropped ? [Heard(word: "…", confidence: 1)] + tail : tail
+            let line = candidate.map(\.word).joined(separator: " ")
+            if TranscriptView.lines(line) > TranscriptView.maxLines { break }
+            best = candidate
+            take += 1
         }
-        return ""
+        return best
     }
 
-    private static func linesFor(_ s: String) -> Int {
-        let h = measure(s).height
-        let line = NSAttributedString(string: "Ag", attributes: attrs).size().height
-        return max(1, Int((h / max(line, 1)).rounded()))
+    private static func lines(_ s: String) -> Int {
+        guard !s.isEmpty else { return 0 }
+        return Layout(NSAttributedString(string: s, attributes: attrs), width: maxWidth).lines
     }
 
-    static func measure(_ s: String) -> NSSize {
-        guard !s.isEmpty else { return .zero }
-        let box = NSAttributedString(string: s, attributes: attrs).boundingRect(
-            with: NSSize(width: maxWidth, height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading])
-        return NSSize(width: ceil(box.width), height: ceil(box.height))
-    }
-
-    /// The panel size this text wants, or `.zero` when there is nothing to show.
+    /// The panel size these words want, or `.zero` when there is nothing to show.
     func fittingSize() -> NSSize {
-        let s = visible()
-        if s.isEmpty { return .zero }
-        let m = TranscriptView.measure(s)
+        guard !shown.isEmpty else { return .zero }
+        let m = Layout(compose(shown).0, width: TranscriptView.maxWidth).size
         return NSSize(
             width: min(m.width, TranscriptView.maxWidth) + TranscriptView.padX * 2,
             height: m.height + TranscriptView.padY * 2)
     }
 
-    func setText(_ s: String) {
-        // The preview appends, so the previous text is normally a prefix of the
-        // new one — anything beyond it is the chunk that just landed. A
-        // wholesale change (a reset, or whisper revising itself) reveals the
-        // lot rather than pretending part of it was already on screen.
-        if !text.isEmpty && s.hasPrefix(text) && s.count > text.count {
-            settled = text.count
-        } else {
-            settled = 0
+    func setWords(_ list: [Heard]) {
+        // The preview appends, so the previous words are normally a prefix of
+        // the new ones — anything beyond is the chunk that just landed. A
+        // wholesale change (a reset, or whisper revising itself) reveals the lot
+        // rather than pretending part of it was already on screen.
+        let appended =
+            !words.isEmpty && list.count > words.count
+            && zip(words, list).allSatisfy { $0.word == $1.word }
+        settled = appended ? words.count : 0
+        words = list
+        shown = fit()
+        // Rasterise the doubtful words now rather than during the first paint
+        // that needs them. Words land every couple of seconds and the panel
+        // repaints sixty times a second, so this is the moment there is time.
+        for h in shown where TranscriptView.doubt(h.confidence) > 0 {
+            _ = TranscriptView.grid(for: h.word)
         }
-        text = s
         arrivedAt = CFAbsoluteTimeGetCurrent()
         needsDisplay = true
     }
 
-    /// The visible text, with the newest chunk part-way through arriving.
+    /// The visible words as one attributed string, plus the character range each
+    /// one occupies.
     ///
-    /// Built as one attributed string rather than drawn in two passes: the
-    /// paragraph wraps, so drawing the tail separately would need its own line
-    /// layout and the two halves would not line up.
-    private func rendered() -> NSAttributedString {
-        let s = visible()
-        let out = NSMutableAttributedString(string: s, attributes: TranscriptView.attrs)
-        guard !s.isEmpty else { return out }
+    /// One string rather than a draw per word: the paragraph wraps, and words
+    /// laid out separately would not agree with each other about where the line
+    /// breaks or how the pairs kern.
+    private func compose(_ list: [Heard]) -> (NSAttributedString, [NSRange]) {
+        let line = NSMutableString()
+        var ranges: [NSRange] = []
+        for h in list {
+            if line.length > 0 { line.append(" ") }
+            let start = line.length
+            line.append(h.word)
+            ranges.append(NSRange(location: start, length: line.length - start))
+        }
 
-        // How much of the *visible* string is new. `visible()` may have dropped
-        // words off the front and added an ellipsis, so this is counted from
-        // the end, where the arrivals are.
-        let fresh = min(max(text.count - settled, 0), s.count)
-        guard fresh > 0 else { return out }
+        let out = NSMutableAttributedString(
+            string: line as String, attributes: TranscriptView.attrs)
+        // How many of the *visible* words are new. `fit()` may have dropped
+        // words off the front, so this is counted from the end, where the
+        // arrivals are.
+        let fresh = min(max(words.count - settled, 0), list.count)
+        guard fresh > 0 else { return (out, ranges) }
 
         let age = CFAbsoluteTimeGetCurrent() - arrivedAt
-        let range = NSRange(location: s.count - fresh, length: fresh)
+        let from = ranges[list.count - fresh].location
+        let range = NSRange(location: from, length: out.length - from)
 
         // `t` runs 0 (just landed, bright) → 1 (settled, joined the rest).
         let t: CGFloat
@@ -362,32 +594,150 @@ final class TranscriptView: NSView {
             rise = 0
         }
 
-        let colour =
-            freshColor.blended(withFraction: t, of: restColor) ?? freshColor
+        let colour = freshColor.blended(withFraction: t, of: restColor) ?? freshColor
         out.addAttribute(
             .foregroundColor, value: colour.withAlphaComponent(alpha), range: range)
         if rise != 0 {
             out.addAttribute(.baselineOffset, value: rise, range: range)
         }
-        return out
+        return (out, ranges)
     }
 
+    // MARK: Drawing
+
     override func draw(_ dirtyRect: NSRect) {
-        let b = bounds
         // The frosted view behind this is the ground; all that is added here is
         // a wash of forest so sage text keeps its contrast over a bright
         // background as well as a dark one.
         cForestTint.withAlphaComponent(0.46).setFill()
-        b.fill()
+        bounds.fill()
 
-        let s = rendered()
-        guard s.length > 0 else { return }
-        s.draw(
-            with: NSRect(
-                x: TranscriptView.padX, y: TranscriptView.padY,
-                width: b.width - TranscriptView.padX * 2,
-                height: b.height - TranscriptView.padY * 2),
-            options: [.usesLineFragmentOrigin, .usesFontLeading])
+        let list = shown
+        guard !list.isEmpty else { return }
+        let (string, ranges) = compose(list)
+        // Laid out at the same width it was measured at, not at the width the
+        // panel ended up: the panel hugs the text, and re-wrapping to that
+        // could push a trailing word onto a line that no longer exists.
+        let layout = Layout(string, width: TranscriptView.maxWidth)
+        let origin = NSPoint(x: TranscriptView.padX, y: TranscriptView.padY)
+
+        // Which words are drawn as cells rather than glyphs.
+        var pixelated: [(range: NSRange, grid: Grid, colour: NSColor, doubt: CGFloat)] = []
+        for (i, h) in list.enumerated() {
+            let doubt = TranscriptView.doubt(h.confidence)
+            guard doubt > 0 else { continue }
+            let range = ranges[i]
+            let glyphs = layout.manager.glyphRange(
+                forCharacterRange: range, actualCharacterRange: nil)
+            guard glyphs.length > 0 else { continue }
+            // A word long enough to wrap has no single baseline to hang cells
+            // off, so it keeps its glyphs. At this width that is a word of forty
+            // characters, which is not a word.
+            let first = layout.manager.lineFragmentRect(
+                forGlyphAt: glyphs.location, effectiveRange: nil)
+            let last = layout.manager.lineFragmentRect(
+                forGlyphAt: NSMaxRange(glyphs) - 1, effectiveRange: nil)
+            guard first == last, let grid = TranscriptView.grid(for: h.word) else { continue }
+            let colour =
+                (string.attribute(.foregroundColor, at: range.location, effectiveRange: nil)
+                    as? NSColor) ?? restColor.withAlphaComponent(restAlpha)
+            pixelated.append((range, grid, colour, doubt))
+        }
+
+        // Glyphs everywhere except where cells are about to go. Drawing the lot
+        // and painting over it would mean punching a hole in a translucent
+        // panel, and the covered glyphs would ghost through.
+        var cursor = 0
+        for word in pixelated {
+            if word.range.location > cursor {
+                draw(layout, NSRange(location: cursor, length: word.range.location - cursor), origin)
+            }
+            cursor = NSMaxRange(word.range)
+        }
+        if cursor < string.length {
+            draw(layout, NSRange(location: cursor, length: string.length - cursor), origin)
+        }
+
+        for word in pixelated {
+            let glyphs = layout.manager.glyphRange(
+                forCharacterRange: word.range, actualCharacterRange: nil)
+            let frag = layout.manager.lineFragmentRect(
+                forGlyphAt: glyphs.location, effectiveRange: nil)
+            let at = layout.manager.location(forGlyphAt: glyphs.location)
+            dissolve(
+                word.grid,
+                at: NSPoint(x: origin.x + frag.minX + at.x, y: origin.y + frag.minY + at.y),
+                colour: word.colour, doubt: word.doubt)
+        }
+    }
+
+    private func draw(_ layout: Layout, _ chars: NSRange, _ origin: NSPoint) {
+        guard chars.length > 0 else { return }
+        let glyphs = layout.manager.glyphRange(forCharacterRange: chars, actualCharacterRange: nil)
+        guard glyphs.length > 0 else { return }
+        layout.manager.drawGlyphs(forGlyphRange: glyphs, at: origin)
+    }
+
+    /// Draw one word as cells of ink instead of letters.
+    ///
+    /// A cell the stroke fills stays put and only the fringe erodes, so the word
+    /// frays at its edges rather than thinning out from the middle. That
+    /// distinction is the whole effect: a word you can still read but can see
+    /// the model is unsure of, not a word that has been redacted.
+    ///
+    /// Cell alpha tracks coverage almost linearly for the same reason. Rounding
+    /// every half-covered cell up to solid is what a pixelate filter does, and
+    /// it lays down more ink than the letters it replaced — the word comes out
+    /// heavier than its neighbours and draws the eye as an error rather than as
+    /// a doubt.
+    private func dissolve(_ grid: Grid, at baseline: NSPoint, colour: NSColor, doubt: CGFloat) {
+        let top = baseline.y - grid.ascent
+        // Darkened toward the deep sage, and further the less certain the word.
+        // Both halves matter: the blend keeps the cells green rather than
+        // letting a low alpha wash them out to grey, and the alpha is what
+        // actually seats them below the line of text they sit in.
+        let pen = colour.blended(withFraction: 0.45 + 0.30 * doubt, of: cSageDeep) ?? colour
+        let alpha = colour.alphaComponent * (0.82 - 0.22 * doubt)
+        let salt = grid.cols &* 31 &+ grid.rows
+
+        func rect(_ i: Int) -> NSRect {
+            NSRect(
+                x: baseline.x + CGFloat(i % grid.cols) * grid.cell,
+                y: top + CGFloat(i / grid.cols) * grid.cell,
+                width: grid.cell, height: grid.cell)
+        }
+
+        /// Cells with enough ink left to be worth drawing, once the fringe has
+        /// been eaten into. The interior is exempt: a solid cell survives any
+        /// amount of doubt, which is what holds the word's skeleton together.
+        // How hard the fringe is eaten into, eased off for narrow words. A long
+        // word can lose a third of its edge and still be the word it was; "it"
+        // is four cells across and the same bite leaves a mark rather than a
+        // word. Short words are also where the model's mistakes cluster, so
+        // this is the one place legibility has to win over the signal.
+        let bite = 0.55 * doubt * min(1, CGFloat(grid.cols) / 9)
+
+        var kept: [Int] = []
+        for i in grid.coverage.indices {
+            let ink = grid.coverage[i]
+            guard ink > 0.12 else { continue }
+            if ink >= 0.55 || ink * (1 - bite * TranscriptView.jitter(i, salt)) > 0.24 {
+                kept.append(i)
+            }
+        }
+
+        // A soft wash under the cells, as one path so overlaps don't stack into
+        // a dark edge. This is the blur in the effect — what stops a grid of
+        // squares reading as a QR code and makes it read as a word out of focus.
+        let halo = NSBezierPath()
+        for i in kept { halo.appendRect(rect(i).insetBy(dx: -0.7, dy: -0.7)) }
+        pen.withAlphaComponent(alpha * (0.05 + 0.07 * doubt)).setFill()
+        halo.fill()
+
+        for i in kept {
+            pen.withAlphaComponent(alpha * min(1, grid.coverage[i] * 1.15)).setFill()
+            rect(i).fill()
+        }
     }
 }
 
@@ -488,13 +838,13 @@ final class Overlay {
     ///
     /// Ignored unless the pill is up: a preview landing after key-up would
     /// otherwise pop this back open as everything was fading out.
-    func setTranscript(_ s: String) {
-        guard panel.alphaValue > 0.5, pill.mode == .recording, !s.isEmpty else {
-            if s.isEmpty { hideTranscript() }
+    func setTranscript(_ list: [Heard]) {
+        guard panel.alphaValue > 0.5, pill.mode == .recording, !list.isEmpty else {
+            if list.isEmpty { hideTranscript() }
             return
         }
 
-        transcript.setText(s)
+        transcript.setWords(list)
         let size = transcript.fittingSize()
         guard size.height > 0 else { return }
 
@@ -540,7 +890,7 @@ final class Overlay {
                 ctx.duration = 0.2
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
                 transcriptPanel.animator().alphaValue = 0
-            }, completionHandler: { [weak self] in self?.transcript.setText("") })
+            }, completionHandler: { [weak self] in self?.transcript.setWords([]) })
     }
 
     private static func capsuleMask(_ h: CGFloat) -> NSImage {
@@ -662,7 +1012,7 @@ DispatchQueue.global(qos: .userInitiated).async {
             case "level":
                 if parts.count > 1, let v = Double(parts[1]) { overlay.pill.setLevel(CGFloat(v)) }
             case "text":
-                overlay.setTranscript(parts.count > 1 ? parts[1] : "")
+                overlay.setTranscript(parts.count > 1 ? parseHeard(parts[1]) : [])
             case "hide": overlay.hide()
             case "quit": NSApplication.shared.terminate(nil)
             default: break
