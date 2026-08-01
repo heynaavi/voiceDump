@@ -72,6 +72,10 @@ export type JobState = {
     paragraphs: Paragraph[];
     segments: Segment[];
     peaks: number[];
+    /** Which speech model ran: "small" or "medium". */
+    model?: string;
+    /** Milliseconds spent decoding, excluding file reading and model loading. */
+    transcribe_ms?: number;
   };
 };
 
@@ -135,6 +139,8 @@ export async function saveTranscript(args: {
   segments: Segment[];
   peaks: number[];
   source: Origin;
+  model?: string;
+  transcribeMs?: number;
 }): Promise<string> {
   return invoke("save_transcript", {
     title: args.title,
@@ -146,6 +152,8 @@ export async function saveTranscript(args: {
     segments: args.segments,
     peaks: args.peaks,
     source: args.source,
+    model: args.model ?? null,
+    transcribeMs: args.transcribeMs ?? null,
   });
 }
 

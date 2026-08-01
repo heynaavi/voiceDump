@@ -555,6 +555,69 @@ fn quietest_cut(buf: &[f32], from: usize, to: usize, rate: u32) -> usize {
     best
 }
 
+/// How long an abandoned scratch capture is allowed to sit on disk.
+const SCRATCH_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Delete scratch captures that never became transcripts.
+///
+/// The happy path already removes each WAV the moment the library has its
+/// normalised copy, so nothing here races a live dictation — but every early
+/// return between "recording stopped" and "transcript inserted" leaks the file,
+/// and a crash mid-capture leaks a *growing* one. Left alone that is unbounded:
+/// one of these directories reached 4.6 GB, of which 4.57 GB was five captures
+/// orphaned by a killed recorder that had held the microphone open for ten
+/// hours apiece.
+///
+/// Age is the whole test, deliberately. A successful capture is deleted
+/// synchronously, so anything still here after a day is abandoned by
+/// definition — consulting the database would mean taking its lock during
+/// startup to learn nothing new.
+fn sweep_scratch(dir: &Path, ttl: std::time::Duration) -> (u32, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let (mut files, mut bytes) = (0u32, 0u64);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only our own captures. The directory is ours, but deleting by age
+        // alone would take anything a user happened to drop in it.
+        if path.extension().and_then(|e| e.to_str()) != Some("wav") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        // `modified` rather than `created`: a leaked capture is still being
+        // written to, and its creation time says nothing about whether the
+        // process that owns it is still alive.
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > ttl);
+        if stale && std::fs::remove_file(&path).is_ok() {
+            files += 1;
+            bytes += meta.len();
+        }
+    }
+    (files, bytes)
+}
+
+/// Run the sweep off the startup path. It is pure disk I/O on a directory that
+/// is normally empty, but "normally" is exactly what failed here before.
+pub fn spawn_sweep(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let Ok(dir) = app.path().app_data_dir() else {
+            return;
+        };
+        let (files, bytes) = sweep_scratch(&dir.join("dictation"), SCRATCH_TTL);
+        if files > 0 {
+            eprintln!(
+                "[dictation] swept {files} abandoned capture(s), {:.1} MB",
+                bytes as f64 / 1_048_576.0
+            );
+        }
+    });
+}
+
 fn start(app: &tauri::AppHandle) {
     let state = app.state::<DictationState>();
     if state.recording.load(Ordering::SeqCst) {
@@ -699,6 +762,62 @@ fn frontmost_app() -> Option<String> {
 }
 
 #[cfg(test)]
+mod sweep_tests {
+    use std::time::Duration;
+
+    /// A scratch directory with one of each thing that can be in it.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("vd-sweep-{name}"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dictation-1.wav"), b"aaaa").unwrap();
+        std::fs::write(dir.join("dictation-2.wav"), b"bb").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"not ours").unwrap();
+        dir
+    }
+
+    /// Everything past its time goes, and the byte count is real — the numbers
+    /// end up in a log line claiming how much was reclaimed.
+    #[test]
+    fn expired_captures_are_removed() {
+        let dir = scratch("expired");
+        let (files, bytes) = super::sweep_scratch(&dir, Duration::ZERO);
+        assert_eq!((files, bytes), (2, 6));
+        assert!(!dir.join("dictation-1.wav").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The guard that matters: a capture written moments ago may still belong to
+    /// a dictation in flight, and deleting it would destroy live audio.
+    #[test]
+    fn fresh_captures_survive() {
+        let dir = scratch("fresh");
+        let (files, _) = super::sweep_scratch(&dir, Duration::from_secs(3600));
+        assert_eq!(files, 0);
+        assert!(dir.join("dictation-1.wav").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Age alone is not licence to delete. Anything that isn't one of our WAVs
+    /// stays put however old it is.
+    #[test]
+    fn other_files_are_left_alone() {
+        let dir = scratch("others");
+        super::sweep_scratch(&dir, Duration::ZERO);
+        assert!(dir.join("notes.txt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A missing directory is the normal state on a fresh install, not a fault.
+    #[test]
+    fn a_missing_directory_is_not_an_error() {
+        let missing = std::env::temp_dir().join("vd-sweep-nope");
+        std::fs::remove_dir_all(&missing).ok();
+        assert_eq!(super::sweep_scratch(&missing, Duration::ZERO), (0, 0));
+    }
+}
+
+#[cfg(test)]
 mod chunk_tests {
     /// The cut lands in the gap, not mid-word.
     ///
@@ -800,6 +919,7 @@ fn finish(app: &tauri::AppHandle, cap: Capture) -> Result<(), String> {
         result.get("segments").cloned().unwrap_or(serde_json::Value::Null),
         result.get("peaks").cloned().unwrap_or(serde_json::Value::Null),
         "hotkey",
+        crate::engine::Run::from_result(&result),
     )?;
 
     // Scratch capture; the library holds the normalised copy now.

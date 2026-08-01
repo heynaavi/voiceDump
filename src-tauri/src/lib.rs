@@ -79,6 +79,10 @@ fn save_transcript(
     segments: serde_json::Value,
     peaks: serde_json::Value,
     source: Option<String>,
+    // Echoed back from the transcription result the window is saving. Optional
+    // so a caller replaying an older job simply records nothing.
+    model: Option<String>,
+    transcribe_ms: Option<i64>,
 ) -> Result<String, String> {
     insert_transcript(
         &app,
@@ -91,6 +95,10 @@ fn save_transcript(
         segments,
         peaks,
         source.as_deref().unwrap_or("file"),
+        engine::Run {
+            model: model.unwrap_or_default(),
+            millis: transcribe_ms.unwrap_or(0),
+        },
     )
 }
 
@@ -197,6 +205,10 @@ pub fn insert_transcript(
     segments: serde_json::Value,
     peaks: serde_json::Value,
     source: &str,
+    // Which speech model ran and for how long. Default for anything that did not
+    // come from the engine; the row keeps its empty columns rather than claiming
+    // a zero-millisecond transcription.
+    run: engine::Run,
 ) -> Result<String, String> {
     let created = now_ms();
     let id = format!("{:x}", created as u128 * 1000 + rand_suffix());
@@ -232,6 +244,11 @@ pub fn insert_transcript(
         source_path,
     )
     .map_err(|e| e.to_string())?;
+    if run.measured() {
+        // Best-effort, like the app label: the note is saved, and losing a
+        // timing is not worth failing an ingest over.
+        let _ = store::set_engine_run(&conn, &id, &run.model, run.millis);
+    }
     drop(conn);
 
     // The title the caller chose — a cleaned-up filename, or a dictation's
@@ -347,7 +364,11 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 #[cfg(target_os = "macos")]
-                dictation::spawn(handle.clone());
+                {
+                    dictation::spawn(handle.clone());
+                    // Clear scratch captures abandoned by a previous run.
+                    dictation::spawn_sweep(handle.clone());
+                }
             });
 
             Ok(())

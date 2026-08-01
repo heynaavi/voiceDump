@@ -169,6 +169,8 @@ export default function App() {
               segments: state.result.segments,
               peaks: state.result.peaks ?? [],
               source: origin,
+              model: state.result.model,
+              transcribeMs: state.result.transcribe_ms,
             });
             jobIdRef.current = null;
             setJob(null);

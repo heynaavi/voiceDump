@@ -19,5 +19,8 @@ src-tauri/target/
 # Swift helper binary — rebuilt automatically by `npm run dev` / `npm run build`
 overlay-helper/voicedumps-overlay
 
-# Speech models — fetched with scripts/fetch-models.sh, too large for git
-models/
+# Speech models — fetched with scripts/fetch-models.sh, too large for git.
+# No trailing slash, for the same reason as node_modules above: `models/` would
+# match the directory but not a *symlink* named `models`, and pointing one at a
+# shared download is the obvious way to avoid keeping 700 MB per checkout.
+models

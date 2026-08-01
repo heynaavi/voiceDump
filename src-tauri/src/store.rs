@@ -123,7 +123,20 @@ pub fn open(dir: &PathBuf) -> rusqlite::Result<Connection> {
         [],
     )
     .ok();
-
+    // Which speech model produced this note, and how long it ran. Older rows keep
+    // the empty default forever: nothing in the history implies which weights
+    // were loaded at the time, and a reconstructed figure would be a guess
+    // wearing the clothes of a measurement.
+    conn.execute(
+        "ALTER TABLE transcripts ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+        [],
+    )
+    .ok();
+    conn.execute(
+        "ALTER TABLE transcripts ADD COLUMN transcribe_ms INTEGER NOT NULL DEFAULT 0",
+        [],
+    )
+    .ok();
 
     Ok(conn)
 }
@@ -286,6 +299,24 @@ pub fn set_app_name(conn: &Connection, id: &str, app: &str) -> rusqlite::Result<
     conn.execute(
         "UPDATE transcripts SET app_name = ?2 WHERE id = ?1",
         params![id, app],
+    )?;
+    Ok(())
+}
+
+/// Record which speech model produced this note and how long it took.
+///
+/// Separate from `insert` for the same reason as `set_app_name`: it is the
+/// engine's answer, not the caller's, and threading it through would mean every
+/// ingest path passing values it never looks at.
+pub fn set_engine_run(
+    conn: &Connection,
+    id: &str,
+    model: &str,
+    millis: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE transcripts SET model = ?2, transcribe_ms = ?3 WHERE id = ?1",
+        params![id, model, millis],
     )?;
     Ok(())
 }

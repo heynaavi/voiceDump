@@ -314,6 +314,12 @@ moving or deleting the original — the store keeps both the archived copy and t
 path it came from. That copy is transcoded with `ffmpeg` when it is available and
 skipped when it is not; transcription never depends on it.
 
+Dictation records to a scratch WAV in `…/dictation/`, which is deleted the moment
+the library has its copy. A capture that never reaches that point — a failed
+transcription, a crash mid-recording — used to be left behind forever; since
+0.4.1 anything still there after a day is swept at launch. Nothing that became a
+transcript is ever touched by the sweep, because it is already gone by then.
+
 Nothing is transmitted. There is no telemetry, no crash reporting and no update
 check in this build.
 
@@ -358,6 +364,9 @@ The interesting ones need real inputs and skip loudly without them:
 | `idle_policy` | A model in active use is never collected; `0` disables collection |
 | `reaper_frees_a_live_model_off_thread` | Freeing a live Metal context from a worker thread doesn't abort, the memory actually returns, and the engine still reloads. `#[ignore]`d — needs the weights |
 | `benchmark_latency` | The numbers above. `#[ignore]`d — it is a measurement, not an assertion |
+| `fresh_captures_survive` | The sweep never deletes a capture that may still belong to a dictation in flight |
+| `other_files_are_left_alone` | Age alone is not licence to delete: only our own `.wav` captures are swept |
+| `an_older_result_is_not_a_measurement` | A transcript from before timing existed records no timing, rather than a zero |
 
 ## Known gaps
 

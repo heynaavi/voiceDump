@@ -678,6 +678,42 @@ fn build_paragraphs(segments: &[Value]) -> Vec<Value> {
 
 // -- transcription ----------------------------------------------------------
 
+/// What the engine did to produce one transcript.
+///
+/// Carried as a struct rather than two more positional arguments on an
+/// `insert_transcript` that already takes eleven, and kept beside the JSON it is
+/// read from so the two can't drift apart.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Run {
+    /// `"small"` / `"medium"`, or empty when the result predates this record.
+    pub model: String,
+    /// Milliseconds spent decoding. Zero means "not measured", never "instant".
+    pub millis: i64,
+}
+
+impl Run {
+    /// Read the engine's own record back out of a transcription result.
+    ///
+    /// Tolerant by design: a result that carries neither field — an old job
+    /// replayed, or a future path that doesn't transcribe — yields the default,
+    /// and the row keeps its empty columns rather than claiming a zero.
+    pub fn from_result(v: &Value) -> Self {
+        Run {
+            model: v
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            millis: v.get("transcribe_ms").and_then(|m| m.as_i64()).unwrap_or(0),
+        }
+    }
+
+    /// Whether there is anything worth writing to the row.
+    pub fn measured(&self) -> bool {
+        !self.model.is_empty() && self.millis > 0
+    }
+}
+
 /// Transcribe a media file, reporting progress through `report(stage, fraction)`.
 pub fn transcribe(
     app: &tauri::AppHandle,
@@ -711,12 +747,24 @@ pub fn transcribe(
     // Leave a couple of cores for the UI and the rest of the machine.
     params.set_n_threads((num_threads() as i32).max(1));
 
+    // Which weights actually ran, which is not always `wanted`: `ensure_loaded`
+    // keeps an already-resident model rather than paying a reload to honour a
+    // preference that changed since.
+    let ran = loaded.size;
+
     let mut st = loaded
         .ctx
         .create_state()
         .map_err(|e| format!("could not start the transcriber: {e}"))?;
+
+    // Time the decode alone. Reading the file, loading weights and building
+    // paragraphs all vary with things that have nothing to do with the model —
+    // a cold load would make the same audio look three times slower on the
+    // first note of the day — and it is the model this figure describes.
+    let began = std::time::Instant::now();
     st.full(params, &samples)
         .map_err(|e| format!("transcription failed: {e}"))?;
+    let elapsed_ms = began.elapsed().as_millis().min(i64::MAX as u128) as i64;
 
     let n = st.full_n_segments();
     let mut segments: Vec<Value> = Vec::with_capacity(n.max(0) as usize);
@@ -781,6 +829,8 @@ pub fn transcribe(
         "segments": segments,
         "paragraphs": paragraphs,
         "text": text,
+        "model": ran.label(),
+        "transcribe_ms": elapsed_ms,
     }))
 }
 
@@ -919,6 +969,57 @@ pub fn warm(app: &tauri::AppHandle) {
         // place the user can act on it.
         let _ = ensure_loaded(&app, &mut guard, wanted);
     });
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::Run;
+    use serde_json::json;
+
+    /// The shape `transcribe` actually emits, read back the way
+    /// `insert_transcript` reads it. These two live in different files; this is
+    /// what pins them together.
+    #[test]
+    fn reads_what_the_engine_writes() {
+        let result = json!({
+            "duration": 12.5,
+            "text": "hello",
+            "model": "medium",
+            "transcribe_ms": 4820,
+        });
+        let run = Run::from_result(&result);
+        assert_eq!(run.model, "medium");
+        assert_eq!(run.millis, 4820);
+        assert!(run.measured());
+    }
+
+    /// A result from before the engine kept this record. The row must keep its
+    /// empty columns rather than claim a zero-millisecond transcription, which
+    /// would divide into an infinite speed anywhere it is reported.
+    #[test]
+    fn an_older_result_is_not_a_measurement() {
+        let run = Run::from_result(&json!({ "duration": 12.5, "text": "hello" }));
+        assert_eq!(run, Run::default());
+        assert!(!run.measured());
+    }
+
+    /// Half a record is not a record: a model with no timing still can't be
+    /// divided, so it must not count as measured.
+    #[test]
+    fn a_partial_record_is_rejected() {
+        let no_time = Run::from_result(&json!({ "model": "small", "transcribe_ms": 0 }));
+        assert!(!no_time.measured());
+        let no_model = Run::from_result(&json!({ "transcribe_ms": 900 }));
+        assert!(!no_model.measured());
+    }
+
+    /// Wrong types shouldn't panic an ingest — a note without a timing beats a
+    /// note that failed to save.
+    #[test]
+    fn nonsense_falls_back_to_the_default() {
+        let run = Run::from_result(&json!({ "model": 7, "transcribe_ms": "ages" }));
+        assert_eq!(run, Run::default());
+    }
 }
 
 #[cfg(test)]
