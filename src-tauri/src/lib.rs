@@ -1,5 +1,6 @@
 mod analytics;
 mod background;
+mod clipboard;
 #[cfg(target_os = "macos")]
 mod dictation;
 mod engine;

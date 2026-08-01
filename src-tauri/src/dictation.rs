@@ -15,7 +15,7 @@
 #![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -421,27 +421,34 @@ fn stop_capture(cap: Capture) -> Result<PathBuf, String> {
 
 // -- paste -----------------------------------------------------------------
 
+/// How long the dictated text is left on the clipboard before whatever was
+/// there goes back.
+///
+/// The paste is a synthetic ⌘V, and the app it lands in reads the clipboard on
+/// its own schedule afterwards — put the old contents back too eagerly and the
+/// text that arrives is the old contents. Nothing reports when that read has
+/// happened, so this is a wait rather than a handshake, and it is long enough
+/// to cover an app that is busy when the keystroke arrives.
+const RESTORE_AFTER: Duration = Duration::from_millis(600);
+
 /// Put text on the clipboard and synthesise ⌘V into the focused app.
 ///
 /// Pasting rather than typing the text out character by character: synthetic
 /// keystrokes are slow and get mangled by autocorrect and input methods.
+///
+/// Dictating used to cost you your clipboard — whatever you had copied was
+/// gone, replaced by the transcript. So what was there is read first and put
+/// back once the paste has landed, which makes the clipboard a place you can
+/// keep something across a dictation rather than a channel this happens to use.
+///
+/// The transcript itself is not lost by that: the tray's "Copy Last Transcript"
+/// puts it back on the clipboard whenever you want it.
 fn paste(text: &str) -> Result<(), String> {
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
-    let mut pb = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("clipboard failed: {e}"))?;
-    {
-        use std::io::Write;
-        pb.stdin
-            .as_mut()
-            .ok_or("clipboard pipe unavailable")?
-            .write_all(text.as_bytes())
-            .map_err(|e| e.to_string())?;
-    }
-    pb.wait().map_err(|e| e.to_string())?;
+    let previous = crate::clipboard::read();
+    crate::clipboard::write(text)?;
 
     let src = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
         .map_err(|_| "could not create event source")?;
@@ -455,6 +462,21 @@ fn paste(text: &str) -> Result<(), String> {
         .map_err(|_| "could not create key event")?;
     up.set_flags(CGEventFlags::CGEventFlagCommand);
     up.post(CGEventTapLocation::HID);
+
+    if let Some(previous) = previous {
+        // Off this thread: the note still has to be saved, and none of that
+        // should wait on a timer.
+        let ours = text.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(RESTORE_AFTER);
+            // Only if the clipboard is still ours. Copying something during
+            // those few hundred milliseconds is a clear instruction about what
+            // the clipboard should hold, and it outranks what was there before.
+            if crate::clipboard::read().as_deref() == Some(ours.as_str()) {
+                let _ = crate::clipboard::write(&previous);
+            }
+        });
+    }
 
     Ok(())
 }
