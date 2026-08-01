@@ -66,7 +66,7 @@ function Panel({
   children,
 }: {
   title: string;
-  aside?: string;
+  aside?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
@@ -277,51 +277,70 @@ function Speech({ v }: { v: Data["vocabulary"] }) {
  */
 function FillerRate({ v }: { v: Data["vocabulary"] }) {
   const MAX = 6;
-  const at = (n: number) => `${Math.min(100, (n / MAX) * 100)}%`;
+  const LOW = 2.07;
+  const HIGH = 3.04;
+  const at = (n: number) => `${Math.max(0, Math.min(100, (n / MAX) * 100))}%`;
+  // The two captions sit on opposite sides of the rail, so yours can never
+  // collide with the band's however close the numbers happen to be. Yours is
+  // also held off the ends, where a centred label would hang outside the card.
+  const you = `${Math.max(6, Math.min(94, (v.filler_rate / MAX) * 100))}%`;
+  const band = at((LOW + HIGH) / 2);
 
   return (
     <Panel title="HOW OFTEN YOU REACH FOR A FILLER">
-      <p className="mono-data text-[34px] leading-none text-ink">
-        {v.filler_rate.toFixed(1)}
-        <span className="ml-1 text-[13px] text-grey">per 100 words</span>
+      <p className="flex items-baseline gap-1.5">
+        <span className="mono-data text-[34px] leading-none text-ink">
+          {v.filler_rate.toFixed(1)}
+        </span>
+        <span className="text-[12px] text-grey">per 100 words</span>
       </p>
 
-      <div className="relative mt-6 h-8">
-        <span className="absolute left-0 right-0 top-[13px] h-[2px] bg-hairline-soft" />
-        {/* The published band, not a target. */}
+      <div className="relative mt-7 h-[44px]">
+        {/* The published band, not a target — labelled above the rail. */}
         <span
-          className="absolute top-[9px] h-[10px] bg-sage-dim/35"
-          style={{ left: at(2.07), width: at(3.04 - 2.07) }}
-        />
-        <span
-          className="absolute top-[4px] h-[20px] w-[2px] bg-sage-dim"
-          style={{ left: at(v.filler_rate) }}
-        />
-        <span
-          className="diagnostic absolute top-[26px] -translate-x-1/2 text-sage-dim"
-          style={{ left: at(v.filler_rate) }}
-        >
-          YOU
-        </span>
-        <span
-          className="diagnostic absolute top-[26px] text-faint"
-          style={{ left: at(2.2) }}
+          className="diagnostic absolute top-0 -translate-x-1/2 whitespace-nowrap text-faint"
+          style={{ left: band }}
         >
           TYPICAL
         </span>
-        <span className="diagnostic absolute left-0 top-[26px] text-faint">0</span>
-        <span className="diagnostic absolute right-0 top-[26px] text-faint">{MAX}</span>
+        <span className="absolute left-0 right-0 top-[20px] h-[2px] bg-hairline-soft" />
+        <span
+          className="absolute top-[16px] h-[10px] bg-sage-dim/35"
+          style={{ left: at(LOW), width: at(HIGH - LOW) }}
+        />
+        <span
+          className="absolute top-[11px] h-[20px] w-[2px] bg-sage-dim"
+          style={{ left: at(v.filler_rate) }}
+        />
+        <span
+          className="diagnostic absolute top-[34px] -translate-x-1/2 whitespace-nowrap text-sage-dim"
+          style={{ left: you }}
+        >
+          YOU
+        </span>
       </div>
 
-      <p className="mt-8 text-[12px] leading-relaxed text-grey">
-        Recorded conversation averages <b className="text-ink">2.07–3.04</b>{" "}
-        fillers per 100 words (Bortfeld et al., 2001, n=192). We count
-        conservatively — only unmistakable fillers, never “like” or “just” — so
-        this figure runs low against that study by design.
+      <p className="micro flex justify-between text-faint">
+        <span>0</span>
+        <span>{MAX} PER 100 WORDS</span>
+      </p>
+
+      <p className="mt-5 border-t border-hairline pt-3 text-[11.5px] leading-snug text-grey">
+        Typical is <b className="text-ink">2.07–3.04</b> (Bortfeld et al., 2001,
+        n=192). We count only unmistakable fillers — never “like” or “just” — so
+        this runs low against that study by design.
       </p>
     </Panel>
   );
 }
+
+/** The spans on offer, shortest first, with what each one costs in history. */
+const SPANS: { key: string; label: string; needs: string }[] = [
+  { key: "1", label: "1D", needs: "two days" },
+  { key: "7", label: "7D", needs: "two weeks" },
+  { key: "30", label: "30D", needs: "two months" },
+  { key: "all", label: "ALL", needs: "" },
+];
 
 /**
  * Whether you are getting better, measured against yourself.
@@ -331,69 +350,151 @@ function FillerRate({ v }: { v: Data["vocabulary"] }) {
  * on each. It refuses to report anything until both windows carry enough words
  * to be stable, because a filler rate off eighty words is noise and calling
  * noise "progress" is what makes habit trackers untrustworthy.
+ *
+ * Every span is computed up front, so switching between them is a re-render
+ * rather than a round trip and can be animated without a spinner in the middle.
+ * A span the history can't support is shown disabled with what it needs, not
+ * hidden — otherwise the control silently changes shape as the weeks pass.
  */
-function Trend({ p }: { p: Data["progress"] }) {
-  const NAMES: Record<string, { label: string; fmt: (n: number) => string }> = {
-    filler_rate: { label: "FILLER RATE", fmt: (n) => `${n.toFixed(1)}/100w` },
-    variety: { label: "WORD VARIETY", fmt: (n) => `${Math.round(n * 100)}%` },
-    avg_sentence_words: { label: "SENTENCE LENGTH", fmt: (n) => `${n.toFixed(1)}w` },
-    words_per_minute: { label: "SPEAKING PACE", fmt: (n) => `${Math.round(n)} wpm` },
+function Trend({ windows }: { windows: Data["progress"] }) {
+  // Value and unit are kept apart so the figure can be set large and the unit
+  // small. Run together — "1.5/100w" at reading size — four of these collided
+  // with the labels beside them and the row broke into the next column.
+  const NAMES: Record<
+    string,
+    { label: string; value: (n: number) => string; unit: string }
+  > = {
+    filler_rate: { label: "FILLER RATE", value: (n) => n.toFixed(1), unit: "per 100w" },
+    variety: { label: "WORD VARIETY", value: (n) => String(Math.round(n * 100)), unit: "%" },
+    avg_sentence_words: { label: "SENTENCE LENGTH", value: (n) => n.toFixed(1), unit: "words" },
+    words_per_minute: { label: "SPEAKING PACE", value: (n) => String(Math.round(n)), unit: "wpm" },
   };
 
-  if (!p.ready) {
-    return (
-      <Panel title="ARE YOU IMPROVING" aside="NOT YET">
-        <p className="text-[12px] leading-relaxed text-grey">
-          This compares two equal stretches of your own history. There isn’t
-          enough speech in both yet — keep dictating and it fills itself in.
-        </p>
-        <p className="micro mt-2 text-faint">
-          {p.before_words.toLocaleString()} THEN · {p.after_words.toLocaleString()} NOW
-          · NEEDS 250 EACH
-        </p>
-      </Panel>
+  const [picked, setPicked] = useState<string | null>(null);
+  const body = useRef<HTMLDivElement>(null);
+
+  // The chosen span, or the shortest one with something to say. A day is what
+  // people ask about first, but opening on "not yet" reads as broken, so a span
+  // that actually holds a comparison wins over an emptier shorter one.
+  const p =
+    (picked ? windows.find((w) => w.key === picked) : undefined) ??
+    windows.find((w) => w.available && w.ready) ??
+    windows.find((w) => w.available) ??
+    windows[0];
+
+  // Switching spans replays the figures rather than swapping them in place: the
+  // numbers change meaning entirely between windows, and a silent substitution
+  // makes it look like your speech changed rather than the question.
+  useEffect(() => {
+    const el = body.current;
+    if (!el || prefersReducedMotion()) return;
+    const tween = gsap.fromTo(
+      el.querySelectorAll("[data-move]"),
+      { opacity: 0, y: 10 },
+      { opacity: 1, y: 0, duration: 0.34, ease: EASE.snap, stagger: 0.05 },
     );
-  }
+    return () => {
+      tween.kill();
+    };
+  }, [p?.key, p?.ready]);
+
+  if (!p) return null;
+
+  const tabs = (
+    <div className="flex items-center gap-1">
+      {SPANS.map((s) => {
+        const w = windows.find((x) => x.key === s.key);
+        const on = w?.key === p.key;
+        const can = !!w?.available;
+        return (
+          <button
+            key={s.key}
+            type="button"
+            disabled={!can}
+            onClick={() => setPicked(s.key)}
+            title={can ? undefined : `Needs ${s.needs} of history`}
+            className={`micro border px-1.5 py-[3px] transition-colors ${
+              on
+                ? "border-ink bg-ink text-surface"
+                : can
+                  ? "border-hairline text-grey hover:border-ink hover:text-ink"
+                  : "cursor-not-allowed border-transparent text-faint/45"
+            }`}
+          >
+            {s.label}
+          </button>
+        );
+      })}
+    </div>
+  );
 
   return (
-    <Panel title="ARE YOU IMPROVING" aside={`LAST ${p.window_days} DAYS VS THE ${p.window_days} BEFORE`}>
-      <ul className="grid gap-x-8 gap-y-4 sm:grid-cols-2">
-        {p.moves.map((m) => {
-          const meta = NAMES[m.key];
-          const delta = m.after - m.before;
-          const pct = m.before !== 0 ? (delta / m.before) * 100 : 0;
-          // No verdict where none is warranted: a longer sentence is not a
-          // better or worse one, so those are drawn neutral.
-          const judged = m.higher_is_better !== null && Math.abs(pct) >= 1;
-          const good = judged && delta > 0 === m.higher_is_better;
-          return (
-            <li key={m.key} className="flex items-baseline justify-between gap-3">
-              <span className="text-[12px] text-grey">{meta.label}</span>
-              <span className="flex items-baseline gap-2 whitespace-nowrap">
-                <span className="mono-data text-[11px] text-faint">
-                  {meta.fmt(m.before)}
-                </span>
-                <span className="text-faint">→</span>
-                <span className="mono-data text-[13px] text-ink">
-                  {meta.fmt(m.after)}
-                </span>
-                <span
-                  className={`mono-data text-[11px] ${
-                    !judged ? "text-faint" : good ? "text-sage-dim" : "text-amber"
-                  }`}
-                >
-                  {pct > 0 ? "+" : ""}
-                  {Math.abs(pct) < 1 ? "—" : `${Math.round(pct)}%`}
-                </span>
-              </span>
-            </li>
-          );
-        })}
-      </ul>
-      <p className="micro mt-4 text-faint">
-        {p.before_words.toLocaleString()} WORDS THEN · {p.after_words.toLocaleString()} NOW
-        · COMPARED WITH YOURSELF, NOT WITH ANYONE ELSE
-      </p>
+    <Panel title="ARE YOU IMPROVING" aside={tabs}>
+      <div ref={body}>
+        {!p.ready ? (
+          <>
+            <p data-move className="text-[12px] leading-relaxed text-grey">
+              This compares two equal stretches of your own history. There isn’t
+              enough speech in both yet — keep dictating and it fills itself in.
+            </p>
+            <p data-move className="micro mt-3 text-faint">
+              {p.before_words.toLocaleString()} THEN ·{" "}
+              {p.after_words.toLocaleString()} NOW · NEEDS 250 EACH
+            </p>
+          </>
+        ) : (
+          <>
+            <ul className="grid grid-cols-2 gap-x-5 gap-y-6">
+              {p.moves.map((m) => {
+                const meta = NAMES[m.key];
+                const delta = m.after - m.before;
+                const pct = m.before !== 0 ? (delta / m.before) * 100 : 0;
+                // No verdict where none is warranted: a longer sentence is not
+                // a better or worse one, so those are drawn neutral.
+                const judged = m.higher_is_better !== null && Math.abs(pct) >= 1;
+                const good = judged && delta > 0 === m.higher_is_better;
+                return (
+                  <li key={m.key} data-move className="min-w-0">
+                    <p className="eyebrow text-faint">{meta.label}</p>
+                    <p className="mt-2 flex items-baseline gap-1.5">
+                      <span className="mono-data text-[20px] leading-none text-ink">
+                        {meta.value(m.after)}
+                      </span>
+                      <span className="text-[10.5px] text-grey">{meta.unit}</span>
+                    </p>
+                    <p className="micro mt-2 flex flex-wrap items-baseline gap-x-2 text-faint">
+                      <span>FROM {meta.value(m.before)}</span>
+                      <span
+                        className={
+                          !judged
+                            ? "text-faint"
+                            : good
+                              ? "text-sage-dim"
+                              : "text-amber"
+                        }
+                      >
+                        {Math.abs(pct) < 1
+                          ? "LEVEL"
+                          : `${delta > 0 ? "↑" : "↓"}${Math.round(Math.abs(pct))}%`}
+                      </span>
+                    </p>
+                  </li>
+                );
+              })}
+            </ul>
+            <p
+              data-move
+              className="micro mt-5 border-t border-hairline pt-3 text-faint"
+            >
+              {p.before_words.toLocaleString()} WORDS THEN ·{" "}
+              {p.after_words.toLocaleString()} NOW ·{" "}
+              {p.key === "all"
+                ? `${p.window_days}-DAY HALVES`
+                : "MEASURED AGAINST YOURSELF"}
+            </p>
+          </>
+        )}
+      </div>
     </Panel>
   );
 }
@@ -801,7 +902,7 @@ export function Insights() {
 
         <div data-row className="grid gap-3 md:grid-cols-2">
           <FillerRate v={v} />
-          <Trend p={data.progress} />
+          <Trend windows={data.progress} />
         </div>
 
         <div data-row>

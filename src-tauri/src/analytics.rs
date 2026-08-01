@@ -95,8 +95,15 @@ pub struct Move {
 /// progress is the failure mode of every habit tracker.
 #[derive(Serialize)]
 pub struct Progress {
+    /// Stable identifier for the span: "1", "7", "30" or "all".
+    pub key: String,
+    /// Whether the history is long enough to hold both halves of this span.
+    /// A false one is still sent, so the tab can be shown disabled with a
+    /// reason rather than vanishing and leaving the row a different shape
+    /// every time you open it.
+    pub available: bool,
     pub ready: bool,
-    /// Days in each window — 30 unless the history is shorter.
+    /// Days in each window. For "all" this is half the history.
     pub window_days: i64,
     pub before_words: i64,
     pub after_words: i64,
@@ -127,25 +134,63 @@ pub struct Summary {
     pub by_language: Vec<Count>,
 
     pub vocabulary: Vocabulary,
-    pub progress: Progress,
+    /// One entry per offered span — yesterday, a week, a month, everything —
+    /// so switching between them is instant and needs no round trip.
+    pub progress: Vec<Progress>,
+}
+
+const DAY_MS: i64 = 86_400_000;
+
+/// How far back the history reaches, in days.
+fn span_days(rows: &[(i64, &str, f64, i64)], now: i64) -> i64 {
+    rows.first()
+        .map(|r| ((now - r.0) / DAY_MS).max(1))
+        .unwrap_or(0)
+}
+
+/// The spans the panel offers, shortest first.
+///
+/// A span of N needs 2N days of history to exist at all — "the last week
+/// against the week before" is not a thing you can say in your first week — so
+/// each is marked available or not, and the unavailable ones are shown disabled
+/// rather than hidden. "All" is whatever there is, split down the middle, and
+/// so is always offered.
+fn progress_windows(rows: &[(i64, &str, f64, i64)], texts: &[String], now: i64) -> Vec<Progress> {
+    let span = span_days(rows, now);
+    let half = (span / 2).max(1);
+
+    let mut out = Vec::new();
+    for days in [1, 7, 30] {
+        let available = span >= days * 2;
+        out.push(Progress {
+            key: days.to_string(),
+            available,
+            ..compare(rows, texts, now, days, available)
+        });
+    }
+    out.push(Progress {
+        key: "all".into(),
+        available: true,
+        ..compare(rows, texts, now, half, true)
+    });
+    out
 }
 
 /// Split the history at a midpoint and measure both halves the same way.
 ///
-/// The window is 30 days where the history allows it and half the history
-/// otherwise, so someone two weeks in still gets a comparison rather than an
-/// empty panel — the panel says how long the window is, so a short one can be
-/// read for what it is.
-fn compare(rows: &[(i64, &str, f64, i64)], texts: &[String], now: i64) -> Progress {
+/// `measure` is false for a span the history cannot support: the word counts are
+/// still worth returning — they're what the panel shows to explain itself — but
+/// there is nothing to analyse, so the text pass is skipped.
+fn compare(
+    rows: &[(i64, &str, f64, i64)],
+    texts: &[String],
+    now: i64,
+    window_days: i64,
+    measure: bool,
+) -> Progress {
     /// Under this many words in a window, none of these numbers are stable.
     const MIN_WORDS: i64 = 250;
-    const DAY_MS: i64 = 86_400_000;
 
-    let span_days = rows
-        .first()
-        .map(|r| ((now - r.0) / DAY_MS).max(1))
-        .unwrap_or(0);
-    let window_days = 30.min((span_days / 2).max(1));
     let cut = now - window_days * DAY_MS;
     let floor = cut - window_days * DAY_MS;
 
@@ -169,8 +214,10 @@ fn compare(rows: &[(i64, &str, f64, i64)], texts: &[String], now: i64) -> Progre
     let (before_text, before_words, before_secs, _) = pick(floor, cut);
     let (after_text, after_words, after_secs, _) = pick(cut, now + DAY_MS);
 
-    if before_words < MIN_WORDS || after_words < MIN_WORDS {
+    if !measure || before_words < MIN_WORDS || after_words < MIN_WORDS {
         return Progress {
+            key: String::new(),
+            available: measure,
             ready: false,
             window_days,
             before_words,
@@ -184,6 +231,8 @@ fn compare(rows: &[(i64, &str, f64, i64)], texts: &[String], now: i64) -> Progre
     let wpm = |w: i64, s: f64| if s > 0.0 { w as f64 / (s / 60.0) } else { 0.0 };
 
     Progress {
+        key: String::new(),
+        available: true,
         ready: true,
         window_days,
         before_words,
@@ -612,7 +661,7 @@ pub fn analytics_summary(app: tauri::AppHandle) -> Result<Summary, String> {
         app_unknown,
         by_language,
         vocabulary: analyse_text(&texts),
-        progress: compare(
+        progress: progress_windows(
             &rows
                 .iter()
                 .map(|r| (r.created_at, r.source.as_str(), r.duration, r.words))
@@ -717,9 +766,34 @@ mod tests {
             (now - 5 * DAY, "hotkey", 30.0, 40),
         ];
         let texts = vec!["a short note".to_string(), "another short note".to_string()];
-        let p = compare(&rows, &texts, now);
+        let p = compare(&rows, &texts, now, 30, true);
         assert!(!p.ready);
         assert!(p.moves.is_empty());
+    }
+
+    /// A span you haven't lived long enough to have is offered, but disabled.
+    ///
+    /// Hiding it instead would change the shape of the row as the history grows,
+    /// and a control that appears one morning without explanation is worse than
+    /// one that has been sitting there greyed out saying what it needs.
+    #[test]
+    fn windows_are_offered_only_where_the_history_reaches() {
+        const DAY: i64 = 86_400_000;
+        let now = 40 * DAY;
+        let rows = vec![(now - 16 * DAY, "hotkey", 30.0, 40), (now - DAY, "hotkey", 30.0, 40)];
+        let texts = vec!["a note".to_string(), "another note".to_string()];
+        let windows = progress_windows(&rows, &texts, now);
+
+        let by = |k: &str| windows.iter().find(|w| w.key == k).unwrap();
+        assert_eq!(windows.len(), 4);
+        // Sixteen days of history. A week against the week before needs
+        // fourteen, and fits; a month against the month before needs sixty.
+        assert!(by("1").available);
+        assert!(by("7").available);
+        assert!(!by("30").available);
+        // Everything is always offered — it is whatever there is, halved.
+        assert!(by("all").available);
+        assert_eq!(by("all").window_days, 8);
     }
 
     /// With enough on both sides, each measure is reported for both windows.
@@ -734,7 +808,7 @@ mod tests {
             (now - 40 * DAY, "hotkey", 120.0, 300),
             (now - 5 * DAY, "hotkey", 120.0, 300),
         ];
-        let p = compare(&rows, &[noisy, clean], now);
+        let p = compare(&rows, &[noisy, clean], now, 30, true);
         assert!(p.ready, "expected a comparison, got {:?}", p.before_words);
         let filler = p.moves.iter().find(|m| m.key == "filler_rate").unwrap();
         assert!(

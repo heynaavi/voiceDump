@@ -309,6 +309,10 @@ export type Move = {
 };
 
 export type Progress = {
+  /** "1" | "7" | "30" | "all" — the span this comparison covers. */
+  key: string;
+  /** False where the history is too short for this span. Shown disabled. */
+  available: boolean;
   ready: boolean;
   window_days: number;
   before_words: number;
@@ -333,7 +337,8 @@ export type Insights = {
   app_unknown: number;
   by_language: Count[];
   vocabulary: Vocabulary;
-  progress: Progress;
+  /** One per offered span, shortest first. Switching is local, not a refetch. */
+  progress: Progress[];
 };
 
 export async function analyticsSummary(): Promise<Insights> {
