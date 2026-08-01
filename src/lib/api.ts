@@ -257,6 +257,8 @@ export async function revealSource(
 export type Settings = {
   /** Draft transcript in the overlay while you speak. Off by default. */
   live_preview: boolean;
+  /** Microphone to record from, by name. `null` follows the system input. */
+  microphone: string | null;
 };
 
 export async function getSettings(): Promise<Settings> {
@@ -265,6 +267,23 @@ export async function getSettings(): Promise<Settings> {
 
 export async function setLivePreview(enabled: boolean): Promise<Settings> {
   return invoke("set_live_preview", { enabled });
+}
+
+/** One attached input device. */
+export type Mic = {
+  name: string;
+  /** Whether macOS would pick this one right now. */
+  is_default: boolean;
+};
+
+/** Microphones attached at this moment — ask again each time the picker opens. */
+export async function listMicrophones(): Promise<Mic[]> {
+  return invoke("list_microphones");
+}
+
+/** Pass `null` to follow whatever macOS is set to. */
+export async function setMicrophone(name: string | null): Promise<Settings> {
+  return invoke("set_microphone", { name });
 }
 
 // -- version ----------------------------------------------------------------

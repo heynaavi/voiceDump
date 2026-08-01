@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { saveRecording } from "../lib/api";
+import { getSettings, saveRecording } from "../lib/api";
 import { formatTimestamp } from "../lib/format";
 
 type Props = {
@@ -23,6 +23,60 @@ function pickMime() {
   return (
     MIME_CANDIDATES.find((c) => MediaRecorder.isTypeSupported(c.mime)) ?? null
   );
+}
+
+const CLEANUP = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
+
+/**
+ * Open the microphone the user chose, in the currency this side speaks.
+ *
+ * The two capture paths name devices differently: CoreAudio hands Rust a device
+ * *name*, and `getUserMedia` wants a `deviceId` that is salted per origin — so
+ * the setting cannot store one. The bridge is `label`, which is the same string
+ * CoreAudio uses.
+ *
+ * Labels are blank until the page has been granted the microphone, and the
+ * picker is filled by Rust, so the first recording after choosing a device can
+ * land here with nothing to match against. Opening any stream is what reveals
+ * the labels — hence the second look. Every failure falls back to the default
+ * device rather than refusing to record, which is what the globe key does too.
+ */
+async function openMic(preferred: string | null): Promise<MediaStream> {
+  const open = (deviceId?: string) =>
+    navigator.mediaDevices.getUserMedia({
+      audio: deviceId ? { ...CLEANUP, deviceId: { exact: deviceId } } : CLEANUP,
+    });
+
+  if (!preferred) return open();
+
+  const tried = new Set<string>();
+  const attempt = async () => {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const id = devices.find(
+      (d) => d.kind === "audioinput" && d.label === preferred,
+    )?.deviceId;
+    if (!id || tried.has(id)) return null;
+    tried.add(id);
+    // An id can go stale between listing and opening — the interface was
+    // unplugged, or is asleep. Not an error, just not that microphone.
+    return open(id).catch(() => null);
+  };
+
+  const direct = await attempt();
+  if (direct) return direct;
+
+  const fallback = await open();
+  if (fallback.getAudioTracks()[0]?.label === preferred) return fallback;
+  const second = await attempt();
+  if (!second) return fallback;
+  // Two streams are briefly live; the loser is released immediately so macOS
+  // drops the recording indicator for it.
+  fallback.getTracks().forEach((t) => t.stop());
+  return second;
 }
 
 /** Live level meter, so it's obvious the mic is actually picking something up. */
@@ -98,13 +152,12 @@ export function Recorder({ onCaptured }: Props) {
 
     let media: MediaStream;
     try {
-      media = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+      // The setting lives in Rust, so it is read fresh rather than held in
+      // state: it can be changed from the sidebar between two recordings.
+      const chosen = await getSettings()
+        .then((s) => s.microphone)
+        .catch(() => null);
+      media = await openMic(chosen);
     } catch {
       setError(
         "Microphone access was denied. Grant it in System Settings › Privacy & Security › Microphone.",

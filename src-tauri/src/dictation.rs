@@ -233,7 +233,7 @@ pub fn stop_overlay() {
 
 // -- audio capture ---------------------------------------------------------
 
-/// Begin recording the default input device to a WAV.
+/// Begin recording the chosen input device — or the system default — to a WAV.
 ///
 /// A native CoreAudio stream (cpal) rather than spawning ffmpeg per press:
 /// ffmpeg's avfoundation input pays a ~2s AVCaptureSession warm-up on every
@@ -285,12 +285,9 @@ fn capture_loop(
     audio_tx: std::sync::mpsc::Sender<Vec<f32>>,
     live_rate: &Arc<AtomicU32>,
 ) -> Result<PathBuf, String> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::traits::{DeviceTrait, StreamTrait};
 
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or("no microphone found")?;
+    let device = crate::microphone::open(crate::settings::microphone(app).as_deref())?;
     let config = device
         .default_input_config()
         .map_err(|e| format!("could not read the microphone's format: {e}"))?;

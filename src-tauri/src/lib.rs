@@ -6,6 +6,7 @@ mod dictation;
 mod engine;
 mod export;
 mod media;
+mod microphone;
 mod settings;
 #[cfg(target_os = "macos")]
 mod sound;
@@ -508,6 +509,8 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         reveal_source,
         settings::get_settings,
         settings::set_live_preview,
+        settings::set_microphone,
+        microphone::list_microphones,
         engine::start_transcription,
         engine::transcribe_peaks,
         engine::engine_status,
