@@ -2,7 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import gsap from "gsap";
 
 import type { IngestProgress, Origin, TranscriptMeta } from "../lib/api";
-import { getSettings, setLivePreview } from "../lib/api";
+import {
+  appVersion,
+  checkUpdate,
+  getSettings,
+  openRelease,
+  setLivePreview,
+} from "../lib/api";
 import { dateGroup, formatDuration, formatRelativeDate } from "../lib/format";
 import { EASE, useGsap } from "../lib/motion";
 import { useTheme } from "../lib/theme";
@@ -47,6 +53,86 @@ const TABS: { key: TabKey; label: string; match: (s: Origin) => boolean }[] = [
   { key: "notes", label: "NOTES", match: (s) => s !== "hotkey" },
 ];
 
+/**
+ * The version, and the only thing in the app that reaches the network.
+ *
+ * Click once to ask GitHub whether there's a newer release; click again, when
+ * there is, to open its page. Nothing checks on its own — a transcription app
+ * that phones home on launch is a different product, and the version sitting
+ * quietly in the footer is worth more than a badge nagging about updates.
+ *
+ * The result is deliberately short-lived: after a check that finds nothing, the
+ * strip goes back to the version rather than keeping a green tick around. A
+ * permanent "up to date" is a claim about the future.
+ */
+function Version() {
+  const [version, setVersion] = useState<string | null>(null);
+  const [state, setState] = useState<
+    { at: "idle" } | { at: "checking" } | { at: "current" } | { at: "new"; version: string } | { at: "failed"; why: string }
+  >({ at: "idle" });
+
+  useEffect(() => {
+    let cancelled = false;
+    appVersion()
+      .then((v) => !cancelled && setVersion(v))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // "Nothing new" and failures both fade back to the version. An error that
+  // stays on screen forever reads as a broken app rather than a missed request.
+  useEffect(() => {
+    if (state.at !== "current" && state.at !== "failed") return;
+    const t = setTimeout(() => setState({ at: "idle" }), 4000);
+    return () => clearTimeout(t);
+  }, [state]);
+
+  const click = () => {
+    if (state.at === "new") {
+      openRelease(state.version).catch(() => {});
+      return;
+    }
+    if (state.at === "checking") return;
+    setState({ at: "checking" });
+    checkUpdate()
+      .then((u) =>
+        setState(u.newer ? { at: "new", version: u.latest } : { at: "current" }),
+      )
+      .catch((e) => setState({ at: "failed", why: String(e) }));
+  };
+
+  const label =
+    state.at === "checking"
+      ? "CHECKING…"
+      : state.at === "current"
+        ? "UP TO DATE"
+        : state.at === "new"
+          ? `${state.version} AVAILABLE`
+          : state.at === "failed"
+            ? "CHECK FAILED"
+            : `VOICEDUMP ${version ?? ""}`.trim();
+
+  return (
+    <button
+      onClick={click}
+      title={
+        state.at === "new"
+          ? `Version ${state.version} has been published. Opens the release page.`
+          : state.at === "failed"
+            ? state.why
+            : "Check GitHub for a newer version. Nothing about you is sent."
+      }
+      className={`diagnostic transition-colors hover:text-ink ${
+        state.at === "new" ? "text-sage-dim" : state.at === "failed" ? "text-amber" : ""
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
 export function Sidebar({
   items,
   activeId,
@@ -81,6 +167,10 @@ export function Sidebar({
   }, []);
 
   const togglePreview = () => {
+    // Until the stored value has landed, `livePreview` is null — and `!null` is
+    // true, so a click in that window turned the preview *on* no matter what
+    // was on disk, and persisted it. The control is disabled until we know.
+    if (livePreview === null) return;
     const next = !livePreview;
     // Optimistic: the write is a small file, and snapping back on failure is
     // clearer than a control that lags a click behind.
@@ -341,6 +431,7 @@ export function Sidebar({
           changes what dictation does, and it needs room to say so. */}
       <button
         onClick={togglePreview}
+        disabled={livePreview === null}
         aria-pressed={livePreview === true}
         title={
           livePreview
@@ -373,7 +464,7 @@ export function Sidebar({
           settings pane: it's a readout of the app's current state, which is
           exactly what this strip is for. */}
       <footer className="flex items-center justify-between gap-2 border-t border-hairline px-4 py-2">
-        <span className="diagnostic">VOICEDUMP</span>
+        <Version />
         <div className="flex items-center gap-3">
           <button
             onClick={toggle}

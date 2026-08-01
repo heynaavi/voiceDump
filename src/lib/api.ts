@@ -267,6 +267,36 @@ export async function setLivePreview(enabled: boolean): Promise<Settings> {
   return invoke("set_live_preview", { enabled });
 }
 
+// -- version ----------------------------------------------------------------
+
+/** The running version, from the bundle. */
+export async function appVersion(): Promise<string> {
+  return invoke("app_version");
+}
+
+export type Update = { current: string; latest: string; newer: boolean };
+
+/**
+ * Ask GitHub whether a newer release exists.
+ *
+ * The only network call the app makes, and only ever from a click. Nothing
+ * about the user is sent — it is a GET for a public release listing.
+ */
+export async function checkUpdate(): Promise<Update> {
+  return invoke("check_update");
+}
+
+/**
+ * Open a release page in the browser.
+ *
+ * Takes a version, not a URL: the backend re-validates it and builds the
+ * address from a fixed repository, so nothing the network said can decide
+ * where this goes.
+ */
+export async function openRelease(version: string): Promise<void> {
+  return invoke("open_release", { version });
+}
+
 // -- insights ---------------------------------------------------------------
 
 /** One row of a grouped breakdown (by app, by source, by language). */

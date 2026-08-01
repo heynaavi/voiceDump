@@ -9,6 +9,7 @@ mod settings;
 #[cfg(target_os = "macos")]
 mod sound;
 mod store;
+mod update;
 
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -182,6 +183,16 @@ fn reveal_source(origin: String, archived: String) -> Result<(), String> {
         .ok_or("that audio is no longer on disk")?;
 
     tauri_plugin_opener::reveal_item_in_dir(found).map_err(|e| e.to_string())
+}
+
+/// The running version, taken from the bundle.
+///
+/// Read from `package_info` rather than compiled in from `package.json`, so
+/// what the footer shows is what was actually installed — the two can drift,
+/// and the one that matters when someone is reporting a bug is the bundle's.
+#[tauri::command]
+fn app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
 }
 
 /// Open the Accessibility pane. macOS shows its permission prompt only once per
@@ -506,5 +517,8 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         write_binary_file,
         save_recording,
         analytics::analytics_summary,
+        update::check_update,
+        update::open_release,
+        app_version,
     ]
 }
