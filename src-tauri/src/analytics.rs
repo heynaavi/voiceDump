@@ -157,23 +157,63 @@ fn span_days(rows: &[(i64, &str, f64, i64)], now: i64) -> i64 {
 /// so is always offered.
 fn progress_windows(rows: &[(i64, &str, f64, i64)], texts: &[String], now: i64) -> Vec<Progress> {
     let span = span_days(rows, now);
-    let half = (span / 2).max(1);
 
     let mut out = Vec::new();
     for days in [1, 7, 30] {
+        let cut = now - days * DAY_MS;
         let available = span >= days * 2;
         out.push(Progress {
             key: days.to_string(),
             available,
-            ..compare(rows, texts, now, days, available)
+            ..compare(
+                rows,
+                texts,
+                Split {
+                    floor: cut - days * DAY_MS,
+                    cut,
+                    end: now,
+                    days,
+                    measure: available,
+                },
+            )
         });
     }
+
+    // All time is cut at the midpoint of the history rather than a whole
+    // number of days back from now: an odd span would otherwise leave the
+    // oldest slice below the floor, and a tab labelled ALL that quietly drops
+    // your first days is the one thing it must not do.
+    let first = rows.first().map(|r| r.0).unwrap_or(now);
+    let cut = first + (now - first) / 2;
     out.push(Progress {
         key: "all".into(),
         available: true,
-        ..compare(rows, texts, now, half, true)
+        ..compare(
+            rows,
+            texts,
+            Split {
+                floor: first,
+                cut,
+                end: now,
+                days: ((now - cut) / DAY_MS).max(1),
+                measure: true,
+            },
+        )
     });
     out
+}
+
+/// Where to cut the history, and how much of it to take.
+struct Split {
+    /// Start of the earlier window. Notes before this are not considered.
+    floor: i64,
+    /// The boundary: earlier window ends here, later window starts here.
+    cut: i64,
+    end: i64,
+    /// Length of each window in days, for display.
+    days: i64,
+    /// False for a span the history cannot support — see `compare`.
+    measure: bool,
 }
 
 /// Split the history at a midpoint and measure both halves the same way.
@@ -181,18 +221,11 @@ fn progress_windows(rows: &[(i64, &str, f64, i64)], texts: &[String], now: i64) 
 /// `measure` is false for a span the history cannot support: the word counts are
 /// still worth returning — they're what the panel shows to explain itself — but
 /// there is nothing to analyse, so the text pass is skipped.
-fn compare(
-    rows: &[(i64, &str, f64, i64)],
-    texts: &[String],
-    now: i64,
-    window_days: i64,
-    measure: bool,
-) -> Progress {
+fn compare(rows: &[(i64, &str, f64, i64)], texts: &[String], split: Split) -> Progress {
     /// Under this many words in a window, none of these numbers are stable.
     const MIN_WORDS: i64 = 250;
 
-    let cut = now - window_days * DAY_MS;
-    let floor = cut - window_days * DAY_MS;
+    let Split { floor, cut, end, days: window_days, measure } = split;
 
     let pick = |from: i64, to: i64| -> (Vec<String>, i64, f64, i64) {
         let mut text = Vec::new();
@@ -212,7 +245,7 @@ fn compare(
     };
 
     let (before_text, before_words, before_secs, _) = pick(floor, cut);
-    let (after_text, after_words, after_secs, _) = pick(cut, now + DAY_MS);
+    let (after_text, after_words, after_secs, _) = pick(cut, end + DAY_MS);
 
     if !measure || before_words < MIN_WORDS || after_words < MIN_WORDS {
         return Progress {
@@ -680,6 +713,18 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
     }
 
+    /// The month-against-month split, for tests that only care about the halves.
+    fn thirty_days(now: i64) -> Split {
+        let cut = now - 30 * DAY_MS;
+        Split {
+            floor: cut - 30 * DAY_MS,
+            cut,
+            end: now,
+            days: 30,
+            measure: true,
+        }
+    }
+
     #[test]
     fn streak_counts_back_from_today() {
         let days: HashSet<_> = [day(2026, 7, 29), day(2026, 7, 30), day(2026, 7, 31)]
@@ -766,7 +811,7 @@ mod tests {
             (now - 5 * DAY, "hotkey", 30.0, 40),
         ];
         let texts = vec!["a short note".to_string(), "another short note".to_string()];
-        let p = compare(&rows, &texts, now, 30, true);
+        let p = compare(&rows, &texts, thirty_days(now));
         assert!(!p.ready);
         assert!(p.moves.is_empty());
     }
@@ -796,6 +841,30 @@ mod tests {
         assert_eq!(by("all").window_days, 8);
     }
 
+    /// "All" means all of it, including the odd day at the far end.
+    ///
+    /// Counting whole days back from now leaves a remainder below the floor on
+    /// an odd span, so a five-day history would compare days 2–5 and silently
+    /// drop day one. Cutting at the midpoint of the history instead means every
+    /// word is on one side or the other.
+    #[test]
+    fn all_time_leaves_nothing_out() {
+        const DAY: i64 = 86_400_000;
+        let now = 10 * DAY;
+        // Five days of history: the oldest note is the one at risk.
+        let rows = vec![
+            (now - 5 * DAY, "hotkey", 10.0, 11),
+            (now - 3 * DAY, "hotkey", 10.0, 22),
+            (now - DAY, "hotkey", 10.0, 33),
+        ];
+        let texts = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        let all = progress_windows(&rows, &texts, now)
+            .into_iter()
+            .find(|w| w.key == "all")
+            .unwrap();
+        assert_eq!(all.before_words + all.after_words, 11 + 22 + 33);
+    }
+
     /// With enough on both sides, each measure is reported for both windows.
     #[test]
     fn progress_compares_the_two_windows() {
@@ -808,7 +877,7 @@ mod tests {
             (now - 40 * DAY, "hotkey", 120.0, 300),
             (now - 5 * DAY, "hotkey", 120.0, 300),
         ];
-        let p = compare(&rows, &[noisy, clean], now, 30, true);
+        let p = compare(&rows, &[noisy, clean], thirty_days(now));
         assert!(p.ready, "expected a comparison, got {:?}", p.before_words);
         let filler = p.moves.iter().find(|m| m.key == "filler_rate").unwrap();
         assert!(

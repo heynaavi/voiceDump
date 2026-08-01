@@ -287,7 +287,10 @@ function FillerRate({ v }: { v: Data["vocabulary"] }) {
   const band = at((LOW + HIGH) / 2);
 
   return (
-    <Panel title="HOW OFTEN YOU REACH FOR A FILLER">
+    // "ALL TIME" is doing real work: the panel beside this one shows the same
+    // measure over its later window, so without it the two cards look like the
+    // same number disagreeing with itself.
+    <Panel title="HOW OFTEN YOU REACH FOR A FILLER" aside="ALL TIME">
       <p className="flex items-baseline gap-1.5">
         <span className="mono-data text-[34px] leading-none text-ink">
           {v.filler_rate.toFixed(1)}
