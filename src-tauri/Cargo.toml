@@ -1,6 +1,6 @@
 [package]
 name = "voicedumps"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local speech to text for macOS"
 authors = ["Naveen"]
 edition = "2021"
