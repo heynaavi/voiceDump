@@ -63,13 +63,34 @@
    <html>, index.html applies it before first paint). Left unlayered so it beats
    Tailwind's `@theme` output, which lands in the `theme` layer on plain :root. */
 :root[data-theme="dark"] {
-  --color-surface: #14180f;
-  --color-panel: #1e2618;
-  --color-rail: #181d12;
-  --color-ink: #d2e6c2;
-  --color-grey: #8fb07c;
-  --color-faint: color-mix(in srgb, #b8d4a4 45%, transparent);
-  --color-hairline: color-mix(in srgb, #b8d4a4 22%, transparent);
+  /* Matched to the site (voiceDumpWeb `src/styles.css`), which had this
+     calibrated better, and for the same reasons:
+
+     **The ground goes deeper and the panels stay put.** #14180f against #1e2618
+     was ten points of luminance — panels read as slightly-different background
+     rather than as cards, and the whole window went flat. Dropping the surface
+     to #0e130c widens the gap without lightening a single panel.
+
+     **Ink lightens and desaturates.** #d2e6c2 is a green with a lot of chroma;
+     held for a paragraph it fizzes. #e0edd6 is nearly the same hue with the
+     saturation taken out, which is what makes it readable at 13px.
+
+     **Faint stops being invisible.** Every eyebrow, every micro-label and every
+     "not recorded" note is drawn in it, and 45% on this ground was a guess at
+     what the label said. 62% is still clearly secondary.
+
+     **Amber brightens.** #a8741d is a *light-mode* amber: on near-black it is
+     mud, and every warning banner sets dark text on it, which at that value is
+     about 3:1. On #e0ad58 the same dark text is legible, and `text-amber` on
+     the surface finally reads as a warning rather than a smudge. */
+  --color-surface: #0e130c;
+  --color-panel: #192217;
+  --color-rail: #131a11;
+  --color-ink: #e0edd6;
+  --color-grey: #9ab889;
+  --color-amber: #e0ad58;
+  --color-faint: color-mix(in srgb, #e0edd6 62%, transparent);
+  --color-hairline: color-mix(in srgb, #b8d4a4 24%, transparent);
   --color-hairline-soft: color-mix(in srgb, #b8d4a4 11%, transparent);
 }
 
@@ -99,9 +120,47 @@
     cursor: default;
   }
 
+  /* Dark only: two very weak lights, so the forest reads as a lit room rather
+     than a flat fill. Fixed to the viewport — a gradient that slides while you
+     resize the window is a distraction, and this should never be noticed at
+     all. Percentages are deliberately under 10: at 20 it becomes a wallpaper,
+     and the design's whole claim is that nothing decorative is in the way. */
+  :root[data-theme="dark"] body {
+    background-image:
+      radial-gradient(
+        circle at 5% -6%,
+        color-mix(in srgb, var(--color-sage) 7%, transparent) 0,
+        transparent 34rem
+      ),
+      radial-gradient(
+        circle at 99% 42%,
+        color-mix(in srgb, var(--color-amber) 4%, transparent) 0,
+        transparent 30rem
+      );
+    background-attachment: fixed;
+  }
+
   ::selection {
     background: color-mix(in srgb, var(--color-sage) 45%, transparent);
     color: var(--color-ink);
+  }
+
+  /* Dark only: a panel gets a top-lit face and a hairline of light along its
+     top edge, which is what separates a card from the ground when both are
+     nearly black. The utility class is the hook because `bg-panel` is what
+     every panel in the app already uses — one rule instead of eighteen edits,
+     and the light theme is untouched.
+
+     `hover:bg-panel` compiles to a different class, so hover states stay flat
+     on purpose: a raised surface that lifts again under the pointer reads as a
+     button, and most of these are not. */
+  :root[data-theme="dark"] .bg-panel {
+    background-image: linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-panel) 94%, #ffffff 4%),
+      var(--color-panel)
+    );
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--color-sage) 10%, transparent);
   }
 
   button {
@@ -329,6 +388,18 @@
       transparent 0
     );
     background-size: 28px 28px;
+  }
+
+  /* The grid is drawn in `hairline`, which dark mode sets from sage rather than
+     ink — and sage at 24% on a near-black ground is a much louder dot than ink
+     at 12% on paper. Same texture, matched weight, instead of a field of specks
+     competing with the text over it. */
+  :root[data-theme="dark"] .dot-grid {
+    background-image: radial-gradient(
+      circle at 1px 1px,
+      color-mix(in srgb, var(--color-sage) 11%, transparent) 1.3px,
+      transparent 0
+    );
   }
 
   .scroll-slim {
