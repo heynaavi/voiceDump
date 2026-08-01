@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import gsap from "gsap";
 
@@ -35,6 +43,69 @@ const FLASH_MS = 420;
  */
 const PLAYABLE = /\.(m4a|mp4|mp3|wav|aac|aiff|aif|caf|flac)$/i;
 const playableAudio = (path: string) => PLAYABLE.test(path);
+
+/** One clickable word, and the exact characters that precede it. */
+type Placed = { prefix: string; text: string; from: number; to: number };
+
+/**
+ * Lay a paragraph's words back onto its own text.
+ *
+ * The two are not in the same shape, and neither one can be spaced by rule:
+ *
+ * - Fresh from whisper, `words` are *BPE tokens*, not words. "graphify" arrives
+ *   as `" graph"` + `"ify"`, and each token carries the whitespace that belongs
+ *   in front of it — punctuation like `","` carries none.
+ * - After an edit, `reconcileWords` splits the typed text on whitespace, so its
+ *   tokens are bare words with no spacing encoded at all.
+ *
+ * Joining with a space is right for the second and wrong for the first, which
+ * is what put a gap in the middle of "graph ify" and in front of every comma.
+ * Concatenating raw is right for the first and wrong for the second. There is no
+ * per-token test that separates them.
+ *
+ * So neither is used as the source of spacing: `text` is. Each token is found in
+ * the paragraph's own text in order, and whatever sits between one token and the
+ * next is emitted verbatim. The rendered characters are then `text`, exactly —
+ * which is what COPY has always used, and why that button was already correct
+ * while selecting the same words with a cursor was not.
+ *
+ * The offsets come back too, so search matches land on the right words instead
+ * of being hunted for in a string nothing renders.
+ */
+function placeWords(text: string, words: { text: string }[]): Placed[] {
+  const out: Placed[] = [];
+  let at = 0;
+  for (const w of words) {
+    const token = w.text.trim();
+    // One entry per input word, always: `flatWords` and the highlight sets key
+    // words by their index in `p.words`, and a skipped token here would shift
+    // every following word onto the wrong timing.
+    if (!token) {
+      out.push({ prefix: "", text: "", from: at, to: at });
+      continue;
+    }
+    const found = text.indexOf(token, at);
+    if (found === -1) {
+      // Timings that no longer describe this text — a reconcile that dropped
+      // out of step. Keep the word clickable and readable rather than losing it.
+      out.push({
+        prefix: out.length ? " " : "",
+        text: token,
+        from: at,
+        to: at + token.length,
+      });
+      continue;
+    }
+    out.push({
+      prefix: text.slice(at, found),
+      text: token,
+      from: found,
+      to: found + token.length,
+    });
+    at = found + token.length;
+  }
+  return out;
+}
 
 /** Type scale for the focused paragraph vs the rest, *while following audio*. */
 const FOCUS_SIZE = 19.5;
@@ -229,21 +300,22 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
   // -- find in transcript ---------------------------------------------------
 
   /**
-   * What each paragraph *renders as*, which is not always `p.text`.
+   * Where each word sits inside its paragraph's text.
    *
-   * A paragraph with word timings is drawn as one span per word joined by
-   * single spaces; an edited one is drawn as its raw text. Searching the same
-   * string the reader is looking at is what keeps a match's character offsets
-   * mapping onto the right words — deriving them from `p.text` instead would
-   * drift the moment an edit reconciled the word list differently.
+   * Computed once per paragraph and used for all three of drawing, searching
+   * and highlighting, so those can't disagree about what the reader is looking
+   * at — which is the whole reason spacing drifted from `p.text` before.
    */
-  const rendered = useMemo(
-    () =>
-      paragraphs.map((p) =>
-        p.words?.length ? p.words.map((w) => w.text).join(" ") : p.text,
-      ),
+  const placed = useMemo(
+    () => paragraphs.map((p) => placeWords(p.text, p.words ?? [])),
     [paragraphs],
   );
+
+  /**
+   * What each paragraph renders as — now always its own text, because that is
+   * what `placeWords` reconstructs character for character.
+   */
+  const rendered = useMemo(() => paragraphs.map((p) => p.text), [paragraphs]);
 
   /** Every hit, in reading order, as a paragraph index and character range. */
   const matches = useMemo(() => {
@@ -281,22 +353,9 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
     const current = new Set<string>();
     if (!matches.length) return { all, current };
 
-    // Cumulative offset of each word in the joined string, computed once per
-    // paragraph that actually has a hit rather than for the whole document.
-    const spans = new Map<number, { from: number; to: number }[]>();
-    const spansFor = (pi: number) => {
-      let s = spans.get(pi);
-      if (!s) {
-        s = [];
-        let at = 0;
-        for (const w of paragraphs[pi]?.words ?? []) {
-          s.push({ from: at, to: at + w.text.length });
-          at += w.text.length + 1; // the joining space
-        }
-        spans.set(pi, s);
-      }
-      return s;
-    };
+    // Already known: `placed` carries each word's range in the paragraph text,
+    // measured against the same string `matches` searched.
+    const spansFor = (pi: number) => placed[pi] ?? [];
 
     matches.forEach((m, mi) => {
       const words = paragraphs[m.pi]?.words;
@@ -314,7 +373,7 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
       });
     });
     return { all, current };
-  }, [matches, matchAt, paragraphs]);
+  }, [matches, matchAt, paragraphs, placed]);
 
   const stepMatch = useCallback(
     (delta: number) => {
@@ -919,14 +978,19 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
                     ].join(" ")}
                   >
                     {p.words?.length
-                      ? p.words.map((w, wi) => {
+                      ? placed[pi]?.map((lay, wi) => {
+                          const w = p.words![wi];
                           const key = `${pi}:${wi}`;
                           const lit = key === activeKey || key === flash;
                           const hit = marked.all.has(key);
                           const here = marked.current.has(key);
                           return (
+                            <Fragment key={wi}>
+                            {/* The gap between words is text, not a span —
+                                so a cursor selection copies the paragraph as
+                                written rather than one space per token. */}
+                            {lay.prefix}
                             <span
-                              key={wi}
                               // Only the two spans that need tracking carry a
                               // ref. A callback on every word would have React
                               // detaching and reattaching thousands of refs on
@@ -955,8 +1019,9 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
                                 w.edited && !lit && !hit ? "word-edited" : "",
                               ].join(" ")}
                             >
-                              {w.text}{" "}
+                              {lay.text}
                             </span>
+                            </Fragment>
                           );
                         })
                       : p.text}
