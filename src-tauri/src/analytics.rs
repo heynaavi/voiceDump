@@ -118,6 +118,17 @@ const STOP_WORDS: &[&str] = &[
     "also", "yeah", "okay", "ok", "well", "want", "need", "make", "made", "let", "lets", "see",
     "think", "know", "like", "just", "really", "thing", "things", "way", "s", "t", "re", "ve",
     "ll", "d", "m",
+    // Contractions, spelled out rather than stemmed. `normalise` keeps the
+    // apostrophe, so "let's" never matched the "lets" above and every one of
+    // these was placing in "what you talk about" — a top-words list led by
+    // "let's, what's, don't, it's" describes nobody. Stripping the suffix
+    // instead would leave stubs ("don", "isn", "won") that are worse than the
+    // contraction, so the forms are simply listed.
+    "i'm", "i've", "i'll", "i'd", "it's", "that's", "there's", "here's", "what's", "who's",
+    "how's", "let's", "he's", "she's", "we're", "we've", "we'll", "we'd", "you're", "you've",
+    "you'll", "you'd", "they're", "they've", "they'll", "they'd", "don't", "doesn't", "didn't",
+    "isn't", "aren't", "wasn't", "weren't", "won't", "can't", "couldn't", "wouldn't",
+    "shouldn't", "haven't", "hasn't", "hadn't",
 ];
 
 /// Only unambiguous fillers.
@@ -176,25 +187,44 @@ fn analyse_text(all: &[String]) -> Vocabulary {
 
         let flat = normalise(text);
 
+        // Padded so a phrase at either end still matches on word boundaries,
+        // and so " sort of " can't fire inside "resort often".
+        let padded = format!(" {} ", flat.split_whitespace().collect::<Vec<_>>().join(" "));
+        let mut subject = padded.clone();
+
         for phrase in FILLER_PHRASES {
-            let n = flat.matches(phrase).count() as i64;
+            let needle = format!(" {phrase} ");
+            let n = padded.matches(&needle).count() as i64;
             if n > 0 {
                 *filler_counts.entry((*phrase).to_string()).or_insert(0) += n;
             }
+            // Blank the phrase out of the copy the subject-matter tally reads.
+            // Counting a phrase as a filler and then also counting the words it
+            // is made of is how "sort" became the most-talked-about topic of
+            // someone who had merely said "sort of" a lot. Only the matched
+            // occurrences go — a standalone "sort the list" still counts.
+            while let Some(at) = subject.find(&needle) {
+                subject.replace_range(at..at + needle.len(), "  ");
+            }
         }
 
-        for word in flat.split_whitespace() {
+        // Totals and single-word fillers read the untouched text: the filler
+        // rate is a proportion of everything said, so removing words from the
+        // denominator would inflate it.
+        for word in padded.split_whitespace() {
             let w = word.trim_matches('\'');
             if w.is_empty() {
                 continue;
             }
             total_words += 1;
-
             if FILLERS.contains(&w) {
                 *filler_counts.entry(w.to_string()).or_insert(0) += 1;
-                continue;
             }
-            if w.len() < 3 || STOP_WORDS.contains(&w) {
+        }
+
+        for word in subject.split_whitespace() {
+            let w = word.trim_matches('\'');
+            if w.len() < 3 || FILLERS.contains(&w) || STOP_WORDS.contains(&w) {
                 continue;
             }
             *freq.entry(w.to_string()).or_insert(0) += 1;
@@ -516,6 +546,44 @@ mod tests {
         let v = analyse_text(&["um so you know it was uh fine".to_string()]);
         let total: i64 = v.fillers.iter().map(|f| f.count).sum();
         assert_eq!(total, 3); // um, uh, "you know"
+    }
+
+    /// A filler phrase must not also become subject matter.
+    ///
+    /// Saying "sort of" eleven times made "sort" the top word in "what you talk
+    /// about" — the phrase was counted as a filler *and* its parts were counted
+    /// as topics. The share card built on that list would have described
+    /// somebody's verbal tic as their week's work.
+    #[test]
+    fn filler_phrases_do_not_leak_into_top_words() {
+        let v = analyse_text(&["sort of the design sort of the design".to_string()]);
+        let top: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
+        assert!(!top.contains(&"sort"), "filler part in top words: {top:?}");
+        assert!(top.contains(&"design"));
+        // Still counted as the filler it is.
+        assert_eq!(v.fillers.iter().find(|f| f.word == "sort of").unwrap().count, 2);
+    }
+
+    /// The same word used properly is still subject matter.
+    #[test]
+    fn a_standalone_word_survives_its_phrase_being_a_filler() {
+        let v = analyse_text(&["sort the records and sort the files".to_string()]);
+        let top: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
+        assert!(top.contains(&"sort"), "lost a real use of the word: {top:?}");
+        assert!(v.fillers.is_empty());
+    }
+
+    /// Contractions are function words, not topics.
+    #[test]
+    fn contractions_are_not_topics() {
+        let v = analyse_text(
+            &["let's ship it it's what's next don't wait let's ship".to_string()],
+        );
+        let top: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
+        for c in ["let's", "it's", "what's", "don't"] {
+            assert!(!top.contains(&c), "contraction in top words: {top:?}");
+        }
+        assert!(top.contains(&"ship"));
     }
 
     #[test]

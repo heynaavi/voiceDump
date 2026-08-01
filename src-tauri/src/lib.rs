@@ -341,6 +341,16 @@ fn write_text_file(path: String, contents: String) -> Result<(), String> {
     std::fs::write(&path, contents).map_err(|e| e.to_string())
 }
 
+/// Write bytes the frontend produced to a path the user picked.
+///
+/// The share card is drawn on a canvas and arrives here as PNG bytes. Separate
+/// from `write_text_file` because a PNG through a `String` would be mangled by
+/// UTF-8 validation long before it reached the disk.
+#[tauri::command]
+fn write_binary_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())
+}
+
 /// Persist a microphone recording and hand back its path.
 ///
 /// Recordings live alongside the database rather than in a temp dir: the
@@ -493,6 +503,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         rename_transcript,
         delete_transcript,
         write_text_file,
+        write_binary_file,
         save_recording,
         analytics::analytics_summary,
     ]

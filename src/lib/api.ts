@@ -229,6 +229,14 @@ export async function writeTextFile(path: string, contents: string): Promise<voi
   return invoke("write_text_file", { path, contents });
 }
 
+/** Save bytes (the share card PNG) to a path the user chose. */
+export async function writeBinaryFile(
+  path: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  return invoke("write_binary_file", { path, bytes: Array.from(bytes) });
+}
+
 /**
  * Show a transcript's audio in Finder.
  *

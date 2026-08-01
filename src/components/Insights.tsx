@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
+import { save } from "@tauri-apps/plugin-dialog";
 
-import { analyticsSummary, type Count, type Insights as Data } from "../lib/api";
+import {
+  analyticsSummary,
+  writeBinaryFile,
+  type Count,
+  type Insights as Data,
+  type WordCount,
+} from "../lib/api";
+import { renderWordCloud } from "../lib/share";
 
 /**
  * Insights — what the history says about how you speak.
@@ -94,7 +102,11 @@ function Bars({
               style={{ width: `${(r.value / max) * 100}%` }}
             />
           </span>
-          <span className="mono-data w-[86px] shrink-0 text-right text-[11px] text-grey">
+          {/* Fixed width keeps every bar ending on the same line, so this must
+              never wrap: a three-digit word count used to push "335w" onto a
+              second row and knock that one bar out of alignment with the rest.
+              `compact` bounds the string so a busy month can't do it again. */}
+          <span className="mono-data w-[104px] shrink-0 whitespace-nowrap text-right text-[11px] text-grey">
             {r.value} {unit}
             {r.sub ? ` · ${r.sub}` : ""}
           </span>
@@ -142,22 +154,27 @@ function Heatmap({ days }: { days: Data["by_day"] }) {
     return `color-mix(in srgb, var(--color-sage-dim) ${step * 100}%, transparent)`;
   };
 
+  // Columns are sized by the panel rather than fixed at 11px. At a fixed size
+  // the grid drew a ~250px block into an 860px panel and left two-thirds of the
+  // row empty — the squares now grow to fill whatever width they are given, so
+  // the panel is the size of its contents in both directions.
   return (
-    <div className="overflow-x-auto">
-      <div className="flex gap-[3px]">
-        {weeks.map((week, i) => (
-          <div key={i} className="flex flex-col gap-[3px]">
-            {week.map((d) => (
-              <span
-                key={d.date}
-                title={d.words >= 0 ? `${d.date} — ${d.words} words` : undefined}
-                className="h-[11px] w-[11px]"
-                style={{ background: shade(d.words) }}
-              />
-            ))}
-          </div>
-        ))}
-      </div>
+    <div
+      className="grid w-full gap-[3px]"
+      style={{
+        gridTemplateRows: "repeat(7, 1fr)",
+        gridAutoColumns: "1fr",
+        gridAutoFlow: "column",
+      }}
+    >
+      {weeks.flat().map((d) => (
+        <span
+          key={d.date}
+          title={d.words >= 0 ? `${d.date} — ${d.words} words` : undefined}
+          className="aspect-square w-full"
+          style={{ background: shade(d.words) }}
+        />
+      ))}
     </div>
   );
 }
@@ -188,8 +205,180 @@ function Hours({ by }: { by: number[] }) {
   );
 }
 
+/** "2026-07-04" + "2026-08-01" → "Jul – Aug 2026". Shown on the share card. */
+function period(first: string | null, last: string | null): string {
+  if (!first || !last) return "";
+  const fmt = (iso: string) =>
+    new Date(`${iso}T12:00:00`).toLocaleDateString(undefined, {
+      month: "short",
+      year: "numeric",
+    });
+  const a = fmt(first);
+  const b = fmt(last);
+  return a === b ? a : `${a} – ${b}`;
+}
+
+/** Words the user has struck off their own cloud, per this machine. */
+const HIDDEN_KEY = "voicedumps:cloud-hidden";
+
+function loadHidden(): Set<string> {
+  try {
+    const raw = localStorage.getItem(HIDDEN_KEY);
+    return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * "What you talk about", as something you can post.
+ *
+ * Two things make this different from the list it replaces. Size carries the
+ * frequency, so the shape of a week is legible before any number is read. And
+ * every word can be struck out: this is a picture of what someone dictates,
+ * which for most people means client names, unreleased products and the odd
+ * colleague — one click from public. Removal is the feature, not a nicety, and
+ * it is applied to the export as well as to the panel.
+ */
+function WordCloud({
+  words,
+  notes,
+  totalWords,
+  period,
+}: {
+  words: WordCount[];
+  notes: number;
+  totalWords: number;
+  period: string;
+}) {
+  const [hidden, setHidden] = useState<Set<string>>(loadHidden);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const shown = useMemo(
+    () => words.filter((w) => !hidden.has(w.word)),
+    [words, hidden],
+  );
+
+  // Functional, because striking three words off quickly is one React batch:
+  // building the next set from the render's `hidden` made each click start from
+  // the same stale value, and only the last one survived.
+  const hide = (word: string) =>
+    setHidden((prev) => new Set(prev).add(word));
+
+  const restoreAll = () => setHidden(new Set());
+
+  // Persisting as an effect keeps it correct however the set was reached.
+  useEffect(() => {
+    try {
+      if (hidden.size) {
+        localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hidden]));
+      } else {
+        localStorage.removeItem(HIDDEN_KEY);
+      }
+    } catch {
+      // Storage can throw in a locked-down webview; the words stay hidden for
+      // this session either way.
+    }
+  }, [hidden]);
+
+  // Rank-based, matching the export exactly: counts cluster tightly in a young
+  // history, so scaling by count draws every word at nearly one size.
+  const scale = (i: number) =>
+    i < 2 ? "text-[30px]" : i < 4 ? "text-[25px]" : i < 7 ? "text-[20px]"
+      : i < 11 ? "text-[17px]" : i < 17 ? "text-[15px]" : "text-[13px]";
+
+  const share = async () => {
+    setError(null);
+    const target = await save({
+      defaultPath: "what-i-talk-about.png",
+      filters: [{ name: "PNG image", extensions: ["png"] }],
+    });
+    if (!target) return;
+    setSaving(true);
+    try {
+      const png = await renderWordCloud({
+        words: shown.map((w) => ({ word: w.word, count: w.count })),
+        notes,
+        totalWords,
+        period,
+      });
+      await writeBinaryFile(target, png);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Panel
+      title="WHAT YOU TALK ABOUT"
+      aside={hidden.size ? `${hidden.size} HIDDEN` : "CLICK A WORD TO HIDE IT"}
+    >
+      {shown.length ? (
+        <>
+          <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+            {shown.map((w, i) => (
+              <button
+                key={w.word}
+                onClick={() => hide(w.word)}
+                title={`${w.word} — ${w.count} times. Click to keep it off the card.`}
+                className={[
+                  scale(i),
+                  "font-semibold leading-tight tracking-[-0.015em] transition-colors",
+                  i < 2 ? "text-sage-dim" : i < 7 ? "text-ink" : "text-grey",
+                  "hover:text-amber hover:line-through",
+                ].join(" ")}
+              >
+                {w.word}
+              </button>
+            ))}
+          </div>
+
+          <div className="mt-4 flex items-center gap-3 border-t border-hairline pt-3">
+            <button
+              onClick={share}
+              disabled={saving}
+              className="micro border border-ink bg-ink px-3 py-1.5 text-surface transition-colors hover:bg-transparent hover:text-ink disabled:opacity-50"
+            >
+              {saving ? "RENDERING…" : "SAVE AS IMAGE"}
+            </button>
+            <span className="micro text-faint">1080 × 1920 · PORTRAIT</span>
+            {hidden.size > 0 && (
+              <button
+                onClick={restoreAll}
+                className="micro ml-auto text-grey underline-offset-2 hover:text-ink hover:underline"
+              >
+                RESTORE {hidden.size}
+              </button>
+            )}
+          </div>
+          {error && (
+            <p className="mono-data mt-2 text-[10px] uppercase tracking-[0.12em] text-amber">
+              COULD NOT SAVE — {error}
+            </p>
+          )}
+        </>
+      ) : (
+        <p className="micro text-faint">
+          {words.length ? "EVERY WORD HIDDEN" : "NOT ENOUGH TEXT YET"}
+        </p>
+      )}
+    </Panel>
+  );
+}
+
+/** 940 → "940", 1_240 → "1.2k". Keeps the count column a fixed width. */
+const compact = (n: number) =>
+  n < 1000 ? String(n) : `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+
 const toRows = (counts: Count[]) =>
-  counts.map((c) => ({ label: c.label, value: c.notes, sub: `${c.words}w` }));
+  counts.map((c) => ({
+    label: c.label,
+    value: c.notes,
+    sub: `${compact(c.words)}w`,
+  }));
 
 export function Insights() {
   const [data, setData] = useState<Data | null>(null);
@@ -263,12 +452,19 @@ export function Insights() {
           />
         </div>
 
-        <Panel
-          title="ACTIVITY"
-          aside={`${data.by_day.length} ACTIVE DAYS`}
-        >
-          <Heatmap days={data.by_day} />
-        </Panel>
+        {/* Activity shares its row rather than owning one. A 17-week grid is
+            about 250px of content; in a full-width panel that left two-thirds
+            of the row empty, and stretching the squares to fill it only made
+            the same information take more space. Half width fits it. */}
+        <div className="grid gap-3 md:grid-cols-2">
+          <Panel title="ACTIVITY" aside={`${data.by_day.length} ACTIVE DAYS`}>
+            <Heatmap days={data.by_day} />
+          </Panel>
+
+          <Panel title="WHEN YOU SPEAK">
+            <Hours by={data.by_hour} />
+          </Panel>
+        </div>
 
         <div className="grid gap-3 md:grid-cols-2">
           <Panel
@@ -283,18 +479,16 @@ export function Insights() {
             )}
           </Panel>
 
-          <Panel title="WHEN YOU SPEAK">
-            <Hours by={data.by_hour} />
-          </Panel>
-        </div>
-
-        <div className="grid gap-3 md:grid-cols-2">
           <Panel title="HOW IT ARRIVES">
             <Bars rows={toRows(data.by_source)} />
           </Panel>
+        </div>
 
+        <div className="grid gap-3">
           <Panel title="HOW YOU SPEAK">
-            <dl className="space-y-2 text-[12px]">
+            {/* Two columns across the full width: four rows stacked in one
+                column left a panel mostly made of gap. */}
+            <dl className="grid gap-x-10 gap-y-2 text-[12px] sm:grid-cols-2">
               <div className="flex justify-between gap-3">
                 <dt className="text-grey">Average sentence</dt>
                 <dd className="mono-data text-ink">
@@ -321,29 +515,23 @@ export function Insights() {
               </div>
             </dl>
             {v.fillers.length > 0 && (
+              // Which fillers, and how often. Unlabelled, this read as a bare
+              // "I MEAN 1" hanging under the rate — a fragment of a sentence
+              // rather than a count. The heading and the × make it a count.
               <p className="micro mt-3 text-faint">
-                {v.fillers.map((f) => `${f.word} ${f.count}`).join(" · ")}
+                <span className="text-grey">WHICH ONES</span>{" "}
+                {v.fillers.map((f) => `${f.word} ×${f.count}`).join(" · ")}
               </p>
             )}
           </Panel>
         </div>
 
-        <Panel title="WHAT YOU TALK ABOUT" aside="COMMON WORDS REMOVED">
-          {v.top_words.length ? (
-            <div className="flex flex-wrap gap-x-3 gap-y-1.5">
-              {v.top_words.map((w) => (
-                <span key={w.word} className="text-[13px] text-ink">
-                  {w.word}
-                  <span className="mono-data ml-1 text-[10px] text-faint">
-                    {w.count}
-                  </span>
-                </span>
-              ))}
-            </div>
-          ) : (
-            <p className="micro text-faint">NOT ENOUGH TEXT YET</p>
-          )}
-        </Panel>
+        <WordCloud
+          words={v.top_words}
+          notes={data.total_notes}
+          totalWords={data.total_words}
+          period={period(data.first_day, data.last_day)}
+        />
 
         <p className="micro pb-2 text-faint">
           COMPUTED ON THIS MAC FROM YOUR HISTORY // NOTHING IS UPLOADED
