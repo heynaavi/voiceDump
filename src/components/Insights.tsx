@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
+import gsap from "gsap";
 
 import {
   analyticsSummary,
@@ -8,7 +9,10 @@ import {
   type Insights as Data,
   type WordCount,
 } from "../lib/api";
+import { EASE, prefersReducedMotion } from "../lib/motion";
+import { bestType, renderReel } from "../lib/reel";
 import { renderWordCloud } from "../lib/share";
+import { CLUSTERS, PixelCluster } from "./PixelCluster";
 
 /**
  * Insights — what the history says about how you speak.
@@ -205,6 +209,59 @@ function Hours({ by }: { by: number[] }) {
   );
 }
 
+/**
+ * How you speak.
+ *
+ * Four label-and-number rows in a full-width panel was mostly leader space —
+ * the eye had to travel the whole panel to pair a name with its figure. These
+ * are four measurements of one thing, so they read as four measures: the number
+ * first at size, the name under it, and the fillers given a line of their own
+ * because a list of your verbal tics is the interesting part, not a footnote.
+ */
+function Speech({ v }: { v: Data["vocabulary"] }) {
+  const measures = [
+    { value: v.avg_sentence_words.toFixed(1), unit: "words", label: "AVERAGE SENTENCE" },
+    { value: String(v.longest_sentence_words), unit: "words", label: "LONGEST SENTENCE" },
+    { value: v.unique_words.toLocaleString(), unit: "", label: "DISTINCT WORDS" },
+    { value: v.filler_rate.toFixed(1), unit: "per 100 words", label: "FILLER RATE" },
+  ];
+
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-x-6 gap-y-5 sm:grid-cols-4">
+        {measures.map((m) => (
+          <div key={m.label}>
+            <p className="mono-data text-[22px] leading-none text-ink">
+              {m.value}
+              {m.unit && (
+                <span className="ml-1 text-[11px] text-grey">{m.unit}</span>
+              )}
+            </p>
+            <p className="eyebrow mt-2 text-faint">{m.label}</p>
+          </div>
+        ))}
+      </div>
+
+      {v.fillers.length > 0 && (
+        <div className="mt-5 border-t border-hairline pt-3">
+          <p className="eyebrow mb-2 text-faint">WHICH FILLERS</p>
+          <div className="flex flex-wrap gap-x-2 gap-y-1.5">
+            {v.fillers.map((f) => (
+              <span
+                key={f.word}
+                className="flex items-baseline gap-1.5 border border-hairline bg-surface px-2 py-1"
+              >
+                <span className="text-[12px] text-ink">{f.word}</span>
+                <span className="mono-data text-[10px] text-grey">×{f.count}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 /** "2026-07-04" + "2026-08-01" → "Jul – Aug 2026". Shown on the share card. */
 function period(first: string | null, last: string | null): string {
   if (!first || !last) return "";
@@ -252,8 +309,12 @@ function WordCloud({
   period: string;
 }) {
   const [hidden, setHidden] = useState<Set<string>>(loadHidden);
-  const [saving, setSaving] = useState(false);
+  const [busy, setBusy] = useState<"png" | "reel" | null>(null);
+  const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  // Probed once: whether this webview has an encoder at all.
+  const canRecord = useMemo(() => bestType() !== null, []);
 
   const shown = useMemo(
     () => words.filter((w) => !hidden.has(w.word)),
@@ -288,26 +349,59 @@ function WordCloud({
     i < 2 ? "text-[30px]" : i < 4 ? "text-[25px]" : i < 7 ? "text-[20px]"
       : i < 11 ? "text-[17px]" : i < 17 ? "text-[15px]" : "text-[13px]";
 
+  const card = () => ({
+    words: shown.map((w) => ({ word: w.word, count: w.count })),
+    notes,
+    totalWords,
+    period,
+  });
+
   const share = async () => {
     setError(null);
+    setNote(null);
     const target = await save({
       defaultPath: "what-i-talk-about.png",
       filters: [{ name: "PNG image", extensions: ["png"] }],
     });
     if (!target) return;
-    setSaving(true);
+    setBusy("png");
     try {
-      const png = await renderWordCloud({
-        words: shown.map((w) => ({ word: w.word, count: w.count })),
-        notes,
-        totalWords,
-        period,
-      });
-      await writeBinaryFile(target, png);
+      await writeBinaryFile(target, await renderWordCloud(card()));
     } catch (err) {
       setError(String(err));
     } finally {
-      setSaving(false);
+      setBusy(null);
+    }
+  };
+
+  const shareReel = async () => {
+    setError(null);
+    setNote(null);
+    // The container is whatever the webview can encode, and the extension has
+    // to match it or the file is unopenable. So it is decided before the dialog
+    // rather than after, and the user picks a name for the format they'll get.
+    const kind = bestType();
+    const ext = kind?.startsWith("video/mp4") ? "mp4" : "webm";
+    const target = await save({
+      defaultPath: `what-i-talk-about.${ext}`,
+      filters: [{ name: ext.toUpperCase() + " video", extensions: [ext] }],
+    });
+    if (!target) return;
+    setBusy("reel");
+    setProgress(0);
+    try {
+      const reel = await renderReel(card(), setProgress);
+      await writeBinaryFile(target, reel.bytes);
+      if (reel.extension !== "mp4") {
+        // Better to say so than to let it fail at the upload screen.
+        setNote(
+          "SAVED AS WEBM — THIS WEBVIEW HAS NO H.264 ENCODER, AND INSTAGRAM WILL NOT ACCEPT IT",
+        );
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -336,13 +430,27 @@ function WordCloud({
             ))}
           </div>
 
-          <div className="mt-4 flex items-center gap-3 border-t border-hairline pt-3">
+          <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-hairline pt-3">
             <button
               onClick={share}
-              disabled={saving}
+              disabled={busy !== null}
               className="micro border border-ink bg-ink px-3 py-1.5 text-surface transition-colors hover:bg-transparent hover:text-ink disabled:opacity-50"
             >
-              {saving ? "RENDERING…" : "SAVE AS IMAGE"}
+              {busy === "png" ? "RENDERING…" : "SAVE AS IMAGE"}
+            </button>
+            <button
+              onClick={shareReel}
+              disabled={busy !== null || !canRecord}
+              title={
+                canRecord
+                  ? "A short portrait video of the cloud assembling"
+                  : "This build's webview cannot record video"
+              }
+              className="micro border border-hairline px-3 py-1.5 text-ink transition-colors hover:border-sage-dim disabled:opacity-40"
+            >
+              {busy === "reel"
+                ? `RECORDING ${Math.round(progress * 100)}%`
+                : "SAVE AS VIDEO"}
             </button>
             <span className="micro text-faint">1080 × 1920 · PORTRAIT</span>
             {hidden.size > 0 && (
@@ -354,9 +462,24 @@ function WordCloud({
               </button>
             )}
           </div>
+          {busy === "reel" && (
+            // Recording runs in real time off the canvas, so this is a genuine
+            // seven-second wait rather than a progress bar for show.
+            <div className="mt-2 h-[2px] w-full bg-hairline-soft">
+              <div
+                className="h-full bg-sage-dim transition-[width] duration-100"
+                style={{ width: `${Math.round(progress * 100)}%` }}
+              />
+            </div>
+          )}
           {error && (
             <p className="mono-data mt-2 text-[10px] uppercase tracking-[0.12em] text-amber">
               COULD NOT SAVE — {error}
+            </p>
+          )}
+          {note && (
+            <p className="mono-data mt-2 text-[10px] uppercase tracking-[0.12em] text-amber">
+              {note}
             </p>
           )}
         </>
@@ -383,12 +506,43 @@ const toRows = (counts: Count[]) =>
 export function Insights() {
   const [data, setData] = useState<Data | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const sheet = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     analyticsSummary()
       .then(setData)
       .catch((e) => setError(String(e)));
   }, []);
+
+  // The panels arrive in reading order once the numbers are in.
+  //
+  // Keyed on `data` rather than on mount: the figures are computed on every
+  // open, so animating at mount would run the entrance against the loading
+  // state and the panels would already be sitting there when it finished.
+  useEffect(() => {
+    if (!data || !sheet.current) return;
+    if (prefersReducedMotion()) return;
+    const rows = sheet.current.querySelectorAll("[data-row]");
+    const tl = gsap.timeline();
+    tl.fromTo(
+      rows,
+      { opacity: 0, y: 14 },
+      {
+        opacity: 1,
+        y: 0,
+        duration: 0.42,
+        ease: EASE.snap,
+        // Fast enough that the last panel isn't still arriving after the eye
+        // has reached it — the whole sequence is under half a second of stagger.
+        stagger: 0.055,
+      },
+    );
+    return () => {
+      tl.kill();
+      // Leave the panels visible if the view is torn down mid-run.
+      gsap.set(rows, { clearProps: "opacity,transform" });
+    };
+  }, [data]);
 
   if (error) {
     return (
@@ -398,9 +552,15 @@ export function Insights() {
     );
   }
   if (!data) {
+    // Every figure on this screen is computed from the whole history on each
+    // open — nothing is cached, so on a large one this is a real wait. The
+    // pulsing mark is the app's own working state rather than a spinner.
     return (
-      <div className="titlebar-pad flex h-full items-center justify-center p-8">
-        <p className="micro text-faint">READING HISTORY…</p>
+      <div className="titlebar-pad flex h-full flex-col items-center justify-center gap-3 p-8">
+        <span className="text-sage-dim">
+          <PixelCluster pattern={CLUSTERS.brand} size={7} gap={3} pulse />
+        </span>
+        <p className="micro text-faint">READING YOUR HISTORY…</p>
       </div>
     );
   }
@@ -421,8 +581,8 @@ export function Insights() {
 
   return (
     <div className="titlebar-pad scroll-slim h-full overflow-y-auto">
-      <div className="mx-auto max-w-[860px] space-y-3 p-6">
-        <header>
+      <div ref={sheet} className="mx-auto max-w-[860px] space-y-3 p-6">
+        <header data-row>
           <h1 className="text-[22px] font-semibold tracking-[-0.01em] text-ink">
             Insights
           </h1>
@@ -433,7 +593,7 @@ export function Insights() {
           </p>
         </header>
 
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div data-row className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           <Stat
             value={thin ? "—" : String(Math.round(sp.words_per_minute))}
             label="WORDS PER MINUTE"
@@ -456,7 +616,7 @@ export function Insights() {
             about 250px of content; in a full-width panel that left two-thirds
             of the row empty, and stretching the squares to fill it only made
             the same information take more space. Half width fits it. */}
-        <div className="grid gap-3 md:grid-cols-2">
+        <div data-row className="grid gap-3 md:grid-cols-2">
           <Panel title="ACTIVITY" aside={`${data.by_day.length} ACTIVE DAYS`}>
             <Heatmap days={data.by_day} />
           </Panel>
@@ -466,7 +626,7 @@ export function Insights() {
           </Panel>
         </div>
 
-        <div className="grid gap-3 md:grid-cols-2">
+        <div data-row className="grid gap-3 md:grid-cols-2">
           <Panel
             title="WHERE YOUR VOICE GOES"
             aside={data.app_unknown ? `${data.app_unknown} NOT RECORDED` : undefined}
@@ -484,54 +644,20 @@ export function Insights() {
           </Panel>
         </div>
 
-        <div className="grid gap-3">
+        <div data-row className="grid gap-3">
           <Panel title="HOW YOU SPEAK">
-            {/* Two columns across the full width: four rows stacked in one
-                column left a panel mostly made of gap. */}
-            <dl className="grid gap-x-10 gap-y-2 text-[12px] sm:grid-cols-2">
-              <div className="flex justify-between gap-3">
-                <dt className="text-grey">Average sentence</dt>
-                <dd className="mono-data text-ink">
-                  {v.avg_sentence_words.toFixed(1)} words
-                </dd>
-              </div>
-              <div className="flex justify-between gap-3">
-                <dt className="text-grey">Longest sentence</dt>
-                <dd className="mono-data text-ink">
-                  {v.longest_sentence_words} words
-                </dd>
-              </div>
-              <div className="flex justify-between gap-3">
-                <dt className="text-grey">Distinct words</dt>
-                <dd className="mono-data text-ink">
-                  {v.unique_words.toLocaleString()}
-                </dd>
-              </div>
-              <div className="flex justify-between gap-3">
-                <dt className="text-grey">Filler rate</dt>
-                <dd className="mono-data text-ink">
-                  {v.filler_rate.toFixed(1)} per 100 words
-                </dd>
-              </div>
-            </dl>
-            {v.fillers.length > 0 && (
-              // Which fillers, and how often. Unlabelled, this read as a bare
-              // "I MEAN 1" hanging under the rate — a fragment of a sentence
-              // rather than a count. The heading and the × make it a count.
-              <p className="micro mt-3 text-faint">
-                <span className="text-grey">WHICH ONES</span>{" "}
-                {v.fillers.map((f) => `${f.word} ×${f.count}`).join(" · ")}
-              </p>
-            )}
+            <Speech v={v} />
           </Panel>
         </div>
 
+        <div data-row>
         <WordCloud
           words={v.top_words}
           notes={data.total_notes}
           totalWords={data.total_words}
           period={period(data.first_day, data.last_day)}
         />
+        </div>
 
         <p className="micro pb-2 text-faint">
           COMPUTED ON THIS MAC FROM YOUR HISTORY // NOTHING IS UPLOADED
