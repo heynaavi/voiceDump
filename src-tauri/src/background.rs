@@ -43,11 +43,48 @@ pub fn hide_instead_of_quit(win: &Window) -> bool {
     true
 }
 
+/// Put the most recent transcript back on the clipboard.
+///
+/// Dictation pastes for you and then hands the clipboard back to whatever was
+/// on it, so the words you just spoke are only in the app. That is the right
+/// default and it is also the moment you notice the paste went somewhere you
+/// didn't mean, or landed in a field that ate it. This is the way back, and it
+/// is in the menu bar because that is reachable without leaving the app you are
+/// standing in.
+fn copy_last(app: &AppHandle) {
+    let store = app.state::<crate::store::Store>();
+    let found = store
+        .0
+        .lock()
+        .map_err(|e| e.to_string())
+        .and_then(|conn| crate::store::latest(&conn).map_err(|e| e.to_string()));
+
+    match found {
+        // An empty library is not a failure — there is simply nothing to put
+        // back, and someone with no notes is not the one clicking this.
+        Ok(None) => {}
+        Ok(Some((title, text))) => match crate::clipboard::write(&text) {
+            Ok(()) => eprintln!("[tray] copied \"{title}\" to the clipboard"),
+            Err(e) => eprintln!("[tray] could not copy \"{title}\": {e}"),
+        },
+        Err(e) => eprintln!("[tray] could not read the last transcript: {e}"),
+    }
+}
+
 pub fn install_tray(app: &AppHandle) -> tauri::Result<()> {
     let autostart = app.autolaunch();
     let launching = autostart.is_enabled().unwrap_or(false);
 
     let open = MenuItem::with_id(app, "open", "Open VoiceDumps", true, None::<&str>)?;
+    // Sits with Open rather than in its own group: both are things you came to
+    // the menu to *do*, as against the settings below the rule.
+    let copy = MenuItem::with_id(
+        app,
+        "copy-last",
+        "Copy Last Transcript",
+        true,
+        None::<&str>,
+    )?;
     let login = CheckMenuItem::with_id(
         app,
         "login",
@@ -59,7 +96,14 @@ pub fn install_tray(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Quit VoiceDumps", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&open, &PredefinedMenuItem::separator(app)?, &login, &PredefinedMenuItem::separator(app)?, &quit],
+        &[
+            &open,
+            &copy,
+            &PredefinedMenuItem::separator(app)?,
+            &login,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
     )?;
 
     TrayIconBuilder::with_id("main")
@@ -72,6 +116,7 @@ pub fn install_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "open" => show_main(app),
+            "copy-last" => copy_last(app),
             "login" => {
                 let auto = app.autolaunch();
                 let now = auto.is_enabled().unwrap_or(false);

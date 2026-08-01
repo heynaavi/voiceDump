@@ -185,6 +185,20 @@ pub fn list(conn: &Connection, query: Option<&str>) -> rusqlite::Result<Vec<Tran
     }
 }
 
+/// The newest note's title and text, or `None` on an empty library.
+///
+/// Its own query rather than `list` then `get`: the tray wants exactly one row,
+/// and listing reads every note's metadata to throw all but the first away.
+pub fn latest(conn: &Connection) -> rusqlite::Result<Option<(String, String)>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT title, text FROM transcripts ORDER BY created_at DESC LIMIT 1",
+        [],
+        |row| Ok((row.get("title")?, row.get("text")?)),
+    )
+    .optional()
+}
+
 pub fn get(conn: &Connection, id: &str) -> rusqlite::Result<Transcript> {
     conn.query_row("SELECT * FROM transcripts WHERE id = ?1", [id], |row| {
         Ok(Transcript {
@@ -341,4 +355,48 @@ pub fn mark_titled(conn: &Connection, id: &str) -> rusqlite::Result<()> {
 pub fn delete(conn: &Connection, id: &str) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM transcripts WHERE id = ?1", [id])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn library(name: &str) -> Connection {
+        let dir = std::env::temp_dir().join(format!("vd-store-{name}"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        open(&dir).unwrap()
+    }
+
+    fn note(conn: &Connection, id: &str, created_at: i64, text: &str) {
+        let nothing = serde_json::Value::Null;
+        insert(
+            conn, id, id, "", 0.0, None, created_at, text, &nothing, &nothing, &nothing,
+            "hotkey", "",
+        )
+        .unwrap();
+    }
+
+    /// The tray copies whatever this returns, so "newest" has to mean newest by
+    /// clock and not by insertion order. They come apart in practice: a dropped
+    /// file is dated when it was recorded, so importing an old one writes a row
+    /// that is last in and must not be what the menu hands back.
+    #[test]
+    fn the_latest_note_is_the_most_recent_one() {
+        let conn = library("latest");
+        note(&conn, "old", 1_000, "spoken first");
+        note(&conn, "new", 9_000, "spoken last");
+        note(&conn, "imported", 500, "recorded years ago, added just now");
+
+        let (title, text) = latest(&conn).unwrap().expect("a library with notes in it");
+        assert_eq!(title, "new");
+        assert_eq!(text, "spoken last");
+    }
+
+    /// A fresh install. The menu item is always present, so this path runs the
+    /// first time anyone opens the tray.
+    #[test]
+    fn an_empty_library_has_no_latest_note() {
+        assert!(latest(&library("empty")).unwrap().is_none());
+    }
 }
