@@ -5,6 +5,7 @@ mod dictation;
 mod engine;
 mod export;
 mod media;
+mod settings;
 #[cfg(target_os = "macos")]
 mod sound;
 mod store;
@@ -128,8 +129,14 @@ fn archive_transcript_media(app: tauri::AppHandle, id: String) -> Result<String,
     };
 
     let src = std::path::Path::new(&current);
-    if current.contains("/media/") {
-        return Ok(current); // already ours
+    let ours = current.contains("/media/");
+
+    // Ours *and* playable is the finished state. Ours but not playable is a
+    // library entry written by a build that fell back to a raw copy, and it can
+    // be re-encoded from itself — the bytes are still here and symphonia reads
+    // the containers the webview won't play.
+    if ours && media::is_playable(&current) {
+        return Ok(current);
     }
     if !src.exists() {
         return Err("the original file is no longer on disk".into());
@@ -139,10 +146,42 @@ fn archive_transcript_media(app: tauri::AppHandle, id: String) -> Result<String,
     let stored = media::archive(&dir, &id, src, created)?;
     let stored = stored.to_string_lossy().into_owned();
 
+    // Repairing in place leaves the unplayable original behind in our own
+    // directory; nothing will ever read it again.
+    if ours && stored != current {
+        media::discard(&current);
+    }
+
+    // Only a path outside the library is an origin. Re-encoding one of our own
+    // files must not record the file we just deleted as "where it came from" —
+    // that is precisely the dangling path that made REVEAL SOURCE do nothing.
+    let origin = if ours { "" } else { current.as_str() };
+
     let store = app.state::<Store>();
     let conn = store.0.lock().unwrap();
-    store::set_media_path(&conn, &id, &stored, &current).map_err(|e| e.to_string())?;
+    store::set_media_path(&conn, &id, &stored, origin).map_err(|e| e.to_string())?;
     Ok(stored)
+}
+
+/// Show a transcript's audio in Finder.
+///
+/// Lives here rather than in the frontend because the choice of *which* file to
+/// reveal depends on what is actually on disk. The original is the better answer
+/// when it exists — that is where the user filed it — but they move and delete
+/// their own files all the time, and the archived copy is always there. The
+/// plugin's reveal canonicalises before it does anything, so a stale origin
+/// doesn't open the wrong window, it fails; asking here means the fallback
+/// happens instead of nothing happening.
+#[tauri::command]
+fn reveal_source(origin: String, archived: String) -> Result<(), String> {
+    let candidates = [origin, archived];
+    let found = candidates
+        .iter()
+        .map(|p| p.trim())
+        .find(|p| !p.is_empty() && std::path::Path::new(p).exists())
+        .ok_or("that audio is no longer on disk")?;
+
+    tauri_plugin_opener::reveal_item_in_dir(found).map_err(|e| e.to_string())
 }
 
 /// Open the Accessibility pane. macOS shows its permission prompt only once per
@@ -226,6 +265,14 @@ pub fn insert_transcript(
         .map(|p| p.to_string_lossy().into_owned());
     let playable = stored.as_deref().unwrap_or(source_path);
 
+    // A dictation's "source" is a scratch WAV in our own data directory that
+    // `dictation::finish` deletes as soon as the library copy exists. Recording
+    // it as the origin left every dictation pointing at a file that was gone
+    // moments later, which is what made REVEAL SOURCE do nothing at all: the
+    // reveal canonicalises the path first and fails before Finder is involved.
+    // Only a file the *user* has somewhere is an origin worth remembering.
+    let origin = if source == "hotkey" { "" } else { source_path };
+
     let store = app.state::<Store>();
     let conn = store.0.lock().unwrap();
     store::insert(
@@ -241,7 +288,7 @@ pub fn insert_transcript(
         &segments,
         &peaks,
         source,
-        source_path,
+        origin,
     )
     .map_err(|e| e.to_string())?;
     if run.measured() {
@@ -343,6 +390,12 @@ pub fn run() {
             let conn = store::open(&dir)?;
             app.manage(Store(Mutex::new(conn)));
 
+            // Before dictation spawns: the key-down path reads this, and a
+            // missing state would silently mean "default" on the first press.
+            app.manage(settings::SettingsState(Mutex::new(settings::load(
+                app.handle(),
+            ))));
+
             // Launch the native dictation-overlay helper. The pill is drawn by a
             // separate accessory process because a Tauri webview window cannot
             // float over another app's full-screen Space; a native NSPanel can.
@@ -430,6 +483,9 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         archive_transcript_media,
         export::export_pdf,
         open_accessibility_settings,
+        reveal_source,
+        settings::get_settings,
+        settings::set_live_preview,
         engine::start_transcription,
         engine::transcribe_peaks,
         engine::engine_status,

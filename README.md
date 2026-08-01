@@ -153,9 +153,9 @@ instead of 13×.
 
 The pill is its own accessory process
 ([`overlay-helper/main.swift`](overlay-helper/main.swift)) — a Tauri webview
-cannot float over another app's full-screen Space, an `NSPanel` can. **The words
-appear while you are still speaking**, in a second panel above it, and nothing
-reaches your document until you let go.
+cannot float over another app's full-screen Space, an `NSPanel` can. The level
+bars are the real signal: CoreAudio RMS, metered every 50 ms. Nothing reaches
+your document until you let go, and then it arrives in one piece.
 
 </td>
 <td width="50%">
@@ -259,7 +259,7 @@ halving the download.
 | UI | `src/` | React + Tailwind. Reader, history, insights, drag-drop. |
 | Shell | `src-tauri/` | Tauri v2. Owns the SQLite history, the globe-key tap and the engine. |
 | Engine | `src-tauri/src/engine.rs` | whisper.cpp via `whisper-rs`, Metal-accelerated. In-process. |
-| Overlay | `overlay-helper/` | Swift `NSPanel` for the dictation pill and PDF typesetting. Its level bars are the real signal — CoreAudio RMS, metered every 50 ms. |
+| Overlay | `overlay-helper/` | Swift `NSPanel` for the dictation pill and PDF typesetting. |
 
 Transcription used to run in a Python sidecar on MLX. That worked but could
 never ship: it needed a 1 GB virtualenv, the `mlx` stack, and `ffmpeg` on the
@@ -278,21 +278,26 @@ asserted they were all released — `abort()`, and macOS reporting a crash on an
 ordinary quit. There is a regression test that runs the exit in a child process,
 because the behaviour under test is what happens *during* exit.
 
-**The live preview transcribes forward.** Whisper has no incremental decode, so
-re-reading the whole recording every pass would compound the lag. A cursor marks
+**The live preview is off by default** (LIVE PREVIEW, at the foot of the
+sidebar). Turned on, the overlay drafts your words while you are still speaking.
+Whisper has no incremental decode, so it transcribes *forward* — a cursor marks
 what has been read, each pass takes only what is new, and chunks are cut at the
-quietest moment in their tail so boundaries land between words rather than
-inside them. Pass cost is bounded by the chunk rather than by how long you have
-been talking, which is what keeps the lag flat. It runs on `small` while the real
-transcription stays on `medium`: the preview is thrown away the moment the
-authoritative pass lands, so it wants speed far more than accuracy. In the panel,
-newly-arrived words are brighter and ease back to match the rest, so a reading
-edge follows your voice.
+quietest moment in their tail so boundaries land between words rather than inside
+them. Pass cost is bounded by the chunk rather than by how long you have been
+talking, which is what keeps the lag flat.
 
-**Nothing is inserted progressively.** Doing so would mean *retracting* text when
-the transcript revises itself — firing backspaces into whatever you were writing
-— so the preview stays in the panel and the paste happens once, from one clean
-read of the whole recording.
+It ships off because of what it costs to read. The preview runs on `small` while
+the real transcription stays on `medium`, and it is thrown away the moment the
+authoritative pass lands — so what you watch appear is a faster, worse guess at a
+sentence you already know you said, and it will quietly change. Being shown a
+mangled version of your own words invites you to correct something that was never
+going to be pasted. It is genuinely useful as reassurance that the microphone is
+working; it is not a draft, and defaulting it on presented it as one.
+
+**Nothing is inserted progressively,** either way. Doing so would mean
+*retracting* text when the transcript revises itself — firing backspaces into
+whatever you were writing — so the preview stays in the panel and the paste
+happens once, from one clean read of the whole recording.
 
 **Text is pasted, not typed.** Synthetic keystrokes are slow and get mangled by
 autocorrect and input methods, so the transcript goes to the clipboard and the
@@ -311,8 +316,9 @@ index behind the search box.
 
 Audio is **copied** into `…/media/`, organised by month, so playback survives you
 moving or deleting the original — the store keeps both the archived copy and the
-path it came from. That copy is transcoded with `ffmpeg` when it is available and
-skipped when it is not; transcription never depends on it.
+path it came from. The copy is normalised to mono AAC so that everything is
+playable by the same `<audio>` element: `symphonia` decodes, and CoreAudio's own
+`/usr/bin/afconvert` encodes. No `ffmpeg`, here or anywhere else.
 
 Dictation records to a scratch WAV in `…/dictation/`, which is deleted the moment
 the library has its copy. A capture that never reaches that point — a failed

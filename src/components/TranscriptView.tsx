@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import gsap from "gsap";
 
 import type { Paragraph, Transcript } from "../lib/api";
@@ -8,6 +7,7 @@ import {
   archiveTranscriptMedia,
   exportPdf,
   fetchPeaks,
+  revealSource,
   setTranscriptPeaks,
   writeTextFile,
 } from "../lib/api";
@@ -28,6 +28,13 @@ type Props = {
 
 /** How long the clicked word stays lit before the caret takes over. */
 const FLASH_MS = 420;
+
+/**
+ * Containers WKWebView will actually decode. Mirrors `media::is_playable` — the
+ * backend decides whether to re-encode, this decides whether to bother asking.
+ */
+const PLAYABLE = /\.(m4a|mp4|mp3|wav|aac|aiff|aif|caf|flac)$/i;
+const playableAudio = (path: string) => PLAYABLE.test(path);
 
 /** Type scale for the focused paragraph vs the rest, *while following audio*. */
 const FOCUS_SIZE = 19.5;
@@ -56,7 +63,8 @@ const READING_LINE = 0.2;
 export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming = false }: Props) {
   const [copied, setCopied] = useState(false);
   const [exporting, setExporting] = useState(false);
-  const [exportError, setExportError] = useState<string | null>(null);
+  /** Shared by every rail action — one place a failure can surface. */
+  const [actionError, setActionError] = useState<string | null>(null);
   const [title, setTitle] = useState(transcript.title);
   const [time, setTime] = useState(0);
   const [paragraphs, setParagraphs] = useState<Paragraph[]>([]);
@@ -165,8 +173,16 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
   // Transcripts saved before the media library point at wherever their file
   // happened to live, in whatever format it happened to be — an Opus voice note,
   // among them, which the webview can't decode. Pull them in on first open.
+  //
+  // Library files get the same treatment when they aren't in a format the
+  // webview plays. Builds that shipped with the `ffmpeg` transcode never found
+  // ffmpeg on a user's machine and archived raw copies instead, so an existing
+  // library can be full of files that decode fine and play as nothing. Opening
+  // the note re-encodes it, once.
   useEffect(() => {
-    if (transcript.source_path.includes("/media/")) return;
+    if (transcript.source_path.includes("/media/") && playableAudio(transcript.source_path)) {
+      return;
+    }
     let cancelled = false;
     archiveTranscriptMedia(transcript.id)
       .then((p) => {
@@ -674,6 +690,24 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
     setCopied(true);
   };
 
+  /**
+   * Reveal the audio in Finder.
+   *
+   * The backend picks between the original and the library copy, so all this
+   * has to do is report a failure. It used to swallow one, which meant a
+   * transcript whose original had been moved — or a dictation, whose scratch
+   * recording is deleted the moment it is archived — gave a button that
+   * visibly did nothing at all.
+   */
+  const revealAudio = async () => {
+    setActionError(null);
+    try {
+      await revealSource(transcript.origin_path, transcript.source_path);
+    } catch (err) {
+      setActionError(`COULD NOT REVEAL — ${err}`);
+    }
+  };
+
   const wordCount = paragraphs.reduce(
     (n, p) => n + p.text.split(/\s+/).filter(Boolean).length,
     0,
@@ -706,7 +740,7 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
     if (!target) return;
 
     setExporting(true);
-    setExportError(null);
+    setActionError(null);
     try {
       if (target.endsWith(".pdf")) {
         await exportPdf(target, {
@@ -730,7 +764,7 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
     } catch (err) {
       // Saving is the one place a silent failure is unforgivable: the user
       // walks away believing the file exists.
-      setExportError(String(err));
+      setActionError(`EXPORT FAILED — ${err}`);
     } finally {
       setExporting(false);
     }
@@ -785,11 +819,12 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
                   </>
                 )}
               </p>
-              {exportError && (
-                // A save that quietly did nothing is the worst outcome here —
-                // the user closes the window believing the file is on disk.
+              {actionError && (
+                // An action that quietly did nothing is the worst outcome here —
+                // the user closes the window believing the file is on disk, or
+                // clicks SOURCE a third time expecting Finder.
                 <p className="mono-data mt-1 text-[10px] uppercase tracking-[0.12em] text-amber">
-                  EXPORT FAILED — {exportError}
+                  {actionError}
                 </p>
               )}
             </div>
@@ -800,16 +835,7 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
                 onClick={exportFile}
                 label={exporting ? "SAVING…" : "EXPORT"}
               />
-              <RailButton
-                onClick={() =>
-                  // Prefer where the file came from; fall back to the archived
-                  // copy for anything that arrived without an original on disk.
-                  revealItemInDir(
-                    transcript.origin_path || transcript.source_path,
-                  ).catch(() => {})
-                }
-                label="SOURCE"
-              />
+              <RailButton onClick={revealAudio} label="SOURCE" />
               <RailButton
                 onClick={() => onDelete(transcript.id)}
                 label="DELETE"

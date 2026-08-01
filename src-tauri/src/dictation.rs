@@ -650,9 +650,21 @@ fn start(app: &tauri::AppHandle) {
             let warming = app.clone();
             std::thread::spawn(move || crate::engine::warm(&warming));
 
-            // Live preview reads the same audio the recording is capturing.
+            // Live preview reads the same audio the recording is capturing, and
+            // is off unless asked for — see `settings::Settings::live_preview`.
+            //
+            // When it is off the receiver is dropped rather than left sitting in
+            // the `Option`: the capture callback sends into that channel on
+            // every buffer, and with nobody draining it a long dictation would
+            // bank the entire recording a second time in memory. A closed
+            // channel makes the send a no-op, which is what the callback already
+            // expects.
             if let Some(c) = state.capture.lock().unwrap().as_ref() {
-                spawn_preview(app, c);
+                if crate::settings::live_preview(app) {
+                    spawn_preview(app, c);
+                } else {
+                    drop(c.audio.lock().unwrap().take());
+                }
             }
         }
         Err(e) => {

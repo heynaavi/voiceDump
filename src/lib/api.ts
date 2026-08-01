@@ -229,6 +229,36 @@ export async function writeTextFile(path: string, contents: string): Promise<voi
   return invoke("write_text_file", { path, contents });
 }
 
+/**
+ * Show a transcript's audio in Finder.
+ *
+ * The backend decides which of the two paths to open — the original if the user
+ * still has it, the library copy otherwise — because only it can check what is
+ * on disk. It rejects when neither exists, and that rejection is worth showing:
+ * this silently did nothing for a long time.
+ */
+export async function revealSource(
+  origin: string,
+  archived: string,
+): Promise<void> {
+  return invoke("reveal_source", { origin, archived });
+}
+
+// -- settings ---------------------------------------------------------------
+
+export type Settings = {
+  /** Draft transcript in the overlay while you speak. Off by default. */
+  live_preview: boolean;
+};
+
+export async function getSettings(): Promise<Settings> {
+  return invoke("get_settings");
+}
+
+export async function setLivePreview(enabled: boolean): Promise<Settings> {
+  return invoke("set_live_preview", { enabled });
+}
+
 // -- insights ---------------------------------------------------------------
 
 /** One row of a grouped breakdown (by app, by source, by language). */

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import gsap from "gsap";
 
 import type { IngestProgress, Origin, TranscriptMeta } from "../lib/api";
+import { getSettings, setLivePreview } from "../lib/api";
 import { dateGroup, formatDuration, formatRelativeDate } from "../lib/format";
 import { EASE, useGsap } from "../lib/motion";
 import { useTheme } from "../lib/theme";
@@ -60,6 +61,32 @@ export function Sidebar({
 }: Props) {
   const [tab, setTab] = useState<TabKey>("all");
   const { theme, toggle } = useTheme();
+
+  // Lives in the backend rather than localStorage: the globe key reads it from
+  // a thread that has no webview to ask. `null` until the first read lands, so
+  // the control doesn't flicker through a wrong state on launch.
+  const [livePreview, setLive] = useState<boolean | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    getSettings()
+      .then((s) => {
+        if (!cancelled) setLive(s.live_preview);
+      })
+      .catch(() => {
+        if (!cancelled) setLive(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const togglePreview = () => {
+    const next = !livePreview;
+    // Optimistic: the write is a small file, and snapping back on failure is
+    // clearer than a control that lags a click behind.
+    setLive(next);
+    setLivePreview(next).catch(() => setLive(!next));
+  };
 
   // Remember each row's last title so we can play the reveal only when a title
   // actually *changes* (an AI rename), not on first paint or when filtering.
@@ -307,6 +334,40 @@ export function Sidebar({
           ))
         )}
       </nav>
+
+      {/* Live preview: the draft transcript that appears in the overlay while
+          you are still speaking. Its own row rather than a chip in the strip
+          below, because unlike the theme it is not a readout of anything — it
+          changes what dictation does, and it needs room to say so. */}
+      <button
+        onClick={togglePreview}
+        aria-pressed={livePreview === true}
+        title={
+          livePreview
+            ? "The overlay drafts your words as you speak, using the fast model. It is a rough guess, and the final text is transcribed again from the whole recording."
+            : "Show a rough draft in the overlay while you speak. It uses the fast model, so it makes mistakes the pasted text will not."
+        }
+        className="group flex items-center justify-between gap-2 border-t border-hairline px-4 py-2 text-left transition-colors hover:bg-panel"
+      >
+        <span className="diagnostic transition-colors group-hover:text-ink">
+          LIVE PREVIEW
+        </span>
+        <span className="flex items-center gap-1.5">
+          {/* Filled when on, hollow when off — same swatch vocabulary as the
+              theme control directly beneath it. */}
+          <span
+            className={[
+              "h-[7px] w-[7px] border",
+              livePreview ? "border-ink bg-ink" : "border-hairline bg-transparent",
+            ].join(" ")}
+          />
+          <span
+            className={`diagnostic ${livePreview ? "text-ink" : "text-faint"}`}
+          >
+            {livePreview === null ? "—" : livePreview ? "ON" : "OFF"}
+          </span>
+        </span>
+      </button>
 
       {/* §5 Footer diagnostic strip. The theme sits here rather than behind a
           settings pane: it's a readout of the app's current state, which is

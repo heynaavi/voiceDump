@@ -469,6 +469,17 @@ pub fn to_engine_rate(input: &[f32], src_rate: u32) -> Vec<f32> {
 /// dependency: mp3, m4a/aac, wav, flac, ogg and mp4/mov audio tracks all decode
 /// in-process.
 fn decode_mono_16k(path: &Path) -> Result<Vec<f32>, String> {
+    let (samples, rate) = decode_mono(path)?;
+    Ok(resample_to_16k(&samples, rate))
+}
+
+/// Decode to mono f32 at whatever rate the file is in.
+///
+/// The transcription path immediately resamples this to 16 kHz, but the media
+/// library wants the audio at its own rate — that copy is for a human to listen
+/// to, and downsampling a 48 kHz recording to model rate would make every
+/// archived note sound like a phone call.
+pub fn decode_mono(path: &Path) -> Result<(Vec<f32>, u32), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("could not open the file: {e}"))?;
     let stream = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -546,7 +557,7 @@ fn decode_mono_16k(path: &Path) -> Result<Vec<f32>, String> {
         return Err("that file contains no audio".into());
     }
 
-    Ok(resample_to_16k(&mono, src_rate))
+    Ok((mono, src_rate))
 }
 
 /// Linear resample to 16 kHz.
