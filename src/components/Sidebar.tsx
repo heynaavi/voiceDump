@@ -6,6 +6,7 @@ import {
   appVersion,
   checkUpdate,
   getSettings,
+  getTranscript,
   openRelease,
   setLivePreview,
 } from "../lib/api";
@@ -129,6 +130,109 @@ function Version() {
       }`}
     >
       {label}
+    </button>
+  );
+}
+
+/** The sheet in front: a filled 3×3. */
+const SHEET = [true, true, true, true, true, true, true, true, true];
+/**
+ * The sheet behind: its top row and right column only — the rest sits under the
+ * front one. Drawing the whole square there instead gives a lumpy blob; this
+ * gives an edge, which is what actually says "there is another one of these".
+ */
+const SHEET_BEHIND = [true, true, true, false, false, true, false, false, true];
+
+/**
+ * Copy, in the app's own vocabulary: two square sheets, one behind the other.
+ *
+ * §4.4 replaces stroke icons with pixel clusters, so this is assembled out of
+ * two of them rather than borrowed from an icon set — the sidebar has no other
+ * drawn glyph in it and one copy icon is not worth becoming the exception.
+ */
+function CopyMark() {
+  return (
+    // `flex` on the two wrappers rather than the default inline flow: an inline
+    // child sits on a line box, and the strut under it would push the front
+    // sheet off its corner by a few pixels.
+    <span aria-hidden className="relative block h-[11px] w-[11px]">
+      <span className="absolute right-0 top-0 flex opacity-45">
+        <PixelCluster pattern={SHEET_BEHIND} size={2} gap={0.7} />
+      </span>
+      <span className="absolute bottom-0 left-0 flex">
+        <PixelCluster pattern={SHEET} size={2} gap={0.7} />
+      </span>
+    </span>
+  );
+}
+
+/**
+ * Copy a note's text without opening it, from the row it sits on.
+ *
+ * The reading view keeps its own COPY button — this is for the case that button
+ * is wrong for: you know which note you want, you only want what is in it, and
+ * opening it first is two clicks and a repaint you didn't need.
+ *
+ * The text is fetched on the click rather than carried by the row. The sidebar
+ * is given metadata only, and holding every transcript in memory to service a
+ * button most rows never show would be a poor trade for a library of hundreds.
+ */
+function QuickCopy({ id }: { id: string }) {
+  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+
+  // Back to COPY on its own. A tick that stays put stops being feedback about
+  // this click and starts looking like a property of the row.
+  useEffect(() => {
+    if (state === "idle") return;
+    const t = setTimeout(() => setState("idle"), 1600);
+    return () => clearTimeout(t);
+  }, [state]);
+
+  const copy = async (e: React.MouseEvent) => {
+    // Copying is not selecting: the row behind this is a button of its own.
+    e.stopPropagation();
+    try {
+      const { text } = await getTranscript(id);
+      await navigator.clipboard.writeText(text);
+      setState("copied");
+    } catch {
+      setState("failed");
+    }
+  };
+
+  const said =
+    state === "copied"
+      ? "Copied"
+      : state === "failed"
+        ? "Could not copy this transcript"
+        : "Copy this transcript";
+
+  return (
+    <button
+      onClick={copy}
+      aria-label={said}
+      title={said}
+      className={[
+        "absolute right-2 top-1/2 flex h-[22px] w-[22px] -translate-y-1/2",
+        "items-center justify-center border",
+        // Hidden until the row is under the cursor, but reachable by keyboard:
+        // an action that only exists on hover doesn't exist for half the people
+        // who might use it.
+        "opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100",
+        state === "copied"
+          ? "border-sage-dim bg-panel text-sage-dim"
+          : state === "failed"
+            ? "border-amber bg-panel text-amber"
+            : "border-hairline bg-panel text-grey hover:border-sage-dim hover:text-ink",
+      ].join(" ")}
+    >
+      {state === "copied" ? (
+        <PixelCluster pattern={CLUSTERS.done} size={2.5} gap={1} />
+      ) : state === "failed" ? (
+        <PixelCluster pattern={CLUSTERS.warn} size={2.5} gap={1} />
+      ) : (
+        <CopyMark />
+      )}
     </button>
   );
 }
@@ -358,7 +462,11 @@ export function Sidebar({
                   const prev = prevTitles.current.get(item.id);
                   const renamed = prev !== undefined && prev !== item.title;
                   return (
-                    <li key={item.id} data-row className="gsap-init">
+                    <li
+                      key={item.id}
+                      data-row
+                      className="group/row relative gsap-init"
+                    >
                       <button
                         onClick={() => onSelect(item.id)}
                         className={[
@@ -416,6 +524,7 @@ export function Sidebar({
                           </span>
                         )}
                       </button>
+                      <QuickCopy id={item.id} />
                     </li>
                   );
                 })}
