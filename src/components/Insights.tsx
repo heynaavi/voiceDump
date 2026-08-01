@@ -337,11 +337,16 @@ function FillerRate({ v }: { v: Data["vocabulary"] }) {
   );
 }
 
-/** The spans on offer, shortest first, with what each one costs in history. */
+/**
+ * The spans on offer, shortest first.
+ *
+ * `needs` names what a disabled tab is missing — always the *earlier* of its
+ * two windows, since that is the side a new history hasn't reached yet.
+ */
 const SPANS: { key: string; label: string; needs: string }[] = [
-  { key: "1", label: "1D", needs: "two days" },
-  { key: "7", label: "7D", needs: "two weeks" },
-  { key: "30", label: "30D", needs: "two months" },
+  { key: "1", label: "1D", needs: "the day before that" },
+  { key: "7", label: "7D", needs: "the week before that" },
+  { key: "30", label: "30D", needs: "the month before that" },
   { key: "all", label: "ALL", needs: "" },
 ];
 
@@ -415,7 +420,7 @@ function Trend({ windows }: { windows: Data["progress"] }) {
             type="button"
             disabled={!can}
             onClick={() => setPicked(s.key)}
-            title={can ? undefined : `Needs ${s.needs} of history`}
+            title={can ? undefined : `Nothing recorded in ${s.needs}`}
             className={`micro border px-1.5 py-[3px] transition-colors ${
               on
                 ? "border-ink bg-ink text-surface"

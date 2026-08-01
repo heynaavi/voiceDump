@@ -141,27 +141,24 @@ pub struct Summary {
 
 const DAY_MS: i64 = 86_400_000;
 
-/// How far back the history reaches, in days.
-fn span_days(rows: &[(i64, &str, f64, i64)], now: i64) -> i64 {
-    rows.first()
-        .map(|r| ((now - r.0) / DAY_MS).max(1))
-        .unwrap_or(0)
-}
-
 /// The spans the panel offers, shortest first.
 ///
-/// A span of N needs 2N days of history to exist at all — "the last week
-/// against the week before" is not a thing you can say in your first week — so
-/// each is marked available or not, and the unavailable ones are shown disabled
-/// rather than hidden. "All" is whatever there is, split down the middle, and
-/// so is always offered.
+/// A span is offered when its earlier window actually holds a note to compare
+/// against — asked of the history itself, not of the calendar. Measuring the
+/// span in whole days and requiring 2N of them was wrong in both directions: it
+/// refused a day-against-day comparison to someone two days in who plainly had
+/// both days, and it would have offered month-against-month to someone who
+/// recorded nothing at all in the earlier month.
+///
+/// Unavailable spans are still returned, so the tab can be shown disabled with
+/// a reason rather than vanishing. "All" is whatever there is, split down the
+/// middle, and so is always offered.
 fn progress_windows(rows: &[(i64, &str, f64, i64)], texts: &[String], now: i64) -> Vec<Progress> {
-    let span = span_days(rows, now);
-
     let mut out = Vec::new();
     for days in [1, 7, 30] {
         let cut = now - days * DAY_MS;
-        let available = span >= days * 2;
+        let floor = cut - days * DAY_MS;
+        let available = rows.iter().any(|r| r.0 >= floor && r.0 < cut);
         out.push(Progress {
             key: days.to_string(),
             available,
@@ -169,7 +166,7 @@ fn progress_windows(rows: &[(i64, &str, f64, i64)], texts: &[String], now: i64) 
                 rows,
                 texts,
                 Split {
-                    floor: cut - days * DAY_MS,
+                    floor,
                     cut,
                     end: now,
                     days,
@@ -816,7 +813,7 @@ mod tests {
         assert!(p.moves.is_empty());
     }
 
-    /// A span you haven't lived long enough to have is offered, but disabled.
+    /// A span with nothing on the earlier side is offered, but disabled.
     ///
     /// Hiding it instead would change the shape of the row as the history grows,
     /// and a control that appears one morning without explanation is worse than
@@ -824,21 +821,44 @@ mod tests {
     #[test]
     fn windows_are_offered_only_where_the_history_reaches() {
         const DAY: i64 = 86_400_000;
-        let now = 40 * DAY;
-        let rows = vec![(now - 16 * DAY, "hotkey", 30.0, 40), (now - DAY, "hotkey", 30.0, 40)];
-        let texts = vec!["a note".to_string(), "another note".to_string()];
+        let now = 90 * DAY;
+        let rows = vec![
+            (now - 10 * DAY, "hotkey", 30.0, 40),
+            (now - 2 * DAY, "hotkey", 30.0, 40),
+            (now - DAY / 2, "hotkey", 30.0, 40),
+        ];
+        let texts = vec!["a note".into(), "another".into(), "one more".into()];
         let windows = progress_windows(&rows, &texts, now);
 
         let by = |k: &str| windows.iter().find(|w| w.key == k).unwrap();
         assert_eq!(windows.len(), 4);
-        // Sixteen days of history. A week against the week before needs
-        // fourteen, and fits; a month against the month before needs sixty.
+        // Yesterday's window holds the note from two days ago; last week's
+        // holds the one from ten days back; the month before last holds nothing.
         assert!(by("1").available);
         assert!(by("7").available);
         assert!(!by("30").available);
         // Everything is always offered — it is whatever there is, halved.
         assert!(by("all").available);
-        assert_eq!(by("all").window_days, 8);
+        assert_eq!(by("all").window_days, 5);
+    }
+
+    /// Two days in, yesterday against the day before is a real question.
+    ///
+    /// This was refused: the span was measured as `(now - first) / DAY`, which
+    /// truncates 1.9 days to 1, and 1 is less than the two days the rule
+    /// demanded — so someone with speech on both days was told a day-against-day
+    /// comparison needed more history than they were looking at.
+    #[test]
+    fn a_day_against_a_day_is_offered_from_the_second_day() {
+        const DAY: i64 = 86_400_000;
+        let now = 10 * DAY;
+        let rows = vec![
+            (now - DAY - DAY / 2, "hotkey", 30.0, 40),
+            (now - DAY / 4, "hotkey", 30.0, 40),
+        ];
+        let texts = vec!["yesterday".into(), "today".into()];
+        let windows = progress_windows(&rows, &texts, now);
+        assert!(windows.iter().find(|w| w.key == "1").unwrap().available);
     }
 
     /// "All" means all of it, including the odd day at the far end.
