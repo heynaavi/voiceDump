@@ -544,6 +544,106 @@ fn decode_mono_16k(path: &Path) -> Result<Vec<f32>, String> {
     Ok(resample_to_16k(&samples, rate))
 }
 
+/// The same live preview, read again by the model that will actually be pasted.
+///
+/// [`Preview`] buys latency with `small`, which is roughly four times quicker
+/// and wrong more often. This reads the *same chunks* a second time on the
+/// already-resident `medium` and hands back a better answer for the ones it
+/// finishes, so the panel reads fast at the edge and accurate behind it.
+///
+/// It exists only where there is something to gain: `start` returns `None`
+/// unless the engine is already holding `medium`. On a machine small enough to
+/// be running `small` for real transcription, the preview is already using the
+/// best model there is and a second pass would buy nothing for a great deal of
+/// memory.
+///
+/// No model is loaded here — the resident one is borrowed. What this does cost
+/// is a second `WhisperState` on `medium`, which is the ~530 MB of KV caches
+/// and compute buffers described on [`Preview`], so it is dropped on key-up
+/// before the final pass allocates its own.
+pub struct Refine {
+    state: whisper_rs::WhisperState,
+}
+
+/// The answer to "can this dictation be refined?", which is not always known
+/// when it is first asked.
+///
+/// The distinction matters because the two negative answers want opposite
+/// handling. `Never` is a property of the machine — the engine is on `small`,
+/// there is nothing better to re-read with, and the caller should stop asking.
+/// `NotYet` is a moment in time: the model is still warming, or another thread
+/// is holding it. Treating that as `Never` is the bug this enum exists to
+/// prevent — the model is *usually* still loading when a dictation starts, so a
+/// single up-front ask fails on exactly the first dictation after launch and
+/// then silently never refines again.
+pub enum Refinable {
+    Ready(Refine),
+    NotYet,
+    Never,
+}
+
+impl Refine {
+    pub fn start(app: &tauri::AppHandle) -> Refinable {
+        use tauri::Manager;
+        let state = app.state::<EngineState>();
+        let Ok(guard) = state.inner.try_lock() else {
+            return Refinable::NotYet;
+        };
+        let Some(loaded) = guard.as_ref() else {
+            return Refinable::NotYet;
+        };
+        if loaded.size != ModelSize::Medium {
+            return Refinable::Never;
+        }
+        match loaded.ctx.create_state() {
+            Ok(state) => Refinable::Ready(Refine { state }),
+            // Out of memory for the KV caches, most likely. Worth another try
+            // on the next turn rather than giving up on the whole dictation.
+            Err(_) => Refinable::NotYet,
+        }
+    }
+
+    /// Re-read one chunk. Same contract as [`Preview::step`] — `None` for a
+    /// cancelled or failed pass, and the caller simply keeps what it had.
+    pub fn step(&mut self, samples: &[f32], cancel: Arc<AtomicBool>) -> Option<Vec<Heard>> {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_translate(false);
+        params.set_print_special(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_token_timestamps(false);
+        // Half the threads, floored at one. The fast pass is what the user is
+        // reading at the edge of their sentence; if this took every core, the
+        // words would arrive later in exchange for being righter sooner, which
+        // is the wrong way round for a preview.
+        params.set_n_threads(((num_threads() / 2).max(1)) as i32);
+
+        self.state.full(params, samples).ok()?;
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let n = self.state.full_n_segments();
+        let mut out: Vec<Heard> = Vec::new();
+        for i in 0..n {
+            let Some(seg) = self.state.get_segment(i) else {
+                continue;
+            };
+            let piece = seg.to_str_lossy().unwrap_or_default();
+            let piece = piece.trim();
+            if piece.is_empty() || is_non_speech(piece) {
+                continue;
+            }
+            words_with_confidence(&seg, &mut out);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+}
+
 /// Decode to mono f32 at whatever rate the file is in.
 ///
 /// The transcription path immediately resamples this to 16 kHz, but the media

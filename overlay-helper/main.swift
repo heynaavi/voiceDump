@@ -207,20 +207,51 @@ struct Heard {
     let word: String
     /// 0…1. The wire carries one digit per word, so this arrives in ninths.
     let confidence: CGFloat
+    /// Whether `medium` has been back over this word. The fast model is what
+    /// puts words on screen; this is what turns a guess into the sentence.
+    var refined: Bool = false
+
+    /// How broken up this word was just before it was corrected, and when the
+    /// correction landed.
+    ///
+    /// Carried on the word rather than tracked as a span of indices, because
+    /// `fit()` drops words off the front and splices an ellipsis in — any index
+    /// into `words` stops meaning anything by the time it reaches `draw`.
+    var wasDoubt: CGFloat = 0
+    var resolvedAt: CFAbsoluteTime? = nil
+
+    /// How much of this word to render as cells right now.
+    ///
+    /// Ordinarily that is just its doubt. In the moment after a correction it
+    /// is whatever it was before, easing down to what it is now — so a word
+    /// that `medium` has just vouched for is seen to resolve rather than being
+    /// swapped out between frames.
+    func drawnDoubt(_ now: CFAbsoluteTime, over duration: CFTimeInterval) -> CGFloat {
+        let settled = TranscriptView.doubt(confidence)
+        guard let at = resolvedAt, wasDoubt > settled else { return settled }
+        let p = min(1, max(0, (now - at) / duration))
+        let eased = 1 - pow(1 - p, 3)
+        return max(settled, wasDoubt * (1 - eased))
+    }
 }
 
 /// Decode a `text` payload.
 ///
 /// Words separated by spaces, each prefixed with a single digit for its
-/// confidence in ninths — see `overlay::words` on the Rust side. A field that
-/// is only a digit, or that starts with something else, is dropped rather than
-/// guessed at: a malformed line should cost one word, not the whole panel.
+/// confidence in ninths — see `overlay::words` on the Rust side. An optional
+/// `*` in front of the digit marks a word `medium` has already re-read. A field
+/// that is only a digit, or that starts with something else, is dropped rather
+/// than guessed at: a malformed line should cost one word, not the whole panel.
 func parseHeard(_ payload: String) -> [Heard] {
     payload.split(separator: " ").compactMap { field in
+        var field = field
+        let refined = field.first == "*"
+        if refined { field = field.dropFirst() }
         guard field.count > 1, let digit = field.first?.wholeNumberValue,
             (0...9).contains(digit)
         else { return nil }
-        return Heard(word: String(field.dropFirst()), confidence: CGFloat(digit) / 9.0)
+        return Heard(
+            word: String(field.dropFirst()), confidence: CGFloat(digit) / 9.0, refined: refined)
     }
 }
 
@@ -304,7 +335,13 @@ final class TranscriptView: NSView {
     static let maxWidth: CGFloat = 520
     /// Beyond this the panel would dominate the screen, so older lines scroll
     /// off the top instead.
-    static let maxLines = 4
+    ///
+    /// Six rather than four: at four, a sentence of any length was already
+    /// sliding off the top while it was still being said, and the panel spent
+    /// most of a dictation showing the end of a thought with no beginning. Six
+    /// is about as tall as this can get and still read as a HUD sitting over
+    /// your work rather than a window of its own.
+    static let maxLines = 6
     static let padX: CGFloat = 16
     static let padY: CGFloat = 11
     /// The dissolve needs vertical room to work in. At 13pt an x-height is
@@ -332,6 +369,14 @@ final class TranscriptView: NSView {
     /// hunting — and it is what makes this feel like speech being heard rather
     /// than a text field being rewritten.
     private let settleDuration: CFTimeInterval = 0.85
+    /// How long a corrected word takes to resolve.
+    ///
+    /// Slower than the reveal on purpose. An arrival should feel like a word
+    /// being caught; a correction should feel like one coming into focus, and
+    /// at 0.34s the cells snap off rather than dissolve. It is also the only
+    /// motion on screen that is not tied to the voice, so it should not compete
+    /// with the edge of the sentence for attention.
+    static let resolveDuration: CFTimeInterval = 0.55
 
     /// Text that has already been said and read: the duller green, and dimmer.
     ///
@@ -351,8 +396,15 @@ final class TranscriptView: NSView {
     /// in fully formed on a single frame, which reads as a glitch rather than
     /// as speech being heard.
     var isAnimating: Bool {
-        !words.isEmpty
-            && CFAbsoluteTimeGetCurrent() - arrivedAt < revealDuration + settleDuration
+        guard !words.isEmpty else { return false }
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - arrivedAt < revealDuration + settleDuration { return true }
+        // A correction can land while the panel is otherwise still, so its
+        // window keeps the frames coming on its own.
+        return words.contains {
+            guard let at = $0.resolvedAt else { return false }
+            return now - at < TranscriptView.resolveDuration
+        }
     }
 
     override var isFlipped: Bool { true }
@@ -526,20 +578,60 @@ final class TranscriptView: NSView {
     }
 
     func setWords(_ list: [Heard]) {
-        // The preview appends, so the previous words are normally a prefix of
-        // the new ones — anything beyond is the chunk that just landed. A
-        // wholesale change (a reset, or whisper revising itself) reveals the lot
-        // rather than pretending part of it was already on screen.
+        var list = list
+        let now = CFAbsoluteTimeGetCurrent()
+
+        // Two different events arrive down this one path, and they want
+        // opposite treatment. `small` appends a chunk to the end — that is new
+        // speech and should reveal. `medium` replaces a chunk in the middle
+        // with a better reading of the same speech — nothing new was said, so
+        // re-revealing the tail every time a correction landed would make the
+        // panel flash on words the user had already read.
         let appended =
             !words.isEmpty && list.count > words.count
             && zip(words, list).allSatisfy { $0.word == $1.word }
-        settled = appended ? words.count : 0
+
+        if !appended && !words.isEmpty && !list.isEmpty {
+            // The smallest span that actually changed: match forward from the
+            // start and backward from the end, and what is left in between is
+            // the correction.
+            var lo = 0
+            while lo < min(words.count, list.count), words[lo].word == list[lo].word,
+                words[lo].refined == list[lo].refined
+            {
+                lo += 1
+            }
+            var hi = 0
+            while hi < min(words.count, list.count) - lo,
+                words[words.count - 1 - hi].word == list[list.count - 1 - hi].word
+            {
+                hi += 1
+            }
+            // Each corrected word inherits how broken up the word standing in
+            // its place was, so it has something to resolve *from*.
+            for i in lo..<max(lo, list.count - hi) where list[i].refined {
+                let before = i < words.count ? TranscriptView.doubt(words[i].confidence) : 0
+                list[i].wasDoubt = before
+                list[i].resolvedAt = now
+            }
+        }
+
+        // Corrections carry their own animation, so nothing in them is treated
+        // as freshly spoken. An empty panel is the exception: the opening chunk
+        // of a dictation is all new, and has to reveal.
+        if appended {
+            settled = words.count
+        } else if words.isEmpty {
+            settled = 0
+        } else {
+            settled = list.count
+        }
         words = list
         shown = fit()
         // Rasterise the doubtful words now rather than during the first paint
         // that needs them. Words land every couple of seconds and the panel
         // repaints sixty times a second, so this is the moment there is time.
-        for h in shown where TranscriptView.doubt(h.confidence) > 0 {
+        for h in shown where h.drawnDoubt(now, over: TranscriptView.resolveDuration) > 0 {
             _ = TranscriptView.grid(for: h.word)
         }
         arrivedAt = CFAbsoluteTimeGetCurrent()
@@ -623,8 +715,9 @@ final class TranscriptView: NSView {
 
         // Which words are drawn as cells rather than glyphs.
         var pixelated: [(range: NSRange, grid: Grid, colour: NSColor, doubt: CGFloat)] = []
+        let now = CFAbsoluteTimeGetCurrent()
         for (i, h) in list.enumerated() {
-            let doubt = TranscriptView.doubt(h.confidence)
+            let doubt = h.drawnDoubt(now, over: TranscriptView.resolveDuration)
             guard doubt > 0 else { continue }
             let range = ranges[i]
             let glyphs = layout.manager.glyphRange(

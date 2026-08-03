@@ -114,14 +114,23 @@ mod overlay {
     /// confidence in ninths, `0` (a guess) to `9` (certain). Words were split on
     /// whitespace upstream and any that survives inside one is stripped here, so
     /// a space is still an unambiguous separator.
-    pub fn words(list: &[crate::engine::Heard]) {
+    ///
+    /// A word already re-read by `medium` is marked with a leading `*`, so the
+    /// panel can resolve it rather than swap it. Per word rather than a count of
+    /// how many are settled, because refinement is not a clean prefix: the
+    /// backlog drops chunks that have scrolled out of sight, so a re-read span
+    /// can sit between two that were never revisited.
+    pub fn words(list: &[(bool, &crate::engine::Heard)]) {
         let mut line = String::from("text");
-        for h in list {
+        for (refined, h) in list {
             let word: String = h.word.split_whitespace().collect();
             if word.is_empty() {
                 continue;
             }
             line.push(' ');
+            if *refined {
+                line.push('*');
+            }
             line.push(confidence_digit(h.confidence));
             line.push_str(&word);
         }
@@ -486,6 +495,35 @@ fn cues(app: &tauri::AppHandle) -> Option<crate::sound::Cues> {
     crate::sound::ensure(&dir).ok()
 }
 
+/// One chunk's worth of preview text, and which model last read it.
+struct Said {
+    words: Vec<crate::engine::Heard>,
+    /// Set once `medium` has been over this chunk and replaced what `small`
+    /// guessed. Carried to the overlay so a corrected word can resolve rather
+    /// than blink.
+    refined: bool,
+}
+
+/// One chunk of audio waiting to be re-read, keyed by which chunk it is.
+type Waiting = (usize, Vec<f32>);
+/// Chunks queued for `medium`, oldest first. Shared with the refine thread.
+type Backlog = Arc<Mutex<std::collections::VecDeque<Waiting>>>;
+
+/// Queue a chunk for re-reading, keeping only the most recent `cap`.
+///
+/// The oldest is dropped rather than the newest, which looks backwards until
+/// you remember what the panel shows: a tail of six lines. A chunk that has
+/// already scrolled out of sight cannot be corrected on screen, so spending a
+/// `medium` pass on it buys nothing — and if the machine cannot keep up, the
+/// backlog would otherwise grow for the whole dictation and every correction
+/// would land minutes after the words it fixes.
+fn enqueue(queue: &mut std::collections::VecDeque<Waiting>, item: Waiting, cap: usize) {
+    queue.push_back(item);
+    while queue.len() > cap {
+        queue.pop_front();
+    }
+}
+
 /// Stream the words out while the user is still speaking.
 ///
 /// The first version re-transcribed the whole recording every pass, which is
@@ -512,6 +550,9 @@ fn spawn_preview(app: &tauri::AppHandle, cap: &Capture) {
     const MIN_CHUNK_SECS: f32 = 2.5;
     /// And never bite off more than this, so a pass stays quick.
     const MAX_CHUNK_SECS: f32 = 8.0;
+    /// How many chunks may be waiting on `medium` before the oldest is given
+    /// up on. Two is roughly what stays on screen ahead of the reader.
+    const REFINE_BACKLOG: usize = 2;
 
     let Some(rx) = cap.audio.lock().unwrap().take() else {
         return;
@@ -529,7 +570,16 @@ fn spawn_preview(app: &tauri::AppHandle, cap: &Capture) {
         let mut session: Option<crate::engine::Preview> = None;
         let mut buf: Vec<f32> = Vec::new();
         let mut cursor = 0usize;
-        let mut heard: Vec<crate::engine::Heard> = Vec::new();
+        // Kept per chunk rather than as one flat list, because a re-read
+        // replaces a chunk's words wholesale — `medium` may hear a different
+        // number of them than `small` did.
+        let mut said: Vec<Said> = Vec::new();
+
+        // The second pass, on the model that will actually be pasted. `None`
+        // when there is nothing to gain: see `engine::Refine::start`.
+        let pending: Backlog = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, Vec<crate::engine::Heard>)>();
+        let refiner = spawn_refine(&app, pending.clone(), done_tx, stop.clone(), cancel.clone());
 
         while !stop.load(Ordering::SeqCst) && !cancel.load(Ordering::Relaxed) {
             // Drain whatever the microphone has produced. Blocking briefly here
@@ -546,6 +596,24 @@ fn spawn_preview(app: &tauri::AppHandle, cap: &Capture) {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
+
+            // Whatever the second pass finished while we were waiting on the
+            // microphone. Drained here, above the chunk-size guard, so a
+            // correction lands the moment it is ready rather than queueing
+            // behind another two and a half seconds of speech. Chunks are
+            // replaced in place, so it lands where its words were.
+            let mut changed = false;
+            while let Ok((i, words)) = done_rx.try_recv() {
+                if let Some(slot) = said.get_mut(i) {
+                    slot.words = words;
+                    slot.refined = true;
+                    changed = true;
+                }
+            }
+            if changed {
+                render(&app, &said);
+            }
+
             let src_rate = rate.load(Ordering::SeqCst);
             if src_rate == 0 {
                 continue;
@@ -571,26 +639,113 @@ fn spawn_preview(app: &tauri::AppHandle, cap: &Capture) {
             let audio = crate::engine::to_engine_rate(&buf[cursor..end], src_rate);
 
             let Some(s) = session.as_mut() else { continue };
+            let mut changed = false;
             if let Some(piece) = s.step(&audio, cancel.clone()) {
-                heard.extend(piece);
-                overlay::words(&heard);
-                // The window gets the plain sentence: confidence is a reading
-                // aid for the words floating over another app, and the app's own
-                // UI is not where you are looking while you dictate.
-                let words: Vec<&str> = heard.iter().map(|h| h.word.as_str()).collect();
-                let _ = app.emit("dictation-partial", words.join(" "));
+                said.push(Said { words: piece, refined: false });
+                // Hand the same audio to `medium`. The fast words are already
+                // on screen; this only decides what they turn into.
+                enqueue(&mut pending.lock().unwrap(), (said.len() - 1, audio), REFINE_BACKLOG);
+                changed = true;
+            }
+
+            // Whatever the second pass finished while we were busy. Chunks are
+            // replaced in place, so a correction lands where its words were
+            // rather than at the end of the sentence.
+            if changed {
+                render(&app, &said);
             }
             // Advance regardless: a chunk that transcribed to nothing was
             // silence, and re-reading it forever would stall the cursor.
             cursor = end;
         }
 
-        // Explicit, and before the final pass allocates its own: two live
-        // states plus the model is over 1.6 GB on `medium`, and there is no
-        // reason for them to overlap.
+        // Both states, and before the final pass allocates its own: two live
+        // ones plus the model is over 1.6 GB on `medium`, and there is no
+        // reason for them to overlap. Joining is what makes that true — the
+        // refine thread checks `cancel` before each pass, so the wait is one
+        // chunk at worst.
         drop(session);
+        let _ = refiner.join();
         overlay::clear();
     });
+}
+
+/// Flatten the chunks and show them.
+fn render(app: &tauri::AppHandle, said: &[Said]) {
+    let flat: Vec<(bool, &crate::engine::Heard)> = said
+        .iter()
+        .flat_map(|s| s.words.iter().map(move |w| (s.refined, w)))
+        .collect();
+    overlay::words(&flat);
+    // The window gets the plain sentence: confidence is a reading aid for the
+    // words floating over another app, and the app's own UI is not where you
+    // are looking while you dictate.
+    let words: Vec<&str> = flat.iter().map(|(_, h)| h.word.as_str()).collect();
+    let _ = app.emit("dictation-partial", words.join(" "));
+}
+
+/// The `medium` half of the preview.
+///
+/// Returns `None` on a machine whose engine is not holding `medium`, in which
+/// case the preview is simply what it was before — `small` alone, which is
+/// already the best model that machine has.
+fn spawn_refine(
+    app: &tauri::AppHandle,
+    pending: Backlog,
+    done: std::sync::mpsc::Sender<(usize, Vec<crate::engine::Heard>)>,
+    stop: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use crate::engine::Refinable;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // Asked on each turn until it answers, not once up front. The engine
+        // loads lazily, so at the instant a dictation starts the model is very
+        // often still warming — and an up-front ask would take that for "this
+        // machine cannot refine" and stay quiet for the whole dictation.
+        let mut refiner: Option<crate::engine::Refine> = None;
+
+        while !stop.load(Ordering::SeqCst) && !cancel.load(Ordering::Relaxed) {
+            if refiner.is_none() {
+                match crate::engine::Refine::start(&app) {
+                    Refinable::Ready(r) => {
+                        // Said out loud because it is otherwise invisible: the
+                        // only outward sign of refinement working is words
+                        // quietly changing, which is indistinguishable from it
+                        // never having started.
+                        eprintln!("[dictation] second pass live — medium is re-reading");
+                        refiner = Some(r);
+                    }
+                    // The engine is on `small`. It is already the best model
+                    // this machine has, so there is nothing to re-read with and
+                    // no reason for this thread to go on existing.
+                    Refinable::Never => {
+                        eprintln!("[dictation] engine is on small — no second pass to run");
+                        break;
+                    }
+                    Refinable::NotYet => {
+                        std::thread::sleep(Duration::from_millis(120));
+                        continue;
+                    }
+                }
+            }
+
+            let next = pending.lock().unwrap().pop_front();
+            let Some((i, audio)) = next else {
+                // Nothing waiting. The fast pass is the clock here too.
+                std::thread::sleep(Duration::from_millis(120));
+                continue;
+            };
+            let Some(r) = refiner.as_mut() else { continue };
+            if let Some(words) = r.step(&audio, cancel.clone()) {
+                // A closed channel means the preview is already shutting down.
+                if done.send((i, words)).is_err() {
+                    break;
+                }
+            }
+        }
+        drop(refiner);
+    })
 }
 
 /// Pick a chunk boundary that is unlikely to fall inside a word.
