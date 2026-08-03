@@ -104,17 +104,26 @@ export default function App() {
     }
   }, []);
 
+  /** Ask whether the engine can run, and say so either way.
+   *
+   * Assigning the answer rather than only assigning failures matters: on a
+   * first run this is asked before the models have been downloaded, so it
+   * correctly reports them missing, and if that verdict could never be
+   * withdrawn the banner would sit there for the rest of the session over a
+   * working app. It is re-asked the moment setup finishes. */
+  const checkEngine = useCallback(() => {
+    engineHealth()
+      .then(({ error }) => setEngineError(error))
+      .catch((e) => setEngineError(String(e)));
+  }, []);
+
   // -- boot ---------------------------------------------------------------
 
   useEffect(() => {
     // Just surface engine problems early. The model is deliberately NOT
     // preloaded — it costs ~0.4s to load on demand, which isn't worth holding
     // 1.6 GB for while the app sits open.
-    engineHealth()
-      .then(({ error }) => {
-        if (error) setEngineError(error);
-      })
-      .catch((e) => setEngineError(String(e)));
+    checkEngine();
 
     // The dictation key reads these from a thread with no webview to ask, so
     // the backend owns them and the window is only ever showing a copy.
@@ -133,7 +142,7 @@ export default function App() {
         console.error("could not check for the speech models", e);
         setModels({ ready: true, needed: [], bytes: 0 });
       });
-  }, []);
+  }, [checkEngine]);
 
   // Background ingest. The Rust side does the work and owns the
   // store, so the UI's job here is purely to reflect it.
@@ -362,7 +371,13 @@ export default function App() {
     return (
       <ModelSetup
         status={models}
-        onReady={() => setModels({ ready: true, needed: [], bytes: 0 })}
+        onReady={() => {
+          setModels({ ready: true, needed: [], bytes: 0 });
+          // The boot check ran before these existed and said so. Ask again
+          // now that they do, or the app opens behind a stale "model is
+          // missing" banner it can no longer take back.
+          checkEngine();
+        }}
       />
     );
   }
