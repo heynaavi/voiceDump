@@ -95,7 +95,7 @@ function Switch({
     >
       <span
         className={[
-          "h-[7px] w-[7px] border",
+          "h-[7px] w-[7px] border transition-colors duration-200",
           on ? "border-ink bg-ink" : "border-hairline bg-transparent",
         ].join(" ")}
       />
@@ -274,7 +274,7 @@ function Microphones({
             >
               <span
                 className={[
-                  "mt-[5px] h-[7px] w-[7px] shrink-0 border",
+                  "mt-[5px] h-[7px] w-[7px] shrink-0 border transition-colors duration-200",
                   absent
                     ? "border-amber bg-amber"
                     : active
@@ -312,11 +312,17 @@ export function Settings({
 }: Props) {
   const sheet = useRef<HTMLDivElement>(null);
 
-  // The groups arrive in reading order, matching Insights. Keyed on the
-  // settings landing rather than on mount, so the entrance doesn't play against
-  // an empty pane and finish before there is anything to see.
+  // The entrance belongs to opening the pane, not to using it.
+  //
+  // Keyed on whether the settings have *arrived*, not on what they say. Every
+  // write hands back a fresh object, so depending on `settings` itself replayed
+  // the whole sheet — stagger and all — each time a switch was flipped, which
+  // read as the pane restarting rather than as a setting changing. The controls
+  // do their own feedback in place; nothing else on screen changed, so nothing
+  // else should move.
+  const arrived = settings !== null;
   useEffect(() => {
-    if (!settings || !sheet.current) return;
+    if (!arrived || !sheet.current) return;
     if (prefersReducedMotion()) return;
     const rows = sheet.current.querySelectorAll("[data-row]");
     const tl = gsap.timeline();
@@ -329,7 +335,7 @@ export function Settings({
       tl.kill();
       gsap.set(rows, { clearProps: "opacity,transform" });
     };
-  }, [settings]);
+  }, [arrived]);
 
   if (!settings) {
     return (
