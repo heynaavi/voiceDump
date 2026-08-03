@@ -7,6 +7,7 @@ mod engine;
 mod export;
 mod media;
 mod microphone;
+mod models;
 mod settings;
 mod shortcut;
 #[cfg(target_os = "macos")]
@@ -519,6 +520,8 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         engine::transcribe_peaks,
         engine::engine_status,
         engine::engine_unload,
+        models::models_status,
+        models::models_fetch,
         rename_transcript,
         delete_transcript,
         write_text_file,

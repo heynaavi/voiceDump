@@ -102,8 +102,16 @@ pub fn auto_model() -> ModelSize {
     }
 }
 
-/// Locate a bundled model file.
-fn model_path(app: &tauri::AppHandle, size: ModelSize) -> Option<PathBuf> {
+/// Locate a model file.
+///
+/// Order is deliberate. The downloaded copy in the data directory comes first
+/// because it is the one that survives an upgrade — see [`crate::models`]. The
+/// resource directory stays as a candidate behind it so a bundle that *did*
+/// ship the weights keeps working: anyone still running 0.8.0 or earlier has
+/// them in there, and asking those users to re-download a file they already
+/// have would be a strange way to introduce a change that exists to save them
+/// a download.
+pub(crate) fn model_path(app: &tauri::AppHandle, size: ModelSize) -> Option<PathBuf> {
     use tauri::Manager;
 
     let name = size.file_name();
@@ -111,10 +119,21 @@ fn model_path(app: &tauri::AppHandle, size: ModelSize) -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("VOICEDUMPS_MODEL_DIR") {
         candidates.push(PathBuf::from(dir).join(name));
     }
+    if let Ok(data) = app.path().app_data_dir() {
+        candidates.push(data.join("models").join(name));
+    }
     if let Ok(res) = app.path().resource_dir() {
         candidates.push(res.join("models").join(name));
     }
-    // Dev: the repo's own model directory, which isn't committed.
+    // Dev only: the repo's own model directory, which isn't committed.
+    //
+    // Debug builds exclusively, because `CARGO_MANIFEST_DIR` is baked in at
+    // compile time. In a release binary it is an absolute path on whatever
+    // machine did the build — which is both a path leak into a public artifact
+    // and, on that machine, a copy of the models that silently satisfies the
+    // first-run check, so the one build you would test the setup screen with
+    // is the one build that never shows it.
+    #[cfg(debug_assertions)]
     candidates.push(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../models")
@@ -124,14 +143,19 @@ fn model_path(app: &tauri::AppHandle, size: ModelSize) -> Option<PathBuf> {
 }
 
 /// Why transcription can't run, or None if it can. Checked at startup so a
-/// broken build says so immediately rather than on the user's first recording.
+/// broken install says so immediately rather than on the user's first
+/// recording.
+///
+/// Reaching this now means something went wrong *after* first-run setup — the
+/// window will not let you past the download screen without the weights — so
+/// it points at the place they live rather than blaming the build.
 pub fn missing_model(app: &tauri::AppHandle) -> Option<String> {
     let want = auto_model();
     if model_path(app, want).is_some() {
         return None;
     }
     Some(format!(
-        "The {} speech model is missing from this build.",
+        "The {} speech model is missing. Quit and reopen the app to download it again.",
         want.label()
     ))
 }

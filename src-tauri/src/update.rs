@@ -1,11 +1,12 @@
 //! "Is there a newer version?" — asked only when the user asks it.
 //!
-//! This is the one place in the app that talks to the network, and it is worth
-//! being explicit about what that means. The request carries no identifier, no
-//! transcript, no telemetry: it is a plain GET for a public release listing,
-//! sent when someone clicks the version number and at no other time. There is
-//! no timer, no check on launch, and nothing to opt out of, because there is
-//! nothing running in the background to opt out of.
+//! One of only two places in the app that talk to the network — the other is
+//! [`crate::models`], which fetches the speech weights once on first run — and
+//! it is worth being explicit about what that means. The request carries no
+//! identifier, no transcript, no telemetry: it is a plain GET for a public
+//! release listing, sent when someone clicks the version number and at no
+//! other time. There is no timer, no check on launch, and nothing to opt out
+//! of, because there is nothing running in the background to opt out of.
 //!
 //! **Why curl.** macOS ships `/usr/bin/curl`, which brings the system trust
 //! store with it. Linking an HTTP client and a TLS stack into a local

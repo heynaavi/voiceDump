@@ -66,8 +66,6 @@
     ],
     "resources": {
       "../overlay-helper/voicedumps-overlay": "voicedumps-overlay",
-      "../models/ggml-small-q5_1.bin": "models/ggml-small-q5_1.bin",
-      "../models/ggml-medium-q5_0.bin": "models/ggml-medium-q5_0.bin",
       "../src/assets/fonts/SpaceGrotesk.ttf": "fonts/SpaceGrotesk.ttf",
       "../src/assets/fonts/JetBrainsMono.ttf": "fonts/JetBrainsMono.ttf"
     },

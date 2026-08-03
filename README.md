@@ -7,7 +7,7 @@
 **Hold the globe key. Talk. The words appear where your cursor already was.**
 
 Local speech-to-text for macOS. No account, no API key, nothing uploaded —
-the speech models live inside the app and run on your own Mac.
+the speech models are downloaded once and run on your own Mac.
 
 [![Latest release](https://img.shields.io/github/v/release/heynaavi/voiceDump?label=release&color=1e2618)](https://github.com/heynaavi/voiceDump/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/heynaavi/voiceDump/total?label=downloads&color=8fb07c)](https://github.com/heynaavi/voiceDump/releases)
@@ -184,9 +184,10 @@ timings survive, so playback follows along and editing keeps the sync.
 
 <img src="docs/media/privacy.png" width="100%" alt="No account, no API key, no upload" />
 
-The weights are bundled in the `.app`. Nothing is fetched at runtime, so a fresh
-install works offline on first launch, and there is no key to leak because there
-is no service to call.
+The app downloads its speech models once, on first run, and never fetches
+anything again — no account, no API key, and no service to call, so there is no
+key to leak. Your audio and your notes are never sent anywhere: transcription
+runs in-process on your own machine, before and after that one download.
 
 </td>
 <td width="50%">
@@ -209,8 +210,13 @@ product's own UI at 1080p rather than screenshotting it.</sub>
 ## Install
 
 Grab the DMG from [**Releases**](https://github.com/heynaavi/voiceDump/releases/latest)
-— Apple Silicon, macOS 11 or later, about 720 MB because the speech models are
-inside it.
+— Apple Silicon, macOS 11 or later, about 5 MB.
+
+On first launch it downloads the speech models it needs — 695 MB on a machine
+with 16 GB of memory or more, 190 MB below that, where the larger model would
+only swap. They are saved beside your notes rather than inside the app, so they
+survive every update and you are asked once. After that the app never fetches
+anything unless you click the version number to check for a release.
 
 Two permissions on first run, both unavoidable for what it does:
 
@@ -238,7 +244,9 @@ npm run tauri dev      # or: npm run build:lite  → .app + .dmg
 
 <br>
 
-Two quantised multilingual ggml models, both bundled:
+Two quantised multilingual ggml models, fetched on first run into
+`~/Library/Application Support/dev.heynaavi.voicedump/models` and kept there
+across updates:
 
 | | File | On disk | Resident |
 | --- | --- | --- | --- |
@@ -271,7 +279,8 @@ halving the download.
 Transcription used to run in a Python sidecar on MLX. That worked but could
 never ship: it needed a 1 GB virtualenv, the `mlx` stack, and `ffmpeg` on the
 user's `PATH`. "Download the app and run it" is not possible on those terms, so
-the engine moved in-process and the weights became a bundled resource.
+the engine moved in-process and the weights became a one-time download the app
+manages itself.
 
 **The model stays warm.** Loading costs real time, so one `WhisperContext` is
 held between jobs and back-to-back dictations pay nothing for it. Two callers
@@ -356,7 +365,7 @@ model on key *down* — the reload happens while you are still speaking. Set
 | Variable | Meaning |
 | --- | --- |
 | `VOICEDUMPS_MODEL_SIZE` | `small` or `medium`, overriding the memory-based choice |
-| `VOICEDUMPS_MODEL_DIR` | Where to find the weights, ahead of the bundled resources |
+| `VOICEDUMPS_MODEL_DIR` | Where to find the weights, ahead of the downloaded copy |
 | `VOICEDUMPS_IDLE_UNLOAD_SECS` | Seconds of disuse before the model is released. Default `300`; `0` keeps it loaded forever |
 | `TEST_AUDIO` | Audio file for the engine tests and `scripts/bench.sh` |
 

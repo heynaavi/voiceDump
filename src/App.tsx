@@ -8,6 +8,7 @@ import {
   getSettings,
   getTranscript,
   listTranscripts,
+  modelsStatus,
   renameTranscript,
   saveTranscript,
   setLivePreview,
@@ -19,6 +20,7 @@ import {
   watchJob,
   type IngestProgress,
   type JobState,
+  type ModelStatus,
   type Origin,
   type Paragraph,
   type Settings as Stored,
@@ -35,6 +37,7 @@ import { DictationPill } from "./components/DictationPill";
 import { Insights } from "./components/Insights";
 import { DropZone } from "./components/DropZone";
 import { JobProgress } from "./components/JobProgress";
+import { ModelSetup } from "./components/ModelSetup";
 import { Settings } from "./components/Settings";
 import { Sidebar } from "./components/Sidebar";
 import { TranscriptView } from "./components/TranscriptView";
@@ -60,6 +63,10 @@ export default function App() {
   /** The backend's copy, held here rather than in the pane so the sidebar's
    *  readout and the controls can never disagree. Null until the first read. */
   const [settings, setSettings] = useState<Stored | null>(null);
+  /** Whether the speech models are on disk. Null until asked; a `ready: false`
+   *  answer takes over the whole window, because there is no useful app
+   *  underneath it until the weights exist. */
+  const [models, setModels] = useState<ModelStatus | null>(null);
 
   // Each writer is optimistic — the store is a small JSON file, and snapping
   // back on failure reads better than a control that lags a click behind. The
@@ -114,6 +121,18 @@ export default function App() {
     getSettings()
       .then(setSettings)
       .catch((e) => console.error("could not read settings", e));
+
+    // Are the weights here? Almost always yes, and then this costs two `stat`
+    // calls. On a first run it is the difference between a setup screen and a
+    // dictation key that appears to do nothing. If the question itself fails,
+    // assume ready: a broken check must not lock a working install behind a
+    // download screen.
+    modelsStatus()
+      .then(setModels)
+      .catch((e) => {
+        console.error("could not check for the speech models", e);
+        setModels({ ready: true, needed: [], bytes: 0 });
+      });
   }, []);
 
   // Background ingest. The Rust side does the work and owns the
@@ -334,6 +353,19 @@ export default function App() {
   }, []);
 
   // -- render -------------------------------------------------------------
+
+  // First run, before anything else can be drawn. Deliberately after every
+  // hook above so the hook order is identical on both sides of the gate, and
+  // deliberately not while `models` is still null — flashing a download screen
+  // at someone who has the models would be worse than a beat of nothing.
+  if (models && !models.ready) {
+    return (
+      <ModelSetup
+        status={models}
+        onReady={() => setModels({ ready: true, needed: [], bytes: 0 })}
+      />
+    );
+  }
 
   return (
     <div className="flex h-full bg-surface">

@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Download the bundled speech models.
+# Download the speech models for development.
 #
-# These are the only large files the app ships, and they're the reason it works
-# offline: they go inside the .app, so a user who downloads the DMG never
-# fetches anything. Kept out of git (a 730 MB repo helps nobody) and fetched
-# here instead, checksummed so a truncated download can't silently ship.
+# Ships nothing. The app fetches these itself on first run and keeps them in
+# its data directory (see `src-tauri/src/models.rs`), which is why a release is
+# 4.6 MB rather than 720 MB. This script exists so a checkout can run `cargo
+# test` and `tauri dev` against local weights without going through the setup
+# screen every time — `engine::model_path` looks in `./models` last.
+#
+# Same files, same source as the app uses, so a dev machine and a user's
+# machine are running identical weights. Kept out of git: a 730 MB repo helps
+# nobody.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p models

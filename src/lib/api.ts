@@ -86,6 +86,39 @@ export async function engineHealth(): Promise<{ error: string | null }> {
   return invoke("engine_health");
 }
 
+// -- speech models ----------------------------------------------------------
+
+/** What still has to be fetched before the app can transcribe anything. */
+export type ModelStatus = {
+  /** Nothing to do — every model this machine needs is already on disk. */
+  ready: boolean;
+  /** Names of the missing models, e.g. ["medium", "small"]. */
+  needed: string[];
+  /** Bytes still to download, for the size shown on the button. */
+  bytes: number;
+};
+
+/** Emitted as `model-progress` while `modelsFetch` runs. */
+export type ModelProgress = {
+  label: string;
+  /** 1-based, so the header can read "1 of 2". */
+  index: number;
+  count: number;
+  received: number;
+  total: number;
+  /** All the bytes are here and the checksum is being computed. */
+  verifying: boolean;
+};
+
+export async function modelsStatus(): Promise<ModelStatus> {
+  return invoke("models_status");
+}
+
+/** Resolves only once everything has downloaded *and* verified. */
+export async function modelsFetch(): Promise<void> {
+  return invoke("models_fetch");
+}
+
 
 
 export async function startJob(path: string): Promise<JobState> {
