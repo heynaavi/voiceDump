@@ -1,7 +1,7 @@
 {
   "name": "voicedump",
   "private": true,
-  "version": "0.8.0",
+  "version": "0.9.0",
   "type": "module",
   "scripts": {
     "dev:vite": "node scripts/build-overlay.mjs && node scripts/free-port.mjs 1420 && vite",
