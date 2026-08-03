@@ -1,10 +1,10 @@
 //! Fetching the speech models on first run instead of shipping them.
 //!
-//! The two quantised whisper weights are 695 MB between them, and until now
+//! The two quantised whisper weights are 729 MB between them, and until now
 //! they lived inside the .app. That made the download honest — install it and
-//! it works on a plane — but it also meant every release was a 720 MB download
-//! of which 695 MB had not changed since the first build. Someone updating for
-//! a two-line fix re-downloaded the models to get it.
+//! it works on a plane — but it also meant every release was a 720 MB DMG that
+//! was almost entirely those two files, and they had not changed since the
+//! first build. Someone updating for a two-line fix downloaded them again.
 //!
 //! So they come down once, into the same directory as the database and the
 //! settings file, and stay there. An upgrade replaces the .app and finds the
@@ -128,7 +128,7 @@ pub struct Status {
     pub ready: bool,
     /// Human-readable names of what is missing, longest first.
     pub needed: Vec<String>,
-    /// Total bytes still to download, for "695 MB" in the copy.
+    /// Total bytes still to download, for "729 MB" in the copy.
     pub bytes: u64,
 }
 
@@ -389,7 +389,7 @@ mod tests {
         assert!(both.contains(&ModelSize::Small));
     }
 
-    /// The saving for smaller machines: 190 MB rather than 695 MB, because
+    /// The saving for smaller machines: 190 MB rather than 729 MB, because
     /// medium would only swap on a machine [`auto_model`] kept off it.
     #[test]
     fn small_machines_do_not_download_medium() {

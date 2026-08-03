@@ -212,7 +212,7 @@ product's own UI at 1080p rather than screenshotting it.</sub>
 Grab the DMG from [**Releases**](https://github.com/heynaavi/voiceDump/releases/latest)
 — Apple Silicon, macOS 11 or later, about 5 MB.
 
-On first launch it downloads the speech models it needs — 695 MB on a machine
+On first launch it downloads the speech models it needs — 729 MB on a machine
 with 16 GB of memory or more, 190 MB below that, where the larger model would
 only swap. They are saved beside your notes rather than inside the app, so they
 survive every update and you are asked once. After that the app never fetches
