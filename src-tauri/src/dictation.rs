@@ -1,12 +1,14 @@
-//! Push-to-talk dictation on the globe (fn) key.
+//! Push-to-talk dictation on a held chord of modifier keys.
 //!
-//! Tap the globe key to start recording, tap again to stop; the transcript is
-//! pasted wherever the cursor happens to be and also saved to history.
+//! Hold the chord to record, release to stop; the transcript is pasted wherever
+//! the cursor happens to be and also saved to history. Which keys make up the
+//! chord is a setting — the globe (fn) key by default. [`crate::shortcut`] owns
+//! the encoding and the matching.
 //!
-//! Why an event tap rather than a registered shortcut: the globe key is a
-//! *modifier*, not a keycode. It never produces a key-down event, only a
-//! `flagsChanged` with the secondary-fn mask set, so the usual global-shortcut
-//! APIs can't see it at all. The same tap is used to synthesise ⌘V.
+//! Why an event tap rather than a registered shortcut: the chord is made of
+//! *modifiers*, not keycodes. They never produce a key-down event, only a
+//! `flagsChanged` with the relevant mask set, so the usual global-shortcut APIs
+//! can't see them at all. The same tap is used to synthesise ⌘V.
 //!
 //! Requires Accessibility permission. macOS also needs
 //! System Settings → Keyboard → "Press 🌐 to:" set to "Do Nothing", or it will
@@ -22,8 +24,6 @@ use std::time::Duration;
 
 use tauri::{Emitter, Manager};
 
-/// `kCGEventFlagMaskSecondaryFn` — the globe/fn bit in a flagsChanged event.
-const FN_MASK: u64 = 0x0080_0000;
 
 #[derive(Default)]
 pub struct DictationState {
@@ -1030,7 +1030,7 @@ pub fn spawn(app: tauri::AppHandle) {
         // per binary path, so also log and surface it — in dev the binary path
         // changes on every rebuild, which quietly revokes the grant.
         if !has_accessibility(true) {
-            let msg = "Accessibility permission is required for the globe key. \
+            let msg = "Accessibility permission is required for the dictation key. \
                        Grant it in System Settings → Privacy & Security → Accessibility, \
                        then restart the app.";
             eprintln!("[dictation] {msg}");
@@ -1048,7 +1048,7 @@ pub fn spawn(app: tauri::AppHandle) {
             }
         }
 
-        eprintln!("[dictation] globe-key tap active");
+        eprintln!("[dictation] tap active");
 
         // Debounce: flagsChanged fires on both press and release of the globe
         // key, and we only want to act on one edge.
@@ -1058,12 +1058,12 @@ pub fn spawn(app: tauri::AppHandle) {
         let tap = CGEventTap::new(
             CGEventTapLocation::Session,
             CGEventTapPlacement::HeadInsertEventTap,
-            // Listen-only: we observe the globe key, we don't swallow it. If we
+            // Listen-only: we observe the chord, we don't swallow it. If we
             // consumed events the whole keyboard would route through us.
             CGEventTapOptions::ListenOnly,
             vec![CGEventType::FlagsChanged],
             move |_, _, event| {
-                let down = event.get_flags().bits() & FN_MASK != 0;
+                let down = crate::shortcut::is_held(event.get_flags().bits());
                 // Hold to talk: press starts, release stops. flagsChanged fires
                 // on both edges, so the previous state is tracked to avoid
                 // acting twice on key repeat.

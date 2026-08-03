@@ -93,32 +93,50 @@ function Bars({
   if (!rows.length) {
     return <p className="micro text-faint">NOTHING RECORDED YET</p>;
   }
+  // The figures used to share one fixed-width cell, which could only ever be
+  // wrong in one direction or the other: sized to fit "51 notes · 4.9kw" it
+  // left "1 note · 11w" swimming, and `whitespace-nowrap` only traded wrapping
+  // for overflowing the box. They are columns now, each sized by the grid to
+  // its own widest row — nothing wraps, nothing overflows, the count and the
+  // word total line up down the panel, and the bar takes what is left.
+  const counted = rows.some((r) => r.sub);
   return (
-    <ul className="space-y-1.5">
+    <ul
+      className={`grid items-center gap-x-3 gap-y-1.5 ${
+        counted
+          ? "grid-cols-[minmax(0,104px)_1fr_auto_auto]"
+          : "grid-cols-[minmax(0,104px)_1fr_auto]"
+      }`}
+    >
       {rows.map((r) => (
-        <li key={r.label} className="flex items-center gap-3">
-          <span className="w-[104px] shrink-0 truncate text-[12px] text-ink" title={r.label}>
+        // `contents` dissolves the row into the grid so every cell shares the
+        // parent's column tracks — the alignment is across rows, not within.
+        <li key={r.label} className="contents">
+          <span className="truncate text-[12px] text-ink" title={r.label}>
             {r.label}
           </span>
-          <span className="relative h-4 flex-1 bg-hairline-soft">
+          <span className="relative h-4 bg-hairline-soft">
             <span
               className="absolute inset-y-0 left-0 bg-sage-dim"
               style={{ width: `${(r.value / max) * 100}%` }}
             />
           </span>
-          {/* Fixed width keeps every bar ending on the same line, so this must
-              never wrap: a three-digit word count used to push "335w" onto a
-              second row and knock that one bar out of alignment with the rest.
-              `compact` bounds the string so a busy month can't do it again. */}
-          <span className="mono-data w-[104px] shrink-0 whitespace-nowrap text-right text-[11px] text-grey">
-            {r.value} {unit}
-            {r.sub ? ` · ${r.sub}` : ""}
+          <span className="mono-data whitespace-nowrap text-right text-[11px] text-grey">
+            {r.value} {r.value === 1 ? singular(unit) : unit}
           </span>
+          {counted && (
+            <span className="mono-data whitespace-nowrap text-right text-[11px] text-faint">
+              {r.sub}
+            </span>
+          )}
         </li>
       ))}
     </ul>
   );
 }
+
+/** "notes" → "note", "msgs" → "msg". Every unit here is a plain -s plural. */
+const singular = (unit: string) => unit.replace(/s$/, "");
 
 /**
  * Activity grid. Columns are weeks, rows are weekdays — the shape everyone

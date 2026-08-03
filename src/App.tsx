@@ -5,10 +5,14 @@ import { open } from "@tauri-apps/plugin-dialog";
 
 import {
   deleteTranscript,
+  getSettings,
   getTranscript,
   listTranscripts,
   renameTranscript,
   saveTranscript,
+  setLivePreview,
+  setMicrophone,
+  setShortcut,
   engineHealth,
   startJob,
   updateTranscript,
@@ -17,6 +21,7 @@ import {
   type JobState,
   type Origin,
   type Paragraph,
+  type Settings as Stored,
   type Transcript,
   type TranscriptMeta,
 } from "./lib/api";
@@ -30,6 +35,7 @@ import { DictationPill } from "./components/DictationPill";
 import { Insights } from "./components/Insights";
 import { DropZone } from "./components/DropZone";
 import { JobProgress } from "./components/JobProgress";
+import { Settings } from "./components/Settings";
 import { Sidebar } from "./components/Sidebar";
 import { TranscriptView } from "./components/TranscriptView";
 
@@ -48,6 +54,37 @@ export default function App() {
   /** Insights replaces the main pane rather than opening a window, so it can be
    *  read next to the list it describes and dismissed by picking any note. */
   const [insights, setInsights] = useState(false);
+  /** Settings does the same. Both are panes, not modals: nothing here is a
+   *  decision that has to be finished before the app can be used again. */
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  /** The backend's copy, held here rather than in the pane so the sidebar's
+   *  readout and the controls can never disagree. Null until the first read. */
+  const [settings, setSettings] = useState<Stored | null>(null);
+
+  // Each writer is optimistic — the store is a small JSON file, and snapping
+  // back on failure reads better than a control that lags a click behind. The
+  // backend answers with the whole settings object, so its reply is the truth.
+  const applyLivePreview = useCallback((enabled: boolean) => {
+    setSettings((s) => (s ? { ...s, live_preview: enabled } : s));
+    setLivePreview(enabled)
+      .then(setSettings)
+      .catch(() => {
+        setSettings((s) => (s ? { ...s, live_preview: !enabled } : s));
+      });
+  }, []);
+
+  const applyMicrophone = useCallback((name: string | null) => {
+    setSettings((s) => (s ? { ...s, microphone: name } : s));
+    setMicrophone(name)
+      .then(setSettings)
+      .catch(() => getSettings().then(setSettings).catch(() => {}));
+  }, []);
+
+  // Not optimistic, and it returns its promise: a refused chord has to surface
+  // as the recorder's own error rather than as a control that silently reverts.
+  const applyShortcut = useCallback(async (chord: string) => {
+    setSettings(await setShortcut(chord));
+  }, []);
 
   // Guards against a stale SSE stream writing over a newer job.
   const jobIdRef = useRef<string | null>(null);
@@ -71,6 +108,12 @@ export default function App() {
         if (error) setEngineError(error);
       })
       .catch((e) => setEngineError(String(e)));
+
+    // The dictation key reads these from a thread with no webview to ask, so
+    // the backend owns them and the window is only ever showing a copy.
+    getSettings()
+      .then(setSettings)
+      .catch((e) => console.error("could not read settings", e));
   }, []);
 
   // Background ingest. The Rust side does the work and owns the
@@ -233,6 +276,7 @@ export default function App() {
   const select = useCallback(async (id: string) => {
     setJob(null);
     setInsights(false);
+    setSettingsOpen(false);
     setActiveId(id);
     try {
       setActive(await getTranscript(id));
@@ -284,6 +328,7 @@ export default function App() {
   const newTranscription = useCallback(() => {
     setJob(null);
     setInsights(false);
+    setSettingsOpen(false);
     setActiveId(null);
     setActive(null);
   }, []);
@@ -302,11 +347,27 @@ export default function App() {
         ingest={ingest}
         namingIds={namingIds}
         insightsOpen={insights}
-        onInsights={() => setInsights((v) => !v)}
+        onInsights={() => {
+          setSettingsOpen(false);
+          setInsights((v) => !v);
+        }}
+        settings={settings}
+        settingsOpen={settingsOpen}
+        onSettings={() => {
+          setInsights(false);
+          setSettingsOpen((v) => !v);
+        }}
       />
 
       <main className="relative min-w-0 flex-1">
-        {insights ? (
+        {settingsOpen ? (
+          <Settings
+            settings={settings}
+            onLivePreview={applyLivePreview}
+            onMicrophone={applyMicrophone}
+            onShortcut={applyShortcut}
+          />
+        ) : insights ? (
           <Insights />
         ) : job ? (
           <JobProgress job={job} onDismiss={() => setJob(null)} />

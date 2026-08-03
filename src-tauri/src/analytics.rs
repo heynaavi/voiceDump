@@ -535,8 +535,18 @@ fn local_day(ms: i64) -> Option<NaiveDate> {
 
 // -- the command ------------------------------------------------------------
 
+/// `async` so the whole-history scan runs on the async runtime rather than on
+/// the thread that paints the window. Every figure here is recomputed on each
+/// open, so this grows with the history — and a main-thread command would mean
+/// the view cannot even repaint to say it is working until the scan finishes.
 #[tauri::command]
-pub fn analytics_summary(app: tauri::AppHandle) -> Result<Summary, String> {
+pub async fn analytics_summary(app: tauri::AppHandle) -> Result<Summary, String> {
+    tauri::async_runtime::spawn_blocking(move || summarise(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn summarise(app: &tauri::AppHandle) -> Result<Summary, String> {
     let store = app.state::<Store>();
     let conn = store.0.lock().map_err(|e| e.to_string())?;
 

@@ -35,6 +35,14 @@ pub struct Settings {
     /// first launch would quietly break that. See [`crate::microphone`] for why
     /// this is a name and not an identifier.
     pub microphone: Option<String>,
+
+    /// The keys held down to dictate, as `+`-joined modifier names.
+    ///
+    /// A string rather than a mask so the file stays legible, and so the one
+    /// place that understands the encoding is [`crate::shortcut`]. Validated on
+    /// the way in; anything unparseable that reaches here anyway is ignored at
+    /// arming time rather than disabling dictation.
+    pub shortcut: String,
 }
 
 impl Default for Settings {
@@ -42,6 +50,7 @@ impl Default for Settings {
         Self {
             live_preview: false,
             microphone: None,
+            shortcut: crate::shortcut::DEFAULT.to_string(),
         }
     }
 }
@@ -133,4 +142,50 @@ pub fn set_microphone(
     };
     persist(&app, &updated)?;
     Ok(updated)
+}
+
+/// Choose the keys that start a dictation.
+///
+/// Rejected rather than coerced if it isn't a chord we can watch for: the
+/// alternative is storing something the tap will silently ignore, leaving a
+/// picker that says one thing and a keyboard that does another. The tap is
+/// re-pointed before the write, so the new chord works on the next keypress
+/// whether or not the file lands.
+#[tauri::command]
+pub fn set_shortcut(
+    app: tauri::AppHandle,
+    state: tauri::State<SettingsState>,
+    chord: String,
+) -> Result<Settings, String> {
+    let chord = crate::shortcut::canonical(&chord)
+        .ok_or_else(|| format!("{chord:?} is not a chord this build can watch for"))?;
+    crate::shortcut::arm(&chord);
+    let updated = {
+        let mut guard = state.0.lock().unwrap();
+        guard.shortcut = chord;
+        guard.clone()
+    };
+    persist(&app, &updated)?;
+    Ok(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lite build ships the preview off: it runs on `small`, a model chosen
+    /// for latency and not accuracy, and its output is discarded the moment the
+    /// real pass lands. Handing that to someone unasked invites them to correct
+    /// a sentence that was never going to be pasted.
+    #[test]
+    fn the_preview_starts_off() {
+        assert!(!Settings::default().live_preview);
+    }
+
+    #[test]
+    fn dictation_starts_on_the_globe_key_and_the_system_input() {
+        let d = Settings::default();
+        assert_eq!(d.shortcut, crate::shortcut::DEFAULT);
+        assert_eq!(d.microphone, None);
+    }
 }

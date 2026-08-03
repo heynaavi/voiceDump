@@ -8,6 +8,7 @@ mod export;
 mod media;
 mod microphone;
 mod settings;
+mod shortcut;
 #[cfg(target_os = "macos")]
 mod sound;
 mod store;
@@ -415,9 +416,11 @@ pub fn run() {
 
             // Before dictation spawns: the key-down path reads this, and a
             // missing state would silently mean "default" on the first press.
-            app.manage(settings::SettingsState(Mutex::new(settings::load(
-                app.handle(),
-            ))));
+            let loaded = settings::load(app.handle());
+            // Point the tap at the stored chord before it is installed below,
+            // so the first keypress after launch already uses it.
+            shortcut::arm(&loaded.shortcut);
+            app.manage(settings::SettingsState(Mutex::new(loaded)));
 
             // Launch the native dictation-overlay helper. The pill is drawn by a
             // separate accessory process because a Tauri webview window cannot
@@ -510,6 +513,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         settings::get_settings,
         settings::set_live_preview,
         settings::set_microphone,
+        settings::set_shortcut,
         microphone::list_microphones,
         engine::start_transcription,
         engine::transcribe_peaks,

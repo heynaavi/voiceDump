@@ -1,18 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import gsap from "gsap";
 
-import type { IngestProgress, Mic, Origin, TranscriptMeta } from "../lib/api";
-import {
-  appVersion,
-  checkUpdate,
-  getSettings,
-  getTranscript,
-  listMicrophones,
-  openRelease,
-  setLivePreview,
-  setMicrophone,
+import type {
+  IngestProgress,
+  Origin,
+  Settings,
+  TranscriptMeta,
 } from "../lib/api";
+import { appVersion, checkUpdate, getTranscript, openRelease } from "../lib/api";
 import { dateGroup, formatDuration, formatRelativeDate } from "../lib/format";
+import { glyphs, words } from "../lib/shortcut";
 import { EASE, useGsap } from "../lib/motion";
 import { useTheme } from "../lib/theme";
 import { CLUSTERS, PixelCluster } from "./PixelCluster";
@@ -29,6 +26,10 @@ type Props = {
   namingIds: Set<string>;
   insightsOpen: boolean;
   onInsights: () => void;
+  /** Null until the backend's copy lands; the row reads "—" until then. */
+  settings: Settings | null;
+  settingsOpen: boolean;
+  onSettings: () => void;
 };
 
 /**
@@ -239,188 +240,6 @@ function QuickCopy({ id }: { id: string }) {
   );
 }
 
-/**
- * One line in the microphone list.
- *
- * The swatch is the same 7px square the theme and live-preview controls use —
- * filled means "this is the one" — so the list reads as part of the strip it
- * opens from rather than as a menu borrowed from somewhere else.
- */
-function Choice({
-  label,
-  hint,
-  active,
-  onClick,
-}: {
-  label: string;
-  hint?: string;
-  active: boolean;
-  onClick?: () => void;
-}) {
-  const body = (
-    <>
-      <span
-        className={[
-          "mt-[3px] h-[7px] w-[7px] shrink-0 border",
-          active ? "border-ink bg-ink" : "border-hairline bg-transparent",
-        ].join(" ")}
-      />
-      <span className="min-w-0">
-        {/* `text-ink!`, not `text-ink`: .diagnostic sets its own colour and is
-            declared after Tailwind's utilities in the same layer, so a plain
-            colour class on it never lands. */}
-        <span className={`diagnostic block truncate ${active ? "text-ink!" : ""}`}>
-          {label}
-        </span>
-        {hint && (
-          <span className="micro mt-0.5 block truncate text-faint">{hint}</span>
-        )}
-      </span>
-    </>
-  );
-
-  // The unavailable entry is shown, not offered: picking it again would change
-  // nothing, and a dead button that responds to hover invites the click anyway.
-  if (!onClick) {
-    return <span className="flex items-start gap-2 px-4 py-1.5">{body}</span>;
-  }
-  return (
-    <button
-      onClick={onClick}
-      className="flex w-full items-start gap-2 px-4 py-1.5 text-left transition-colors hover:bg-rail"
-    >
-      {body}
-    </button>
-  );
-}
-
-/**
- * Which microphone gets recorded.
- *
- * A row in the settings stack, not a pane of its own: it is one choice, made
- * rarely. The list opens *over* the notes instead of pushing them, so the
- * sidebar stays exactly as tall as it was and the strip gains one line.
- */
-function MicPicker({
-  chosen,
-  onChoose,
-}: {
-  chosen: string | null;
-  onChoose: (name: string | null) => void;
-}) {
-  const [mics, setMics] = useState<Mic[]>([]);
-  const [open, setOpen] = useState(false);
-  const box = useRef<HTMLDivElement>(null);
-
-  // Enumerated on demand, and again every time the list opens: someone opening
-  // it has usually just plugged something in.
-  const refresh = () => {
-    listMicrophones()
-      .then(setMics)
-      .catch(() => setMics([]));
-  };
-  useEffect(refresh, []);
-
-  useEffect(() => {
-    if (!open) return;
-    const away = (e: MouseEvent) => {
-      if (!box.current?.contains(e.target as Node)) setOpen(false);
-    };
-    const key = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", away);
-    document.addEventListener("keydown", key);
-    return () => {
-      document.removeEventListener("mousedown", away);
-      document.removeEventListener("keydown", key);
-    };
-  }, [open]);
-
-  const systemName = mics.find((m) => m.is_default)?.name ?? null;
-  // A remembered device that isn't attached. The length check covers the moment
-  // before the first list lands, when everything would look missing.
-  const missing =
-    chosen !== null && mics.length > 0 && !mics.some((m) => m.name === chosen);
-  // What will actually be recorded from, which is the useful readout — the
-  // swatch is what says whether it was pinned or inherited.
-  const live = chosen ?? systemName;
-
-  const pick = (name: string | null) => {
-    onChoose(name);
-    setOpen(false);
-  };
-
-  return (
-    <div ref={box} className="relative border-t border-hairline">
-      {open && (
-        <div className="absolute bottom-full left-0 right-0 z-20 max-h-[260px] overflow-y-auto border-t border-hairline bg-panel pb-1.5 shadow-[0_-8px_24px_rgba(0,0,0,0.2)]">
-          <p className="eyebrow px-4 pb-1.5 pt-2.5 text-faint">RECORD FROM</p>
-          <Choice
-            label="System default"
-            hint={systemName ?? undefined}
-            active={chosen === null}
-            onClick={() => pick(null)}
-          />
-          {mics.map((m) => (
-            <Choice
-              key={m.name}
-              label={m.name}
-              active={chosen === m.name}
-              onClick={() => pick(m.name)}
-            />
-          ))}
-          {missing && (
-            <Choice label={chosen!} hint="Not connected" active />
-          )}
-          {mics.length === 0 && (
-            <p className="micro px-4 py-1.5 text-faint">NO MICROPHONE FOUND</p>
-          )}
-        </div>
-      )}
-
-      <button
-        onClick={() => {
-          if (!open) refresh();
-          setOpen(!open);
-        }}
-        aria-expanded={open}
-        title={
-          chosen === null
-            ? "Recording from whatever macOS is set to. Click to pick a specific microphone."
-            : missing
-              ? `${chosen} is not connected — the system default is used until it is back.`
-              : `Recording from ${chosen}, whatever macOS is set to.`
-        }
-        className="group flex w-full items-center justify-between gap-2 px-4 py-2 text-left transition-colors hover:bg-panel"
-      >
-        <span className="diagnostic shrink-0 transition-colors group-hover:text-ink">
-          INPUT
-        </span>
-        <span className="flex min-w-0 items-center gap-1.5">
-          <span
-            className={[
-              "h-[7px] w-[7px] shrink-0 border",
-              missing
-                ? "border-amber bg-amber"
-                : chosen
-                  ? "border-ink bg-ink"
-                  : "border-hairline bg-transparent",
-            ].join(" ")}
-          />
-          <span
-            className={`diagnostic truncate ${
-              missing ? "text-amber!" : chosen ? "text-ink!" : ""
-            }`}
-          >
-            {live ?? "SYSTEM"}
-          </span>
-        </span>
-      </button>
-    </div>
-  );
-}
-
 export function Sidebar({
   items,
   activeId,
@@ -432,51 +251,12 @@ export function Sidebar({
   namingIds,
   insightsOpen,
   onInsights,
+  settings,
+  settingsOpen,
+  onSettings,
 }: Props) {
   const [tab, setTab] = useState<TabKey>("all");
   const { theme, toggle } = useTheme();
-
-  // Lives in the backend rather than localStorage: the globe key reads it from
-  // a thread that has no webview to ask. `null` until the first read lands, so
-  // the control doesn't flicker through a wrong state on launch.
-  const [livePreview, setLive] = useState<boolean | null>(null);
-  // No loading state for this one: `null` is a real answer — it means "follow
-  // the system input" — and it is also the default, so the row is right from
-  // the first paint for everyone who has never changed it.
-  const [mic, setMic] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    getSettings()
-      .then((s) => {
-        if (cancelled) return;
-        setLive(s.live_preview);
-        setMic(s.microphone);
-      })
-      .catch(() => {
-        if (!cancelled) setLive(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const chooseMic = (name: string | null) => {
-    const previous = mic;
-    setMic(name);
-    setMicrophone(name).catch(() => setMic(previous));
-  };
-
-  const togglePreview = () => {
-    // Until the stored value has landed, `livePreview` is null — and `!null` is
-    // true, so a click in that window turned the preview *on* no matter what
-    // was on disk, and persisted it. The control is disabled until we know.
-    if (livePreview === null) return;
-    const next = !livePreview;
-    // Optimistic: the write is a small file, and snapping back on failure is
-    // clearer than a control that lags a click behind.
-    setLive(next);
-    setLivePreview(next).catch(() => setLive(!next));
-  };
 
   // Remember each row's last title so we can play the reveal only when a title
   // actually *changes* (an AI rename), not on first paint or when filtering.
@@ -730,40 +510,33 @@ export function Sidebar({
         )}
       </nav>
 
-      <MicPicker chosen={mic} onChoose={chooseMic} />
-
-      {/* Live preview: the draft transcript that appears in the overlay while
-          you are still speaking. Its own row rather than a chip in the strip
-          below, because unlike the theme it is not a readout of anything — it
-          changes what dictation does, and it needs room to say so. */}
+      {/* One row, however many settings there turn out to be.
+          Microphone and live preview each used to own a row here, and every
+          new option would have cost another — so they moved into a pane and
+          this is the way in. The readout is the dictation chord, because that
+          is the one setting worth seeing without opening anything. */}
       <button
-        onClick={togglePreview}
-        disabled={livePreview === null}
-        aria-pressed={livePreview === true}
+        onClick={onSettings}
+        aria-pressed={settingsOpen}
         title={
-          livePreview
-            ? "The overlay drafts your words as you speak, using the fast model. It is a rough guess, and the final text is transcribed again from the whole recording."
-            : "Show a rough draft in the overlay while you speak. It uses the fast model, so it makes mistakes the pasted text will not."
+          settings
+            ? `Hold ${words(settings.shortcut)} to dictate. Click to change this and more.`
+            : "Microphone, live preview and the dictation shortcut"
         }
-        className="group flex items-center justify-between gap-2 border-t border-hairline px-4 py-2 text-left transition-colors hover:bg-panel"
+        className={`group flex items-center justify-between gap-2 border-t border-hairline px-4 py-2 text-left transition-colors ${
+          settingsOpen ? "bg-panel" : "hover:bg-panel"
+        }`}
       >
-        <span className="diagnostic transition-colors group-hover:text-ink">
-          LIVE PREVIEW
+        <span
+          className={`diagnostic transition-colors group-hover:text-ink ${
+            settingsOpen ? "text-ink" : ""
+          }`}
+        >
+          SETTINGS
         </span>
-        <span className="flex items-center gap-1.5">
-          {/* Filled when on, hollow when off — same swatch vocabulary as the
-              theme control directly beneath it. */}
-          <span
-            className={[
-              "h-[7px] w-[7px] border",
-              livePreview ? "border-ink bg-ink" : "border-hairline bg-transparent",
-            ].join(" ")}
-          />
-          <span
-            className={`diagnostic ${livePreview ? "text-ink" : "text-faint"}`}
-          >
-            {livePreview === null ? "—" : livePreview ? "ON" : "OFF"}
-          </span>
+        {/* The keys as they are printed on the keyboard — fn, or ⌃⌥. */}
+        <span className="text-[11px] leading-none text-grey">
+          {settings ? glyphs(settings.shortcut) : "—"}
         </span>
       </button>
 

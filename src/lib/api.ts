@@ -259,6 +259,8 @@ export type Settings = {
   live_preview: boolean;
   /** Microphone to record from, by name. `null` follows the system input. */
   microphone: string | null;
+  /** Modifier names joined with `+` — the keys held to dictate. See lib/shortcut. */
+  shortcut: string;
 };
 
 export async function getSettings(): Promise<Settings> {
@@ -284,6 +286,16 @@ export async function listMicrophones(): Promise<Mic[]> {
 /** Pass `null` to follow whatever macOS is set to. */
 export async function setMicrophone(name: string | null): Promise<Settings> {
   return invoke("set_microphone", { name });
+}
+
+/**
+ * Choose the keys held to dictate.
+ *
+ * Rejects with a readable sentence if the chord isn't one the keyboard tap can
+ * watch for — a lone modifier, or anything containing a non-modifier key.
+ */
+export async function setShortcut(chord: string): Promise<Settings> {
+  return invoke("set_shortcut", { chord });
 }
 
 // -- version ----------------------------------------------------------------

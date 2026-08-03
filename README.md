@@ -29,6 +29,13 @@ You are already typing somewhere — Slack, Mail, a terminal, a code comment. Ho
 the globe key, say the sentence, let go. The text lands at the cursor in the app
 you were already in. Nothing switches, nothing is pasted by hand.
 
+Not everyone has a globe key free, so it is only the default: SETTINGS will
+record whatever chord you would rather hold — ⌃⌥, ⇧⌘, whatever your hands
+already know. Modifiers only, and for a reason worth stating plainly — the
+keyboard is *watched*, never taken over, so anything in the chord also reaches
+the app underneath. ⌃⌥ types nothing anywhere; ⌃⌥D would arrive in your editor
+mid-sentence.
+
 Then there is the other half: drop in audio or video and get a readable
 transcript with real timestamps, word-level follow-along during playback, inline
 editing that keeps the timings, full-text search across everything you have ever
@@ -278,8 +285,8 @@ asserted they were all released — `abort()`, and macOS reporting a crash on an
 ordinary quit. There is a regression test that runs the exit in a child process,
 because the behaviour under test is what happens *during* exit.
 
-**The live preview is off by default** (LIVE PREVIEW, at the foot of the
-sidebar). Turned on, the overlay drafts your words while you are still speaking.
+**The live preview is off by default** (SETTINGS, at the foot of the sidebar,
+under DICTATION). Turned on, the overlay drafts your words while you are still speaking.
 Whisper has no incremental decode, so it transcribes *forward* — a cursor marks
 what has been read, each pass takes only what is new, and chunks are cut at the
 quietest moment in their tail so boundaries land between words rather than inside
