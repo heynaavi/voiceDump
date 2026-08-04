@@ -218,6 +218,33 @@ only swap. They are saved beside your notes rather than inside the app, so they
 survive every update and you are asked once. After that the app never fetches
 anything unless you click the version number to check for a release.
 
+### macOS will say it cannot verify the app
+
+It will, and there is no way around it that does not cost $99 a year.
+
+> **"VoiceDumps" Not Opened** — Apple could not verify "VoiceDumps" is free of
+> malware that may harm your Mac or compromise your privacy.
+
+That dialog does not mean anything was found. It means the app is not
+*notarized*: not sent to Apple for scanning and signed with a paid Developer ID
+certificate. This is a one-person open-source project, so it is signed with an
+ad-hoc signature instead, and macOS flags anything downloaded from a browser
+that it cannot trace to a paid account. Every unsigned Mac app you have ever
+installed showed you this.
+
+The build is reproducible — clone the repo, run `npm run build:lite`, and
+compare. Do not take the dialog's advice and click **Move to Bin**; either:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/VoiceDumps.app
+```
+
+or open it once through **System Settings → Privacy & Security**, scroll to the
+message about VoiceDumps being blocked, and click **Open Anyway**. Either way it
+is asked once, not every launch. Recent macOS versions have narrowed the old
+Control-click → Open shortcut, so if that does not offer you an Open button, use
+one of the two above.
+
 Two permissions on first run, both unavoidable for what it does:
 
 | Permission | Why |
