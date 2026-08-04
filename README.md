@@ -209,8 +209,23 @@ product's own UI at 1080p rather than screenshotting it.</sub>
 
 ## Install
 
-Grab the DMG from [**Releases**](https://github.com/heynaavi/voiceDump/releases/latest)
-— Apple Silicon, macOS 11 or later, about 5 MB.
+Apple Silicon, macOS 11 or later, about 5 MB.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/heynaavi/voiceDump/main/scripts/install.sh | bash
+```
+
+That fetches the latest DMG, checks its signature, copies the app to
+`/Applications`, and clears the download quarantine flag so macOS does not
+refuse to open it — see below for why that flag is the problem. No `sudo`,
+nothing written outside `/Applications`, and
+[the script](scripts/install.sh) is forty lines you can read first, which you
+should: piping anything into `bash` deserves that much.
+
+Or grab the DMG from
+[**Releases**](https://github.com/heynaavi/voiceDump/releases/latest) and drag
+it to Applications the usual way — then read the next section, because macOS
+will stop you.
 
 On first launch it downloads the speech models it needs — 729 MB on a machine
 with 16 GB of memory or more, 190 MB below that, where the larger model would
@@ -220,7 +235,9 @@ anything unless you click the version number to check for a release.
 
 ### macOS will say it cannot verify the app
 
-It will, and there is no way around it that does not cost $99 a year.
+If you installed with the command above, it will not — that is the whole reason
+the command exists. If you dragged the DMG across yourself, it will, and there
+is no way around it that does not cost $99 a year.
 
 > **"VoiceDumps" Not Opened** — Apple could not verify "VoiceDumps" is free of
 > malware that may harm your Mac or compromise your privacy.
