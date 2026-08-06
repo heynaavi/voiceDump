@@ -1,6 +1,7 @@
 import { useMemo, useRef } from "react";
 import gsap from "gsap";
 
+import type { MeetingCapability } from "../lib/api";
 import { EASE, useGsap } from "../lib/motion";
 import { CLUSTERS, PixelCluster } from "./PixelCluster";
 import { Recorder } from "./Recorder";
@@ -10,14 +11,22 @@ type Props = {
   dragging: boolean;
   onBrowse: () => void;
   onRecorded: (path: string) => void;
-  engineError: string | null;
+  assistantError: string | null;
+  /** Null until the backend has been asked whether this Mac can capture a call. */
+  meeting: MeetingCapability | null;
+  onStartMeeting: () => void;
+  /** Set when the last attempt to start a meeting was refused. */
+  meetingError: string | null;
 };
 
 export function DropZone({
   dragging,
   onBrowse,
   onRecorded,
-  engineError,
+  assistantError,
+  meeting,
+  onStartMeeting,
+  meetingError,
 }: Props) {
   const titleRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -114,15 +123,42 @@ export function DropZone({
             <span className="h-px flex-1 bg-hairline" />
           </div>
           <Recorder onCaptured={onRecorded} />
+
+          {/* The third way in, and the only one that hears someone else. Kept
+              on the same rung as the microphone button: both are "start
+              talking", and the difference is who else is in the room. */}
+          {meeting?.available && (
+            <button
+              onClick={onStartMeeting}
+              className="micro mt-2.5 flex items-center gap-2.5 border border-hairline px-4 py-2.5 text-grey transition-colors hover:border-ink hover:bg-ink hover:text-surface"
+            >
+              <span className="block h-2.5 w-2.5 bg-sage-dim" />
+              RECORD A MEETING
+            </button>
+          )}
+
+          {/* An unavailable feature explains itself once, quietly, rather than
+              showing a button that will only ever fail. */}
+          {meeting && !meeting.available && (
+            <p className="micro mt-2.5 max-w-[320px] text-center leading-relaxed text-faint">
+              {meeting.reason}
+            </p>
+          )}
+
+          {meetingError && (
+            <p className="micro mt-2.5 max-w-[360px] text-center leading-relaxed text-amber">
+              {meetingError}
+            </p>
+          )}
         </div>
 
-        {engineError && (
+        {assistantError && (
           <div className="no-drag mt-5 w-full max-w-[440px] border border-amber bg-panel">
             <p className="micro border-b border-hairline-soft bg-amber px-3 py-1.5 text-surface">
-              ENGINE UNAVAILABLE
+              AI LAYER OFFLINE
             </p>
             <p className="selectable whitespace-pre-wrap px-3 py-2.5 font-mono text-[10px] leading-relaxed text-grey">
-              {engineError}
+              {assistantError}
             </p>
           </div>
         )}

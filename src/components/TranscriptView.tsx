@@ -8,19 +8,31 @@ import {
   useState,
 } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import gsap from "gsap";
 
-import type { Paragraph, Transcript } from "../lib/api";
+import type {
+  Brief,
+  BriefCapability,
+  BriefProgress,
+  Paragraph,
+  Transcript,
+} from "../lib/api";
 import {
   archiveTranscriptMedia,
+  briefCapability,
   exportPdf,
   fetchPeaks,
-  revealSource,
+  generateBrief,
+  namesInMeeting,
   setTranscriptPeaks,
+  watchBriefFailed,
+  watchBriefProgress,
+  watchBriefSaved,
   writeTextFile,
 } from "../lib/api";
 import { reconcileWords } from "../lib/diff";
-import { fileName, formatDuration } from "../lib/format";
+import { fileName, formatDuration, formatWhen } from "../lib/format";
 import { EASE, prefersReducedMotion } from "../lib/motion";
 import { AudioPlayer, type PlayerHandle } from "./AudioPlayer";
 import { CLUSTERS, PixelCluster } from "./PixelCluster";
@@ -30,6 +42,8 @@ type Props = {
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
   onEdit: (id: string, paragraphs: Paragraph[]) => void;
+  /** Name one side of a meeting. Rejects with a sentence worth showing. */
+  onRenameSpeaker: (id: string, from: string, to: string) => Promise<void>;
   /** The AI is currently generating this note's title. */
   naming?: boolean;
 };
@@ -44,7 +58,6 @@ const FLASH_MS = 420;
 const PLAYABLE = /\.(m4a|mp4|mp3|wav|aac|aiff|aif|caf|flac)$/i;
 const playableAudio = (path: string) => PLAYABLE.test(path);
 
-/** One clickable word, and the exact characters that precede it. */
 type Placed = { prefix: string; text: string; from: number; to: number };
 
 /**
@@ -131,15 +144,33 @@ const PLAYER_SAFE_PX = 96;
 /** Where a paragraph's top lands when it has to be scrolled into view. */
 const READING_LINE = 0.2;
 
-export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming = false }: Props) {
+export function TranscriptView({
+  transcript,
+  onRename,
+  onDelete,
+  onEdit,
+  onRenameSpeaker,
+  naming = false,
+}: Props) {
   const [copied, setCopied] = useState(false);
   const [exporting, setExporting] = useState(false);
-  /** Shared by every rail action — one place a failure can surface. */
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
   const [title, setTitle] = useState(transcript.title);
   const [time, setTime] = useState(0);
   const [paragraphs, setParagraphs] = useState<Paragraph[]>([]);
   const [editing, setEditing] = useState<number | null>(null);
+  /** Which turn's speaker label is open for editing, and what has been typed
+   *  into it. Keyed on the paragraph rather than the name so only the label you
+   *  clicked turns into a field — the rename still lands on every turn by that
+   *  speaker, but a meeting where six labels became inputs at once would look
+   *  like six separate edits. */
+  const [namingSpeakerAt, setNamingSpeakerAt] = useState<number | null>(null);
+  const [speakerDraft, setSpeakerDraft] = useState("");
+  const [speakerError, setSpeakerError] = useState<string | null>(null);
+  /** Names the model heard in this call, once asked. Null until then — which is
+   *  what makes the ask happen exactly once per note. */
+  const [heardNames, setHeardNames] = useState<string[] | null>(null);
+  const [listening, setListening] = useState(false);
   const [flash, setFlash] = useState<string | null>(null);
   const [peaks, setPeaks] = useState<number[] | null>(null);
   const [focus, setFocus] = useState(0);
@@ -150,6 +181,118 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
   const [finding, setFinding] = useState(false);
   const [query, setQuery] = useState("");
   const [matchAt, setMatchAt] = useState(0);
+  // The overview half of the note. Held locally as well as on the prop so a
+  // freshly generated brief appears without waiting for the parent to refetch.
+  const [brief, setBrief] = useState<Brief | null>(transcript.brief);
+  const [pane, setPane] = useState<"overview" | "transcript">("transcript");
+  const [briefing, setBriefing] = useState(false);
+  const [briefError, setBriefError] = useState<string | null>(null);
+  // Null until the probe answers, so the toggle doesn't flicker into view and
+  // out again on a Mac that cannot make overviews.
+  const [canBrief, setCanBrief] = useState<BriefCapability | null>(null);
+  // Which pass the on-device model is on. A long meeting is read in pieces and
+  // the whole thing can take a couple of minutes; a label that never changes
+  // for that long is indistinguishable from one that has hung.
+  const [briefStage, setBriefStage] = useState<BriefProgress | null>(null);
+
+  useEffect(() => {
+    briefCapability().then(setCanBrief, () =>
+      // An unregistered command means a build with no overviews at all.
+      setCanBrief({
+        available: false,
+        reason: "helper-missing",
+        on_device: false,
+        message: "",
+      }),
+    );
+  }, []);
+
+  // Apple Intelligence reports "still downloading" but never how far through,
+  // and nothing tells us when it lands — the framework offers a state and no
+  // progress and no notification. So rather than asking someone to keep coming
+  // back and pressing a dead button, we come back for them. Only while the pane
+  // is actually showing that state, and every few seconds rather than
+  // constantly: each check is a process spawn, cheap but not free.
+  useEffect(() => {
+    if (canBrief?.reason !== "model-not-ready") return;
+    const timer = setInterval(() => {
+      briefCapability().then(setCanBrief, () => {});
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [canBrief?.reason]);
+
+  // Always listening, not only while this window started something. A meeting
+  // briefs itself as it saves, so the first time a reader sees this pane the
+  // work may already be under way — and the note they are looking at may not be
+  // the note being read, which is why every event carries an id.
+  useEffect(() => {
+    const id = transcript.id;
+    const subs = [
+      watchBriefProgress((p) => {
+        if (p.id !== id) return;
+        setBriefStage(p);
+        setBriefing(p.progress < 1);
+      }),
+      watchBriefSaved((p) => {
+        if (p.id !== id) return;
+        setBrief(p.brief);
+        setBriefing(false);
+        setBriefStage(null);
+        setBriefError(null);
+        // Show it. The overview is now written unasked, so this is the moment
+        // it becomes worth reading — for a meeting you have just left or a file
+        // you have just dropped in, it is the answer to why you opened the app.
+        //
+        // Only if the reader has not gone looking for something in the
+        // transcript. Someone mid-scrub or mid-search is doing something the
+        // summary does not answer, and pulling the page out from under them
+        // would be the app deciding it knows better.
+        setPane((current) =>
+          current === "transcript" && !readerBusy.current ? "overview" : current,
+        );
+      }),
+      watchBriefFailed((p) => {
+        if (p.id !== id) return;
+        setBriefing(false);
+        setBriefStage(null);
+        setBriefError(p.problem);
+      }),
+    ];
+    return () => {
+      subs.forEach((s) => s.then((un) => un()).catch(() => {}));
+    };
+  }, [transcript.id]);
+
+  /** Whether the reader is in the middle of something the summary doesn't
+   *  answer. Held in a ref because the brief handler above subscribes once per
+   *  note: reading these off the closure would give it whatever they were when
+   *  the note opened, which is always "no". */
+  const readerBusy = useRef(false);
+  useEffect(() => {
+    readerBusy.current = finding || following;
+  }, [finding, following]);
+
+  // Who was heard in *this* call. Cleared on the way to another note, or the
+  // second meeting you opened would be offered the first one's names.
+  useEffect(() => {
+    setHeardNames(null);
+    setListening(false);
+    setNamingSpeakerAt(null);
+    setSpeakerError(null);
+  }, [transcript.id]);
+
+  /** Heard names that aren't already labelling somebody here. The backend
+   *  filters this too, but its answer was computed before the rename that is
+   *  most likely to make it stale — the one just made from this very list. */
+  const suggestions = useMemo(() => {
+    if (!heardNames) return [];
+    const taken = new Set(
+      paragraphs
+        .map((p) => p.speaker?.toLowerCase())
+        .filter((s): s is string => !!s),
+    );
+    return heardNames.filter((name) => !taken.has(name.toLowerCase()));
+  }, [heardNames, paragraphs]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<PlayerHandle | null>(null);
@@ -192,6 +335,13 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
     setMatchAt(0);
     setPeaks(transcript.peaks?.length ? transcript.peaks : null);
     setMediaPath(transcript.source_path);
+    setBrief(transcript.brief);
+    setBriefError(null);
+    setBriefing(false);
+    // Open on the overview when there is one. Generating a brief is a
+    // deliberate act — if the user paid for it, it is what they came back for.
+    // Notes without one open on the transcript, which is every note by default.
+    setPane(transcript.brief ? "overview" : "transcript");
     setParagraphs(
       transcript.paragraphs?.length
         ? transcript.paragraphs
@@ -242,7 +392,7 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
   }, [transcript.id, transcript.source_path, transcript.peaks]);
 
   // Transcripts saved before the media library point at wherever their file
-  // happened to live, in whatever format it happened to be — an Opus voice note,
+  // happened to live, in whatever format it happened to be — Discord's Opus
   // among them, which the webview can't decode. Pull them in on first open.
   //
   // Library files get the same treatment when they aren't in a format the
@@ -251,7 +401,10 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
   // library can be full of files that decode fine and play as nothing. Opening
   // the note re-encodes it, once.
   useEffect(() => {
-    if (transcript.source_path.includes("/media/") && playableAudio(transcript.source_path)) {
+    if (
+      transcript.source_path.includes("/media/") &&
+      playableAudio(transcript.source_path)
+    ) {
       return;
     }
     let cancelled = false;
@@ -300,11 +453,13 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
   // -- find in transcript ---------------------------------------------------
 
   /**
-   * Where each word sits inside its paragraph's text.
+   * What each paragraph *renders as*, which is not always `p.text`.
    *
-   * Computed once per paragraph and used for all three of drawing, searching
-   * and highlighting, so those can't disagree about what the reader is looking
-   * at — which is the whole reason spacing drifted from `p.text` before.
+   * A paragraph with word timings is drawn as one span per word joined by
+   * single spaces; an edited one is drawn as its raw text. Searching the same
+   * string the reader is looking at is what keeps a match's character offsets
+   * mapping onto the right words — deriving them from `p.text` instead would
+   * drift the moment an edit reconciled the word list differently.
    */
   const placed = useMemo(
     () => paragraphs.map((p) => placeWords(p.text, p.words ?? [])),
@@ -673,6 +828,9 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
         e.preventDefault();
         setFinding(true);
+        // Find searches the prose. Opening it from the overview would count
+        // and step through matches nobody can see.
+        setPane("transcript");
         // Already open: re-select, so a second ⌘F replaces the query rather
         // than appending to it — the behaviour every other find bar has.
         findRef.current?.select();
@@ -742,29 +900,64 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
     onRename(transcript.id, next);
   };
 
-  const fullText = () => paragraphs.map((p) => p.text).join("\n\n");
+  /** Open the label for editing, and — once per note — ask the model who was
+   *  on the call. Asked here rather than on save because most meetings are
+   *  never renamed, and a model call to answer a question nobody asked is the
+   *  cost the overview is careful not to pay either. */
+  const openSpeaker = (at: number, current: string) => {
+    setSpeakerError(null);
+    setSpeakerDraft(current);
+    setNamingSpeakerAt(at);
+
+    if (heardNames !== null || listening) return;
+    setListening(true);
+    namesInMeeting(transcript.id)
+      .then(setHeardNames)
+      // Apple Intelligence being off is the common case here, and it is not
+      // worth a message: the field below still works, which is the whole point.
+      .catch(() => setHeardNames([]))
+      .finally(() => setListening(false));
+  };
+
+  const closeSpeaker = () => {
+    setNamingSpeakerAt(null);
+    setSpeakerError(null);
+  };
+
+  /** Commit a speaker's name. The backend rewrites every turn, so the answer
+   *  is a whole new transcript and the parent swaps it in. */
+  const commitSpeaker = async (from: string, picked?: string) => {
+    const next = (picked ?? speakerDraft).trim();
+    if (!next || next === from) {
+      closeSpeaker();
+      return;
+    }
+    try {
+      await onRenameSpeaker(transcript.id, from, next);
+      closeSpeaker();
+    } catch (e) {
+      // Kept open, with the reason under it: the name is still in the field,
+      // so fixing a stray colon is one keystroke rather than typing it again.
+      setSpeakerError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  /**
+   * The transcript as prose, for copying, .txt and Markdown.
+   *
+   * Speaker labels are part of the text here, not decoration around it: a
+   * meeting pasted into a document without them reads as one person
+   * contradicting themselves. Anything without speakers — every dictation and
+   * dropped file — is unchanged.
+   */
+  const fullText = () =>
+    paragraphs
+      .map((p) => (p.speaker ? `${p.speaker}: ${p.text}` : p.text))
+      .join("\n\n");
 
   const copyAll = async () => {
     await navigator.clipboard.writeText(fullText());
     setCopied(true);
-  };
-
-  /**
-   * Reveal the audio in Finder.
-   *
-   * The backend picks between the original and the library copy, so all this
-   * has to do is report a failure. It used to swallow one, which meant a
-   * transcript whose original had been moved — or a dictation, whose scratch
-   * recording is deleted the moment it is archived — gave a button that
-   * visibly did nothing at all.
-   */
-  const revealAudio = async () => {
-    setActionError(null);
-    try {
-      await revealSource(transcript.origin_path, transcript.source_path);
-    } catch (err) {
-      setActionError(`COULD NOT REVEAL — ${err}`);
-    }
   };
 
   const wordCount = paragraphs.reduce(
@@ -799,7 +992,7 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
     if (!target) return;
 
     setExporting(true);
-    setActionError(null);
+    setExportError(null);
     try {
       if (target.endsWith(".pdf")) {
         await exportPdf(target, {
@@ -807,9 +1000,13 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
           meta: dateline(),
           // Timestamps are hung in the margin of the PDF, so every paragraph
           // carries the one from the audio it starts at.
+          // Speakers ride along in the text rather than as a field of their
+          // own: the PDF layout takes a stamp and a paragraph, and a meeting
+          // printed without attribution is the same unreadable run-on that
+          // copying one without it would be.
           paragraphs: paragraphs.map((p) => ({
             stamp: formatDuration(p.start),
-            text: p.text,
+            text: p.speaker ? `${p.speaker}: ${p.text}` : p.text,
           })),
         });
         return;
@@ -823,9 +1020,23 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
     } catch (err) {
       // Saving is the one place a silent failure is unforgivable: the user
       // walks away believing the file exists.
-      setActionError(`EXPORT FAILED — ${err}`);
+      setExportError(String(err));
     } finally {
       setExporting(false);
+    }
+  };
+
+  const runBrief = async () => {
+    setBriefing(true);
+    setBriefError(null);
+    try {
+      setBrief(await generateBrief(transcript.id));
+    } catch (e) {
+      // The sentence the backend sent is written for a reader; pass it through
+      // rather than replacing it with a generic failure.
+      setBriefError(String(e));
+    } finally {
+      setBriefing(false);
     }
   };
 
@@ -870,6 +1081,7 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
                   </span>
                 ) : (
                   <>
+                    {formatWhen(transcript.created_at)} //{" "}
                     {formatDuration(transcript.duration)} //{" "}
                     {wordCount.toLocaleString()} WORDS
                     {transcript.language
@@ -878,12 +1090,11 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
                   </>
                 )}
               </p>
-              {actionError && (
-                // An action that quietly did nothing is the worst outcome here —
-                // the user closes the window believing the file is on disk, or
-                // clicks SOURCE a third time expecting Finder.
+              {exportError && (
+                // A save that quietly did nothing is the worst outcome here —
+                // the user closes the window believing the file is on disk.
                 <p className="mono-data mt-1 text-[10px] uppercase tracking-[0.12em] text-amber">
-                  {actionError}
+                  EXPORT FAILED — {exportError}
                 </p>
               )}
             </div>
@@ -894,7 +1105,16 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
                 onClick={exportFile}
                 label={exporting ? "SAVING…" : "EXPORT"}
               />
-              <RailButton onClick={revealAudio} label="SOURCE" />
+              <RailButton
+                onClick={() =>
+                  // Prefer where the file came from; fall back to the archived
+                  // copy for anything that arrived without an original on disk.
+                  revealItemInDir(
+                    transcript.origin_path || transcript.source_path,
+                  ).catch(() => {})
+                }
+                label="SOURCE"
+              />
               <RailButton
                 onClick={() => onDelete(transcript.id)}
                 label="DELETE"
@@ -902,6 +1122,30 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
               />
             </div>
           </div>
+
+          {/* Shown when an overview is possible, or could be made possible.
+              "Apple Intelligence is switched off" belongs on screen because it
+              has a fix in it; "this Mac is too old" does not, and a tab that
+              can only ever apologise is worse than no tab. A note that already
+              has a brief always keeps its tab — it was readable yesterday and
+              nothing about the machine should take that away. */}
+          {(canBrief?.available ||
+            canBrief?.reason === "apple-intelligence-off" ||
+            canBrief?.reason === "model-not-ready" ||
+            brief) && (
+            <div className="reading-body no-drag flex items-center gap-px pb-2">
+              <PaneTab
+                label="AI OVERVIEW"
+                active={pane === "overview"}
+                onClick={() => setPane("overview")}
+              />
+              <PaneTab
+                label="TRANSCRIPT"
+                active={pane === "transcript"}
+                onClick={() => setPane("transcript")}
+              />
+            </div>
+          )}
         </header>
 
         {/* The gutter is 40px of stamp and 14px of gap, matching the PDF
@@ -909,12 +1153,113 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
             anatomy. Bottom padding clears the floating player, which overlays
             the text. */}
         <article className="reading-body pb-32 pt-9">
-          {/* ~1.75 leading on a ~66-character measure. Font size and opacity are
+          {pane === "overview" && (
+            <Overview
+              brief={brief}
+              busy={briefing}
+              stage={briefStage}
+              capability={canBrief}
+              error={briefError}
+              onGenerate={runBrief}
+            />
+          )}
+
+          {/* Hidden rather than unmounted. The paragraph refs drive follow-along
+              scrolling, the focus tween and find-in-transcript, and tearing them
+              down every time someone glances at the overview would reset the
+              reader's place and re-run the whole GSAP setup on the way back.
+              ~1.75 leading on a ~66-character measure. Font size and opacity are
               owned by GSAP, not React — see the focus effect above; declaring
               them here too would let a re-render stomp mid-tween. */}
-          <div className="space-y-[1.4em] leading-[1.75] text-ink">
+          <div
+            hidden={pane === "overview"}
+            className="space-y-[1.4em] leading-[1.75] text-ink"
+          >
             {paragraphs.map((p, pi) => (
               <div key={pi} className="relative">
+                {/* Who is talking. Only meetings carry this, and because
+                    consecutive turns from one speaker are already merged into
+                    one paragraph, every label here is a genuine change of
+                    voice — so there is never a run of identical labels to
+                    suppress. */}
+                {p.speaker &&
+                  (namingSpeakerAt === pi ? (
+                    <div className="mb-1.5">
+                      <input
+                        autoFocus
+                        value={speakerDraft}
+                        onChange={(e) => setSpeakerDraft(e.target.value)}
+                        onBlur={() => commitSpeaker(p.speaker!)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") e.currentTarget.blur();
+                          if (e.key === "Escape") {
+                            // Straight to closed, not through the blur handler,
+                            // or escape would save what it was meant to discard.
+                            closeSpeaker();
+                          }
+                        }}
+                        aria-label="Name this speaker"
+                        className="micro no-drag selectable w-44 border border-sage-dim bg-transparent px-1 py-0.5 uppercase text-ink outline-none"
+                      />
+
+                      {/* Names actually said out loud during the call. Offered,
+                          never applied: the tap hears the far side as one
+                          stream, so knowing Rupesh and Priya were both there
+                          says nothing about which voice this is. */}
+                      {listening && (
+                        <p className="mono-data mt-1 text-[10px] uppercase tracking-[0.12em] text-faint">
+                          LISTENING FOR NAMES…
+                        </p>
+                      )}
+                      {suggestions.length > 0 && (
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                          {suggestions.map((name) => (
+                            <button
+                              key={name}
+                              // Before blur, or the input would commit and close
+                              // out from under the click that landed here.
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                setSpeakerDraft(name);
+                                commitSpeaker(p.speaker!, name);
+                              }}
+                              className="micro no-drag border border-hairline px-1.5 py-0.5 text-faint transition-colors hover:border-sage-dim hover:text-ink"
+                            >
+                              {name.toUpperCase()}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                      {speakerError && (
+                        <p className="mono-data mt-1 text-[10px] uppercase tracking-[0.12em] text-amber">
+                          {speakerError}
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    /* A button, because the tap hears the whole far side as one
+                       stream and calls it "Others" — true, and useless the
+                       moment you want to know who agreed to something. You know
+                       who was talking; this is the cheapest way to get that
+                       into the note. Renames every turn by this speaker. */
+                    <button
+                      onClick={() => openSpeaker(pi, p.speaker!)}
+                      title={`Rename ${p.speaker} throughout this meeting`}
+                      className={[
+                        "micro no-drag mb-1.5 -ml-1 border border-transparent px-1 py-0.5 transition-colors hover:border-hairline hover:text-ink",
+                        // By side, not by name. Meetings recorded before sides
+                        // were stored fall back to the label they shipped with.
+                        (p.side ?? (p.speaker === "You" ? "you" : "others")) ===
+                        "you"
+                          ? "text-sage-dim"
+                          : "text-faint",
+                      ].join(" ")}
+                    >
+                      {p.speaker.toUpperCase()}
+                    </button>
+                  ))}
+
                 {/* Hung in the margin, never in the reading line. It answers
                     "how far in is this?" without ever interrupting a sentence,
                     and seeks when clicked. */}
@@ -1031,7 +1376,7 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
             ))}
           </div>
 
-          {!hasWords && (
+          {!hasWords && pane === "transcript" && (
             <p className="mono-data mt-8 border-t border-hairline pt-3 text-[10px] uppercase tracking-[0.12em] text-faint">
               NO WORD TIMINGS // FOLLOW-ALONG RUNS BY PARAGRAPH
             </p>
@@ -1106,6 +1451,211 @@ export function TranscriptView({ transcript, onRename, onDelete, onEdit, naming 
         handleRef={playerRef}
       />
     </div>
+  );
+}
+
+/** One half of the Overview/Transcript switch. */
+function PaneTab({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      aria-pressed={active}
+      className={[
+        "micro border px-2.5 py-1.5 transition-colors",
+        active
+          ? "border-ink bg-ink text-surface"
+          : "border-hairline text-grey hover:border-ink hover:text-ink",
+      ].join(" ")}
+    >
+      {label}
+    </button>
+  );
+}
+
+/**
+ * The structured half of a note: what it was about, rather than what was said.
+ *
+ * Generated on request and then kept, so this is one of three states — never
+ * asked, asking, or answered — and the empty one has to explain itself. A blank
+ * pane with a button reads like something is broken.
+ */
+function Overview({
+  brief,
+  busy,
+  stage,
+  capability,
+  error,
+  onGenerate,
+}: {
+  brief: Brief | null;
+  busy: boolean;
+  stage: BriefProgress | null;
+  capability: BriefCapability | null;
+  error: string | null;
+  onGenerate: () => void;
+}) {
+  if (!brief) {
+    // Nothing can be generated yet, and the reason is the only useful thing on
+    // screen. The button is still rendered rather than removed, because the
+    // reasons that reach here are the ones the user can clear — the pane is
+    // hidden entirely for the ones they can't.
+    const blocked = capability !== null && !capability.available;
+    // Blocked, but by something that clears itself or that the user can clear.
+    // Both mean the model that will eventually write this is the local one.
+    const pending =
+      capability?.reason === "model-not-ready" ||
+      capability?.reason === "apple-intelligence-off";
+
+    return (
+      <div className="flex flex-col items-start gap-3 border border-hairline bg-panel p-6">
+        <p className="eyebrow text-ink">
+          {!blocked
+            ? "NO AI OVERVIEW YET"
+            : capability?.reason === "model-not-ready"
+              ? "NOT READY YET"
+              : "AI OVERVIEWS ARE OFF"}
+        </p>
+        <p className="max-w-[440px] text-[13px] leading-relaxed text-grey">
+          An overview pulls the summary, key points, decisions and any action
+          items out of this note. Meetings write their own as they save; every
+          other note waits until you ask, because most dictation is a sentence
+          on its way somewhere else and has nothing to summarise.
+        </p>
+        {/* Where it runs is the part worth saying out loud. It is the whole
+            difference between this and every other meeting-notes tool, and the
+            place a person would otherwise assume the transcript went.
+            Shown while blocked too, and deliberately: waiting for a download or
+            walking to System Settings is a cost, and this is the reason it is
+            worth paying. Not shown when the overview would come from the
+            assistant build's own model, where it would simply be untrue. */}
+        {(capability?.on_device || (blocked && pending)) && (
+          <p className="max-w-[440px] text-[13px] leading-relaxed text-grey">
+            It is written by the model built into macOS, on this Mac. Nothing is
+            uploaded and nothing is charged for.
+          </p>
+        )}
+        {blocked && capability.message && (
+          <p className="max-w-[440px] text-[13px] leading-relaxed text-amber">
+            {capability.message}
+          </p>
+        )}
+        <button
+          onClick={onGenerate}
+          disabled={busy || blocked}
+          className="micro border border-hairline px-2.5 py-1.5 text-grey transition-colors hover:border-ink hover:bg-ink hover:text-surface disabled:opacity-50 disabled:hover:border-hairline disabled:hover:bg-transparent disabled:hover:text-grey"
+        >
+          {busy ? briefBusyLabel(stage) : "GENERATE"}
+        </button>
+        {/* A long meeting is read in pieces. The bar is what says the wait is
+            finite — the label alone can sit on "reading part 3 of 9" for long
+            enough to look stuck. */}
+        {busy && stage && (
+          <div className="flex w-full max-w-[440px] gap-px">
+            {Array.from({ length: 32 }, (_, i) => (
+              <span
+                key={i}
+                className={[
+                  "h-1 flex-1",
+                  i / 32 < stage.progress ? "bg-sage-dim" : "bg-hairline",
+                ].join(" ")}
+              />
+            ))}
+          </div>
+        )}
+        {/* Prose, not the uppercase mono the other readouts use. That style is
+            for codes and counts — a two-line sentence set in tracked-out caps
+            is markedly harder to read, and this is the one line here whose job
+            is to be read carefully and acted on. */}
+        {error && (
+          <p className="max-w-[440px] text-[13px] leading-relaxed text-amber">
+            {error}
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-7">
+      <p className="text-[17px] leading-[1.65] text-ink">{brief.summary}</p>
+
+      <BriefList title="KEY POINTS" items={brief.key_points} />
+      <BriefList title="DECISIONS" items={brief.decisions} />
+
+      {brief.action_items.length > 0 && (
+        <section>
+          <p className="eyebrow mb-2 text-faint">ACTION ITEMS</p>
+          <ul className="space-y-2">
+            {brief.action_items.map((a, i) => (
+              <li key={i} className="flex gap-3 text-[15px] leading-[1.6]">
+                <span className="mt-[7px] h-1 w-1 shrink-0 bg-sage-dim" />
+                <span className="text-ink">
+                  {a.text}
+                  {a.owner && (
+                    <span className="mono-data ml-2 text-[10px] uppercase tracking-[0.12em] text-faint">
+                      {a.owner}
+                    </span>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      <div className="flex items-center gap-3 border-t border-hairline pt-4">
+        <button
+          onClick={onGenerate}
+          disabled={busy || (capability !== null && !capability.available)}
+          className="micro border border-hairline px-2.5 py-1.5 text-grey transition-colors hover:border-ink hover:bg-ink hover:text-surface disabled:opacity-50"
+        >
+          {busy ? briefBusyLabel(stage) : "REGENERATE"}
+        </button>
+        {/* Prose here too, and for the same reason as the empty state. */}
+        {error && (
+          <span className="text-[13px] leading-relaxed text-amber">{error}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * What the button says while the model is reading.
+ *
+ * The stage comes from the backend because only it knows how many passes a note
+ * takes — a dictated note is one, a long meeting is a dozen — and "reading part
+ * 4 of 12" is the difference between a wait a person will sit through and one
+ * they assume has hung. Falls back to the old wording until the first pass
+ * reports, which on a short note may be the only thing ever shown.
+ */
+function briefBusyLabel(stage: BriefProgress | null): string {
+  return stage?.stage ? stage.stage.toUpperCase() + "…" : "READING THE NOTE…";
+}
+
+/** A titled list that disappears rather than showing an empty heading. */
+function BriefList({ title, items }: { title: string; items: string[] }) {
+  if (!items.length) return null;
+  return (
+    <section>
+      <p className="eyebrow mb-2 text-faint">{title}</p>
+      <ul className="space-y-2">
+        {items.map((t, i) => (
+          <li key={i} className="flex gap-3 text-[15px] leading-[1.6] text-ink">
+            <span className="mt-[7px] h-1 w-1 shrink-0 bg-hairline" />
+            <span>{t}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

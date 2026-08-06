@@ -1,10 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "VoiceDumps",
-  "version": "1.0.0",
-  "identifier": "dev.heynaavi.voicedump",
+  "productName": "VoiceDumps-qwee",
+  "version": "1.1.0",
+  "identifier": "ai.qwee.voicedumps",
   "build": {
-    "beforeDevCommand": "npm run dev:vite",
+    "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
@@ -66,16 +66,15 @@
     ],
     "resources": {
       "../overlay-helper/voicedumps-overlay": "voicedumps-overlay",
+      "../capture-helper/voicedumps-capture": "voicedumps-capture",
+      "../hud-helper/voicedumps-hud": "voicedumps-hud",
+      "../brain-helper/voicedumps-brain": "voicedumps-brain",
       "../src/assets/fonts/SpaceGrotesk.ttf": "fonts/SpaceGrotesk.ttf",
       "../src/assets/fonts/JetBrainsMono.ttf": "fonts/JetBrainsMono.ttf"
     },
     "macOS": {
       "signingIdentity": "-",
       "entitlements": "Entitlements.plist"
-    },
-    "shortDescription": "Local speech to text",
-    "longDescription": "Transcribe audio and video, record from the microphone, and dictate anywhere with the globe key. Everything runs on your Mac \u2014 nothing is uploaded, and there is nothing to sign in to.",
-    "copyright": "Naveen",
-    "category": "Productivity"
+    }
   }
 }

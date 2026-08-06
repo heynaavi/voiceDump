@@ -1,13 +1,24 @@
 # Dependencies.
 # No trailing slash: `node_modules/` matches a directory but not a *symlink* to
-# one, which is how a symlink pointing at an absolute path on one machine can
-# end up committed.
+# one, so a worktree that symlinks node_modules at the shared install would sail
+# straight past this and commit an absolute path from one machine.
 node_modules
 
 # Build output
 dist/
 src-tauri/target/
-*.dmg
+
+# Python sidecar environment (recreate with: ./scripts/setup-sidecar.sh)
+# No trailing slash, for the same reason as node_modules above. This one was
+# not hypothetical: a worktree symlinked .venv at the shared install, the
+# trailing slash let it through, and merging the branch checked the symlink out
+# on top of the real directory — pointing it at itself and destroying the env.
+sidecar/.venv
+sidecar/__pycache__/
+*.pyc
+
+# Agent worktrees — not part of the project
+.claude/worktrees/
 
 # macOS
 .DS_Store
@@ -16,11 +27,34 @@ src-tauri/target/
 .env
 .env.local
 
-# Swift helper binary — rebuilt automatically by `npm run dev` / `npm run build`
+# Swift overlay helper binary — rebuild with:
+#   swiftc -O overlay-helper/main.swift -o overlay-helper/voicedumps-overlay
 overlay-helper/voicedumps-overlay
 
+# Swift system-audio capture helper — rebuild with:
+#   node scripts/build-capture.mjs
+capture-helper/voicedumps-capture
+
+# Swift meeting HUD helper — rebuild with:
+#   node scripts/build-hud.mjs
+hud-helper/voicedumps-hud
+
 # Speech models — fetched with scripts/fetch-models.sh, too large for git.
-# No trailing slash, for the same reason as node_modules above: `models/` would
-# match the directory but not a *symlink* named `models`, and pointing one at a
-# shared download is the obvious way to avoid keeping 700 MB per checkout.
+# No trailing slash, for the same reason as node_modules above.
 models
+
+# Swift on-device model helper — rebuild with:
+#   node scripts/build-brain.mjs
+brain-helper/voicedumps-brain
+
+# Nobody's library, ever.
+#
+# The database lives in ~/Library/Application Support/<bundle id>/ and has never
+# been inside this tree, so this is a guard rather than a fix: a stray copy made
+# while debugging must not become a commit that publishes somebody's notes to a
+# public repository. Everyone who installs the app builds their own.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3

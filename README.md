@@ -6,8 +6,9 @@
 
 **Hold the globe key. Talk. The words appear where your cursor already was.**
 
-Local speech-to-text for macOS. No account, no API key, nothing uploaded —
-the speech models are downloaded once and run on your own Mac.
+Local speech-to-text for macOS — dictation, meeting recording, and a library
+you can ask questions of. No account, no API key, nothing uploaded: the speech
+models are downloaded once and run on your own Mac.
 
 [![Latest release](https://img.shields.io/github/v/release/heynaavi/voiceDump?label=release&color=1e2618)](https://github.com/heynaavi/voiceDump/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/heynaavi/voiceDump/total?label=downloads&color=8fb07c)](https://github.com/heynaavi/voiceDump/releases)
@@ -40,6 +41,26 @@ Then there is the other half: drop in audio or video and get a readable
 transcript with real timestamps, word-level follow-along during playback, inline
 editing that keeps the timings, full-text search across everything you have ever
 dictated, and export to typeset PDF, Markdown or plain text.
+
+**Calls, both sides.** Start a recording and your microphone and whatever the
+Mac is playing are captured as two separate tracks, so the transcript knows who
+said what without guessing at voices. No bot joins the meeting — Zoom, Meet,
+Teams and a phone on speaker all work the same way, because it is the audio
+that is captured, not the app.
+
+**Names, overviews and answers.** On macOS 26 with Apple Intelligence switched
+on, every recording gets a short real title, an overview with its key points and
+action items, and a note of the people and projects it was about. Then ASK YOUR
+NOTES puts a question to the whole library — *what did we decide about pricing*,
+*what are my action items* — and answers from the recordings that bear on it,
+citing the ones it used so you can open them and check. You can follow up in
+plain language: "write that as a paragraph", "make it shorter", "as bullets".
+
+That half runs on Apple's on-device model, so it holds the same promise as the
+rest: nothing is uploaded, and there is still nothing to sign in to. Without
+Apple Intelligence — an older macOS, an ineligible Mac, or simply switched off —
+everything else works exactly as it always did, and ASK still finds and shows
+you the recordings that match.
 
 ## How fast, exactly
 
@@ -199,6 +220,32 @@ runs in-process on your own machine, before and after that one download.
 Words, pace, which apps you dictate into, and an activity grid — computed
 locally in [`analytics.rs`](src-tauri/src/analytics.rs). It refuses to print a
 words-per-minute figure from too thin a sample rather than guessing.
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**Both sides of a call, kept apart**
+
+Your microphone and the Mac's own output are recorded as two streams and
+transcribed separately, so attribution is a fact about which track a sentence
+arrived on rather than a guess about a voice. The far side is taken with a
+CoreAudio process tap in a helper
+([`capture-helper/main.swift`](capture-helper/main.swift)); nothing is injected
+into the meeting app and no participant sees a bot.
+
+</td>
+<td width="50%">
+
+**A question, not a search box**
+
+ASK reads the recordings that bear on what you asked and answers from them, with
+citations you can open. Retrieval runs two ways at once — full-text search for
+what notes *say*, a knowledge graph for what they are *about* — because each
+fails where the other works. The answer is generated under a schema rather than
+a prompt asking nicely for one, which is what stops a 3-billion-parameter model
+replying with a tool call instead of a sentence.
 
 </td>
 </tr>
@@ -440,14 +487,26 @@ Stated plainly, because a README that only lists wins is not worth reading:
 
 - **Apple Silicon only.** The arm64 build does not run on Intel Macs, and Windows
   and Linux are not supported.
-- **No licence yet.** There is no `LICENSE` file in this repo, which means the
-  default is "all rights reserved" and nobody can safely reuse the code. That
-  needs choosing before this is meaningfully open source.
+- **The AI half needs macOS 26 and Apple Intelligence.** Titles, overviews and
+  ASK all run on Apple's on-device model, which does not exist before macOS 26
+  and can be switched off or unavailable on an eligible Mac. Everything else —
+  dictation, transcription, meeting recording, search, export — works on macOS
+  11 and later regardless, and the app says which state it is in rather than
+  failing quietly.
+- **ASK answers from about six recordings at a time.** The on-device model has a
+  4,096-token window shared between the question, the notes and the answer, so a
+  question that really needs forty notes gets the six that matched best. It
+  cites them, so you can see what it read.
+- **Turning an answer into an email is unreliable.** Reformatting works —
+  paragraph, bullets, shorter, a poem — but "make that an email" sometimes
+  returns the input unchanged when the answer it is working from is thin.
 
 ## Roadmap
 
 - Watch a folder for auto-transcription
 - Local audio enhancement — podcast-grade cleanup, tunable
+- Speaker names carried across meetings, not just within one
+- One-click updates, once there is a signing key that never touches this repo
 
 <div align="center">
 <br>

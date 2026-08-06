@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import gsap from "gsap";
 
 /**
- * Motion vocabulary for the Field Notes skin.
+ * Motion vocabulary for the QWEE skin.
  *
  * The design language is machine-set and disciplined, so easing is snappy and
  * often *stepped* rather than springy — things click into place like a readout
@@ -40,8 +40,47 @@ export function useGsap(
       return;
     }
 
-    const ctx = gsap.context(() => setup({ scope }), scope);
-    return () => ctx.revert();
+    // Do not start an entrance into a window nobody is looking at.
+    //
+    // GSAP's ticker is driven by requestAnimationFrame, which macOS does not
+    // deliver to a hidden or fully occluded window. A `fromTo` that begins at
+    // opacity 0 applies that instantly and then waits for a frame that never
+    // arrives — so the content is not "animating in", it is invisible, and it
+    // stays invisible until something happens to schedule a frame.
+    //
+    // Measured, in a webview reporting `visibilityState: "hidden"`: zero rAF
+    // ticks in 400ms, and a walkthrough frozen at opacity 0 with its heading,
+    // its body and its only button unreachable. On a screen that *is* the whole
+    // window, that is not a missing flourish — it is a blank app.
+    //
+    // So the animation waits for the window to be seen. Anything mounted while
+    // hidden simply appears, which is the correct behaviour anyway: an entrance
+    // nobody watched has no reason to be replayed.
+    let ctx: gsap.Context | null = null;
+    let waiting: (() => void) | null = null;
+
+    const run = () => {
+      ctx = gsap.context(() => setup({ scope }), scope);
+    };
+
+    if (document.visibilityState === "hidden") {
+      const onVisible = () => {
+        if (document.visibilityState !== "hidden") {
+          document.removeEventListener("visibilitychange", onVisible);
+          waiting = null;
+          run();
+        }
+      };
+      document.addEventListener("visibilitychange", onVisible);
+      waiting = () => document.removeEventListener("visibilitychange", onVisible);
+    } else {
+      run();
+    }
+
+    return () => {
+      waiting?.();
+      ctx?.revert();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);
 

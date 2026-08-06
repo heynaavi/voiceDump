@@ -51,6 +51,25 @@ export function formatRelativeDate(ms: number): string {
   });
 }
 
+/** The absolute when, for the one place that has to say it outright.
+ *
+ * Meetings used to be called "Meeting — 6 Aug, 2:14 PM", so the header carried
+ * the time by accident. Now that the AI names them after what was discussed,
+ * nothing else on screen says when a note happened — the sidebar's relative
+ * date is scrolled away by the time you're reading. The year is dropped for the
+ * current one, where it is noise. */
+export function formatWhen(ms: number): string {
+  const date = new Date(ms);
+  return date.toLocaleString(undefined, {
+    day: "numeric",
+    month: "short",
+    year:
+      date.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 /** Group history entries under friendly date headings. */
 export function dateGroup(ms: number): string {
   const date = new Date(ms);

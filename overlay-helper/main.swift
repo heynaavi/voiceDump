@@ -6,7 +6,7 @@
 // the user sees while dictating lives here, and the main app drives it over a
 // pipe.
 //
-// Design: "Field Notes" — forest & sage, squares not circles, the
+// Design: QWEE V2 "Field Notes" — forest & sage, squares not circles, the
 // pixel-cluster brand mark, and stepped/mechanical motion. The one concession is
 // the rounded frosted container: a hard rectangle floating over another app's UI
 // reads as a system error, a soft frosted pill reads as a quiet status HUD.
@@ -17,7 +17,7 @@
 import Cocoa
 import QuartzCore
 
-// MARK: - Palette (Field Notes §3)
+// MARK: - Palette (QWEE V2 §3)
 
 private let cForestTint = NSColor(calibratedRed: 0.09, green: 0.12, blue: 0.07, alpha: 0.55)
 private let cBorder = NSColor(calibratedRed: 0.72, green: 0.83, blue: 0.64, alpha: 0.20)

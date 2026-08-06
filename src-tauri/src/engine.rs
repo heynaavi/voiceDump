@@ -1,19 +1,23 @@
 //! Local transcription, in-process.
 //!
-//! whisper.cpp does the transcription (Metal-accelerated on Apple Silicon) and
-//! symphonia does the decoding. Both are compiled into the binary and the model
-//! weights ship as a bundle resource, which is the whole point: there is no
-//! Python, no virtualenv, no `ffmpeg` on the user's PATH, and nothing fetched at
-//! runtime. Download the app, open it, drop in a file — offline, first launch.
+//! This replaces the Python sidecar's transcribe path. That version worked, but
+//! it could never be shipped: it needed a 1 GB virtualenv, the `mlx` stack, and
+//! `ffmpeg`/`ffprobe` on the user's PATH. "Download the app and run it" is not
+//! possible on those terms.
 //!
-//! That constraint drives most of the decisions below. Anything that would need
-//! a runtime download or a system binary is out, however convenient.
+//! Here, whisper.cpp does the transcription (Metal-accelerated on Apple
+//! Silicon) and symphonia does the decoding — both compiled into the binary,
+//! with the model weights bundled as a resource. Nothing is fetched at runtime,
+//! so a fresh install works offline on first launch.
+//!
+//! The output shape deliberately matches what the sidecar returned, down to the
+//! paragraph-splitting heuristics, so the store, the UI and the reading view
+//! didn't have to change.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
 use serde_json::{json, Value};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -144,11 +148,12 @@ pub(crate) fn model_path(app: &tauri::AppHandle, size: ModelSize) -> Option<Path
 
 /// Why transcription can't run, or None if it can. Checked at startup so a
 /// broken install says so immediately rather than on the user's first
-/// recording.
+/// recording. The assistant build reports the sidecar's health instead.
 ///
 /// Reaching this now means something went wrong *after* first-run setup — the
 /// window will not let you past the download screen without the weights — so
 /// it points at the place they live rather than blaming the build.
+#[cfg(not(feature = "assistant"))]
 pub fn missing_model(app: &tauri::AppHandle) -> Option<String> {
     let want = auto_model();
     if model_path(app, want).is_some() {
@@ -167,21 +172,6 @@ pub fn missing_model(app: &tauri::AppHandle) -> Option<String> {
 /// Loading medium costs a couple of seconds, so holding it makes back-to-back
 /// dictations feel instant. It's dropped by [`unload`] when the app goes idle —
 /// a menu-bar app that sits on 1.5 GB all day is a bad neighbour.
-/// Answered on boot: is the app able to transcribe anything at all?
-#[derive(Serialize, Clone)]
-pub struct EngineHealth {
-    pub error: Option<String>,
-}
-
-/// What the window shows while something is being transcribed in the background.
-#[derive(Serialize, Clone)]
-pub struct IngestProgress {
-    pub title: String,
-    pub stage: String,
-    pub progress: f64,
-    pub source: &'static str,
-}
-
 #[derive(Default)]
 pub struct EngineState {
     inner: Mutex<Option<Loaded>>,
@@ -295,13 +285,10 @@ pub fn start_idle_unload(app: tauri::AppHandle) {
 
 /// Put `wanted` in the slot, loading it only if what's there isn't already it.
 ///
-/// Shared by `run` and [`warm`] so the two can't drift — a warm-up that loaded
-/// the model even slightly differently from the transcription it was warming
-/// for would be worse than no warm-up at all.
-///
-/// The caller holds the lock across the load on purpose. Two callers racing
-/// would otherwise each build a context, and one would be dropped seconds later
-/// having achieved nothing but a 1.5 GB spike.
+/// The caller holds the lock across the load on purpose. Two callers racing —
+/// a warm-up and the transcription it was warming for — would otherwise each
+/// build a context, and one would be dropped seconds later having achieved
+/// nothing but a 1.5 GB spike.
 fn ensure_loaded(
     app: &tauri::AppHandle,
     guard: &mut Option<Loaded>,
@@ -323,6 +310,26 @@ fn ensure_loaded(
     .map_err(|e| format!("could not load the speech model: {e}"))?;
     *guard = Some(Loaded { size: wanted, ctx });
     Ok(())
+}
+
+/// Preload the model so the next transcription can start decoding immediately.
+///
+/// Dictation calls this the moment the key goes down, so the couple of seconds
+/// a cold load costs overlap with the user still speaking instead of landing
+/// after they let go — which is the one moment the delay is unmissable.
+///
+/// Deliberately silent: this is an optimisation, not a step. If it fails, `run`
+/// will try the same load again and report the failure properly, in the place
+/// the user can actually act on it.
+pub fn warm(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    let state = app.state::<EngineState>();
+    let wanted = auto_model();
+    let mut guard = state.inner.lock().unwrap();
+    let _ = ensure_loaded(app, &mut guard, wanted);
+    // Held key, no transcription yet: the reaper must not collect the model out
+    // from under the dictation this was warming for.
+    state.touch();
 }
 
 /// Whether a segment is whisper narrating the audio rather than transcribing it.
@@ -519,9 +526,7 @@ impl Preview {
         params.set_print_timestamps(false);
         params.set_n_threads((num_threads() as i32).max(1));
         // No token timestamps: the panel shows words, not a scrubber, and they
-        // cost real time to compute. Per-token *probabilities* are a different
-        // matter — the decoder has them either way, so the confidence the
-        // overlay draws with is free.
+        // cost real time to compute.
         params.set_token_timestamps(false);
 
         // A failed pass is not worth surfacing — the final transcription is
@@ -546,26 +551,6 @@ impl Preview {
         }
         (!out.is_empty()).then_some(out)
     }
-}
-
-/// Resample arbitrary-rate mono audio to what whisper expects.
-///
-/// Exposed for live preview, which reads the microphone at whatever rate the
-/// device runs at rather than going through a decoded file.
-pub fn to_engine_rate(input: &[f32], src_rate: u32) -> Vec<f32> {
-    resample_to_16k(input, src_rate)
-}
-
-// -- decoding ---------------------------------------------------------------
-
-/// Decode any supported media file to 16 kHz mono f32.
-///
-/// symphonia is pure Rust, so this is what lets the app drop its `ffmpeg`
-/// dependency: mp3, m4a/aac, wav, flac, ogg and mp4/mov audio tracks all decode
-/// in-process.
-fn decode_mono_16k(path: &Path) -> Result<Vec<f32>, String> {
-    let (samples, rate) = decode_mono(path)?;
-    Ok(resample_to_16k(&samples, rate))
 }
 
 /// The same live preview, read again by the model that will actually be pasted.
@@ -666,6 +651,26 @@ impl Refine {
         }
         (!out.is_empty()).then_some(out)
     }
+}
+
+/// Resample arbitrary-rate mono audio to what whisper expects.
+///
+/// Exposed for live preview, which reads the microphone at whatever rate the
+/// device runs at rather than going through a decoded file.
+pub fn to_engine_rate(input: &[f32], src_rate: u32) -> Vec<f32> {
+    resample_to_16k(input, src_rate)
+}
+
+// -- decoding ---------------------------------------------------------------
+
+/// Decode any supported media file to 16 kHz mono f32.
+///
+/// symphonia is pure Rust, so this is what lets the app drop its `ffmpeg`
+/// dependency: mp3, m4a/aac, wav, flac, ogg and mp4/mov audio tracks all decode
+/// in-process.
+fn decode_mono_16k(path: &Path) -> Result<Vec<f32>, String> {
+    let (samples, rate) = decode_mono(path)?;
+    Ok(resample_to_16k(&samples, rate))
 }
 
 /// Decode to mono f32 at whatever rate the file is in.
@@ -826,12 +831,9 @@ fn ends_sentence(text: &str) -> bool {
     matches!(candidate, Some('.') | Some('!') | Some('?') | Some('…'))
 }
 
-/// Group segments into readable paragraphs.
-///
-/// Three rules, in order: a real pause after a completed thought, a long-enough
-/// run that ends on a sentence, or a hard cut for a monologue that never breaks
-/// cleanly. Whisper emits segments on its own rhythm, which is far too choppy to
-/// read; this is what turns them into prose.
+/// Group segments into readable paragraphs. Same three rules as the sidecar:
+/// a real pause after a completed thought, a long-enough run ending on a
+/// sentence, or a hard cut for a monologue that never breaks cleanly.
 fn build_paragraphs(segments: &[Value]) -> Vec<Value> {
     let mut out = Vec::new();
     let mut buf: Vec<&Value> = Vec::new();
@@ -902,7 +904,7 @@ impl Run {
     ///
     /// Tolerant by design: a result that carries neither field — an old job
     /// replayed, or a future path that doesn't transcribe — yields the default,
-    /// and the row keeps its empty columns rather than claiming a zero.
+    /// and Insights treats that as an unmeasured note rather than a zero.
     pub fn from_result(v: &Value) -> Self {
         Run {
             model: v
@@ -920,7 +922,8 @@ impl Run {
     }
 }
 
-/// Transcribe a media file, reporting progress through `report(stage, fraction)`.
+/// Transcribe a media file. `report(stage, progress)` mirrors the sidecar's
+/// progress contract so the existing UI keeps working unchanged.
 pub fn transcribe(
     app: &tauri::AppHandle,
     path: &str,
@@ -966,7 +969,7 @@ pub fn transcribe(
     // Time the decode alone. Reading the file, loading weights and building
     // paragraphs all vary with things that have nothing to do with the model —
     // a cold load would make the same audio look three times slower on the
-    // first note of the day — and it is the model this figure describes.
+    // first note of the day — and it is the model that Insights is comparing.
     let began = std::time::Instant::now();
     st.full(params, &samples)
         .map_err(|e| format!("transcription failed: {e}"))?;
@@ -1052,8 +1055,11 @@ pub fn peaks_for(path: &str) -> Result<Vec<f32>, String> {
     Ok(compute_peaks(&decode_mono_16k(Path::new(path))?))
 }
 
-/// Transcribe a file that arrived from outside the window — today a globe-key
-/// dictation — mirroring its progress into the sidebar.
+/// Transcribe a file arriving from outside the window — a Discord voice note, a
+/// Slack clip, a globe-key dictation — mirroring progress into the sidebar.
+///
+/// Same signature as the sidecar bridge it replaces, minus the port, so the
+/// ingest paths swapped over without restructuring.
 pub fn transcribe_ingest(
     app: &tauri::AppHandle,
     path: &str,
@@ -1065,7 +1071,7 @@ pub fn transcribe_ingest(
     transcribe(app, path, |stage, progress| {
         let _ = app.emit(
             "ingest-progress",
-            IngestProgress {
+            crate::sidecar::IngestProgress {
                 title: title.to_string(),
                 stage: stage.to_string(),
                 progress,
@@ -1080,6 +1086,8 @@ pub fn transcribe_ingest(
 /// Kick off a transcription and stream progress back as `transcribe-progress`
 /// events.
 ///
+/// The shape mirrors the sidecar's old `JobState` exactly — same fields, same
+/// stages, same 0..1 progress — so the window's job UI carried over untouched.
 /// Transcription is CPU/GPU-bound and takes real seconds, so it runs on its own
 /// thread; blocking the command would freeze the webview.
 #[tauri::command]
@@ -1155,36 +1163,14 @@ pub fn engine_unload(state: tauri::State<EngineState>) {
     state.unload();
 }
 
-/// Load the model in the background, before anyone asks for it.
-///
-/// Called the moment globe-key dictation starts, so the model is resident by the
-/// time the key comes back up rather than making the user wait through a cold
-/// load at exactly the wrong moment. Anything that needs the model meanwhile
-/// simply blocks on the same lock, so this can never cause a double load.
-pub fn warm(app: &tauri::AppHandle) {
-    use tauri::Manager;
-    let app = app.clone();
-    // Off the calling thread: the load blocks for a couple of seconds, and the
-    // caller is the one driving the event tap.
-    std::thread::spawn(move || {
-        let wanted = auto_model();
-        let state = app.state::<EngineState>();
-        let mut guard = state.inner.lock().unwrap();
-        // Deliberately silent. This is an optimisation, not a step: if it
-        // fails, `run` attempts the same load and reports the failure in the
-        // place the user can act on it.
-        let _ = ensure_loaded(&app, &mut guard, wanted);
-    });
-}
-
 #[cfg(test)]
 mod run_tests {
     use super::Run;
     use serde_json::json;
 
-    /// The shape `transcribe` actually emits, read back the way
-    /// `insert_transcript` reads it. These two live in different files; this is
-    /// what pins them together.
+    /// The shape `transcribe` actually emits, read back the way `insert_transcript`
+    /// reads it. These two live in different files; this is what pins them
+    /// together.
     #[test]
     fn reads_what_the_engine_writes() {
         let result = json!({
@@ -1201,7 +1187,7 @@ mod run_tests {
 
     /// A result from before the engine kept this record. The row must keep its
     /// empty columns rather than claim a zero-millisecond transcription, which
-    /// would divide into an infinite speed anywhere it is reported.
+    /// would divide into an infinite speed in Insights.
     #[test]
     fn an_older_result_is_not_a_measurement() {
         let run = Run::from_result(&json!({ "duration": 12.5, "text": "hello" }));
@@ -1210,7 +1196,7 @@ mod run_tests {
     }
 
     /// Half a record is not a record: a model with no timing still can't be
-    /// divided, so it must not count as measured.
+    /// divided, so it must not reach the speed calculation.
     #[test]
     fn a_partial_record_is_rejected() {
         let no_time = Run::from_result(&json!({ "model": "small", "transcribe_ms": 0 }));
@@ -1517,6 +1503,7 @@ mod tests {
     /// real pass from a probe that never ran.
     const PROBE_READY: &str = "VD_EXIT_PROBE: model loaded";
 
+    /// Resident size of this process, in MB.
     fn rss_mb() -> f64 {
         let pid = std::process::id().to_string();
         std::process::Command::new("ps")

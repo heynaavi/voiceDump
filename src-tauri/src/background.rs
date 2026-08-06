@@ -78,13 +78,7 @@ pub fn install_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open VoiceDumps", true, None::<&str>)?;
     // Sits with Open rather than in its own group: both are things you came to
     // the menu to *do*, as against the settings below the rule.
-    let copy = MenuItem::with_id(
-        app,
-        "copy-last",
-        "Copy Last Transcript",
-        true,
-        None::<&str>,
-    )?;
+    let copy = MenuItem::with_id(app, "copy-last", "Copy Last Transcript", true, None::<&str>)?;
     let login = CheckMenuItem::with_id(
         app,
         "login",

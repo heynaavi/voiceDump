@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import gsap from "gsap";
 
-import type { Mic, Settings as Stored } from "../lib/api";
-import { listMicrophones } from "../lib/api";
+import type { MeetingCapability, Mic, Settings as Stored } from "../lib/api";
+import type { BriefCapability } from "../lib/api";
+import {
+  briefCapability,
+  listMicrophones,
+  openAudioCaptureSettings,
+} from "../lib/api";
 import { EASE, prefersReducedMotion } from "../lib/motion";
 import {
   glyphs,
@@ -20,6 +25,9 @@ type Props = {
   onLivePreview: (enabled: boolean) => void;
   onMicrophone: (name: string | null) => void;
   onShortcut: (chord: string) => Promise<void>;
+  /** Null until the backend has been asked whether this Mac can record calls. */
+  meeting: MeetingCapability | null;
+  onReplayTutorial: () => void;
 };
 
 /**
@@ -309,8 +317,31 @@ export function Settings({
   onLivePreview,
   onMicrophone,
   onShortcut,
+  meeting,
+  onReplayTutorial,
 }: Props) {
   const sheet = useRef<HTMLDivElement>(null);
+
+  // Asked live, and asked again while the pane is open. Someone who opens this
+  // *because* overviews aren't appearing will often go and switch Apple
+  // Intelligence on in another window — and the status they come back to has to
+  // be the new one, or the panel that told them what to do reads as broken.
+  const [brain, setBrain] = useState<BriefCapability | null>(null);
+  useEffect(() => {
+    let live = true;
+    const look = () => {
+      briefCapability().then(
+        (state) => live && setBrain(state),
+        () => live && setBrain(null),
+      );
+    };
+    look();
+    const every = setInterval(look, 5000);
+    return () => {
+      live = false;
+      clearInterval(every);
+    };
+  }, []);
 
   // The entrance belongs to opening the pane, not to using it.
   //
@@ -386,6 +417,117 @@ export function Settings({
           aside={settings.microphone ? "PINNED" : "FOLLOWING SYSTEM"}
         >
           <Microphones chosen={settings.microphone} onChoose={onMicrophone} />
+        </Group>
+
+        {/* No switch here on purpose: a meeting is recorded by asking for it,
+            never by a preference left on. What this group is for is telling
+            someone where the permission lives once macOS has stopped asking. */}
+        <Group
+          title="MEETINGS"
+          aside={
+            meeting === null
+              ? undefined
+              : meeting.available
+                ? "READY"
+                : "UNAVAILABLE"
+          }
+        >
+          <Row
+            label="Recording a call"
+            note="Both sides are captured separately — your microphone, and whatever this Mac is playing — then transcribed and interleaved. Nobody is added to the call and no meeting service is contacted."
+            control={
+              <span className="micro text-faint">
+                {meeting?.available ? "ON THIS MAC" : "—"}
+              </span>
+            }
+          />
+          {meeting && !meeting.available && meeting.reason && (
+            <>
+              <div className="border-t border-hairline" />
+              <div className="px-4 py-3">
+                <p className="text-[11px] leading-relaxed text-grey">
+                  {meeting.reason}
+                </p>
+              </div>
+            </>
+          )}
+          <div className="border-t border-hairline" />
+          <Row
+            label="System audio permission"
+            note="macOS asks the first time you record a meeting, and only once. If it was declined, this opens System Settings › Privacy & Security, where the entry is called Audio Recording."
+            control={
+              <button
+                onClick={() => openAudioCaptureSettings()}
+                className="micro border border-hairline px-3 py-1.5 text-grey transition-colors hover:border-ink hover:bg-ink hover:text-surface"
+              >
+                OPEN
+              </button>
+            }
+          />
+        </Group>
+
+        {/* What this group is really for is telling somebody whose overviews
+            never appear *why*. The status is asked for live rather than cached,
+            because the answer changes while the app runs and the whole point is
+            that turning it on works without a restart. */}
+        <Group
+          title="APPLE INTELLIGENCE"
+          aside={
+            brain === null ? undefined : brain.available ? "ON" : "OFF"
+          }
+        >
+          <Row
+            label="Titles, overviews and Ask"
+            note="Notes are named, summarised and searchable by subject using Apple's model, which runs on this Mac. Nothing is uploaded and nothing is sent to us."
+            control={
+              <span className="micro text-faint">
+                {brain === null ? "…" : brain.available ? "WORKING" : "OFF"}
+              </span>
+            }
+          />
+
+          <div className="border-t border-hairline" />
+          <div className="px-4 py-3">
+            {/* The backend's own sentence, so a blocked Overview pane and this
+                panel can never disagree about why. */}
+            <p className="text-[11px] leading-relaxed text-grey">
+              {brain === null
+                ? "Checking…"
+                : brain.available
+                  ? "Everything works on this Mac. Recordings are transcribed, named and summarised here, and Ask answers from them without a network."
+                  : brain.message}
+            </p>
+
+            {brain && !brain.available && brain.reason === "apple-intelligence-off" && (
+              <ol className="mt-3 flex flex-col gap-1 text-[11px] leading-relaxed text-faint">
+                <li>1 — Open System Settings › Apple Intelligence &amp; Siri</li>
+                <li>2 — Turn on Apple Intelligence</li>
+                <li>3 — Come back; the first model download finishes on its own</li>
+              </ol>
+            )}
+          </div>
+
+          <div className="border-t border-hairline" />
+          <Row
+            label="Without it"
+            note="Recording, transcription, dictation, playback, editing and search all work exactly the same — they never touch this model. Notes keep the name they were saved under, overviews are skipped, and Ask finds the notes that match your question instead of answering it."
+            control={<span className="micro text-faint">STILL WORKS</span>}
+          />
+        </Group>
+
+        <Group title="GETTING STARTED">
+          <Row
+            label="Replay the walkthrough"
+            note="The short tour shown the first time the app opened — the dictation key, the permissions it needs, and how to record a meeting."
+            control={
+              <button
+                onClick={onReplayTutorial}
+                className="micro border border-hairline px-3 py-1.5 text-grey transition-colors hover:border-ink hover:bg-ink hover:text-surface"
+              >
+                SHOW
+              </button>
+            }
+          />
         </Group>
 
         <p className="micro pb-2 text-faint">

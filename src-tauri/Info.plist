@@ -11,5 +11,13 @@
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>VoiceDumps records audio from your microphone so it can transcribe it on this Mac. Nothing is uploaded.</string>
+  <!--
+    Meeting capture records the other side of a call — whatever the Mac is
+    playing — through a CoreAudio process tap. That is its own permission
+    category, separate from the microphone above, and it is only ever asked for
+    when someone starts recording a meeting.
+  -->
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>VoiceDumps records the audio your Mac is playing so it can transcribe the other side of a meeting on this Mac. Nothing is uploaded.</string>
 </dict>
 </plist>

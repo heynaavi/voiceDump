@@ -19,12 +19,19 @@ use tauri::Manager;
 pub struct Settings {
     /// Show the transcript in the overlay while the user is still speaking.
     ///
-    /// **Off by default.** The preview runs on `small` — a model chosen for
-    /// latency, not accuracy — and its output is thrown away the moment the real
-    /// pass lands. Watching a rough draft of your own sentence appear and then
-    /// silently change is worse than watching nothing: it invites you to correct
-    /// something that was never going to be pasted. Anyone who wants the
-    /// feedback can turn it on; nobody should be handed it unasked.
+    /// **On by default in the full build, off in the lite one** — the one
+    /// setting whose default is deliberately not the same in both, which is why
+    /// it hangs off the feature flag rather than off a constant.
+    ///
+    /// The preview runs on `small`, a model chosen for latency and not for
+    /// accuracy, and its output is thrown away the moment the real pass lands.
+    /// Handing that to someone unasked invites them to correct a sentence that
+    /// was never going to be pasted, so the lite build ships it off.
+    ///
+    /// The full build had it running unconditionally before this setting
+    /// existed. A new switch should explain what the app does, not quietly
+    /// withdraw it, so there the default is what was happening yesterday and
+    /// the row is the way to disagree.
     pub live_preview: bool,
 
     /// The microphone to record from, by name.
@@ -48,7 +55,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            live_preview: false,
+            live_preview: cfg!(feature = "assistant"),
             microphone: None,
             shortcut: crate::shortcut::DEFAULT.to_string(),
         }
@@ -173,17 +180,23 @@ pub fn set_shortcut(
 mod tests {
     use super::*;
 
-    /// The lite build ships the preview off: it runs on `small`, a model chosen
-    /// for latency and not accuracy, and its output is discarded the moment the
-    /// real pass lands. Handing that to someone unasked invites them to correct
-    /// a sentence that was never going to be pasted.
+    /// Every other default is shared, and that is the point — one tree, two
+    /// products. This one is not, so each build asserts its own concrete value
+    /// rather than restating the `cfg!` and proving nothing.
+    #[cfg(feature = "assistant")]
     #[test]
-    fn the_preview_starts_off() {
+    fn the_full_build_leaves_the_preview_on() {
+        assert!(Settings::default().live_preview);
+    }
+
+    #[cfg(not(feature = "assistant"))]
+    #[test]
+    fn the_lite_build_ships_the_preview_off() {
         assert!(!Settings::default().live_preview);
     }
 
     #[test]
-    fn dictation_starts_on_the_globe_key_and_the_system_input() {
+    fn both_builds_start_on_the_globe_key_and_the_system_input() {
         let d = Settings::default();
         assert_eq!(d.shortcut, crate::shortcut::DEFAULT);
         assert_eq!(d.microphone, None);

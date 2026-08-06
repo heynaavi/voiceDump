@@ -1,9 +1,9 @@
 @import "tailwindcss";
 
 /* ---------------------------------------------------------------------------
-   "Field Notes" — a print design system, adapted for a resizable app window.
+   QWEE Design System V2 — "Field Notes", adapted for a resizable app window.
 
-   It is a print system: fixed 960x540pt pages, absolute measurements. What
+   V2 is a print system: fixed 960x540pt pages, absolute measurements. What
    carries over verbatim is the *language* — forest & sage, two families only,
    square everything, the emphasis ladder, mono-as-data. What doesn't carry
    over is the fixed canvas, so sizes here are screen px on a fluid layout.

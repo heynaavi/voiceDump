@@ -10,7 +10,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-PY="${1:-python3}"
+PY="${1:-sidecar/.venv/bin/python}"
+[ -x "$PY" ] || PY=python3
 ICONS=src-tauri/icons
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

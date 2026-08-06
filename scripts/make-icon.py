@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render the app icon from the design system, rather than shipping a stock one.
 
-The default Tauri icon — a glossy teal/orange swirl — shares nothing with Field Notes
+The default Tauri icon — a glossy teal/orange swirl — shares nothing with QWEE
 V2: not the palette, not the geometry, not the idea. This draws the mark the app
 already uses for itself, `CLUSTERS.brand` from PixelCluster.tsx: a 3x3 grid with
 two cells knocked out, like a fragment of a QR code (§4.4, which replaces all

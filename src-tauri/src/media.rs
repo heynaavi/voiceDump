@@ -6,9 +6,9 @@
 //! 1. **Stability.** A dropped file gets moved, renamed or deleted and playback
 //!    silently breaks. The library copy is ours and outlives the original.
 //! 2. **Playability.** WKWebView decodes a narrow set of formats — notably *not*
-//!    Ogg Vorbis, Matroska or WebM, which is what plenty of recorders and chat
-//!    apps produce. Normalising to AAC means anything we ingest is playable by
-//!    the same `<audio>` element.
+//!    Ogg Opus, which is exactly what Discord voice notes are, nor Matroska or
+//!    WebM. Normalising to AAC means anything we ingest is playable by the same
+//!    `<audio>` element.
 //! 3. **Size.** Video is transcoded down to its audio track. A 200 MB screen
 //!    recording becomes a ~2 MB m4a, and nothing downstream ever wanted the
 //!    pixels.

@@ -10,9 +10,9 @@
 //! `flagsChanged` with the relevant mask set, so the usual global-shortcut APIs
 //! can't see them at all. The same tap is used to synthesise ⌘V.
 //!
-//! Requires Accessibility permission. macOS also needs
-//! System Settings → Keyboard → "Press 🌐 to:" set to "Do Nothing", or it will
-//! open the emoji picker underneath us.
+//! Requires Accessibility permission. If the chord is the globe key, macOS also
+//! needs System Settings → Keyboard → "Press 🌐 to:" set to "Do Nothing", or it
+//! will open the emoji picker underneath us.
 
 #![cfg(target_os = "macos")]
 
@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tauri::{Emitter, Manager};
-
 
 #[derive(Default)]
 pub struct DictationState {
@@ -39,15 +38,28 @@ pub struct DictationState {
 /// active full-screen Space, however it's configured (measured exhaustively). A
 /// standalone accessory `NSPanel` can, so the pill lives in this tiny process
 /// and we drive it over its stdin. Protocol: one command per line —
-/// `show`, `transcribing`, `level <0..1>`, `text <words>`, `hide`, `quit`.
+/// `show`, `transcribing`, `level <0..1>`, `text <partial>`, `hide`, `quit`.
 mod overlay {
     use std::io::Write;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, Command, Stdio};
     use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
     static PIPE: OnceLock<Mutex<Option<ChildStdin>>> = OnceLock::new();
     static CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+    /// Where the helper was found, so it can be started again without an
+    /// `AppHandle` — every caller below is deep inside the audio path.
+    static WHERE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    /// When we last tried to bring it back.
+    static TRIED: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+    /// How long to leave it alone after a failed start.
+    ///
+    /// The overlay is driven at audio rate — a `level` command per buffer — so a
+    /// helper that cannot start would otherwise mean a process spawn attempt
+    /// several times a second for as long as somebody holds the key down.
+    const BEFORE_TRYING_AGAIN: Duration = Duration::from_secs(3);
 
     fn pipe() -> &'static Mutex<Option<ChildStdin>> {
         PIPE.get_or_init(|| Mutex::new(None))
@@ -69,6 +81,7 @@ mod overlay {
     }
 
     pub fn spawn(path: &Path) {
+        *WHERE.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(path.to_path_buf());
         match Command::new(path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -84,12 +97,85 @@ mod overlay {
         }
     }
 
+    /// Write one command, and say whether it landed.
+    ///
+    /// Flushed rather than left in the buffer, because "did this reach the
+    /// helper" is the whole question and a buffered write cannot answer it.
+    fn write_line(cmd: &str) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+        let mut guard = pipe()
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other, "the overlay pipe is poisoned"))?;
+        let stdin = guard
+            .as_mut()
+            .ok_or_else(|| Error::new(ErrorKind::BrokenPipe, "no overlay helper"))?;
+        writeln!(stdin, "{cmd}")?;
+        stdin.flush()
+    }
+
+    /// Send a command, and bring the helper back if it has died.
+    ///
+    /// It was `let _ = writeln!(...)` — the failure discarded, once, with
+    /// nothing watching the process. When the helper went away for any reason
+    /// the app carried on exactly as before: the key still worked, the sound
+    /// still played, the words were still transcribed and saved, and the pill
+    /// simply never appeared again until a restart. A silent partial failure,
+    /// and the only symptom is a thing that does not happen.
+    ///
+    /// Seen for real: macOS killed all three helpers with
+    /// `SIGKILL (Code Signature Invalid)` when a second build replaced the
+    /// binaries under the running processes. That particular cause is a
+    /// development artifact, but a helper can die in the wild too, and nothing
+    /// here should depend on it never happening.
     fn send(cmd: &str) {
-        if let Ok(mut guard) = pipe().lock() {
-            if let Some(stdin) = guard.as_mut() {
-                let _ = writeln!(stdin, "{cmd}");
-                let _ = stdin.flush();
+        if write_line(cmd).is_ok() {
+            return;
+        }
+        if !revive() {
+            return;
+        }
+        // One retry. If the freshly started helper will not take a line either,
+        // the next command will try again after the cooldown.
+        let _ = write_line(cmd);
+    }
+
+    /// Start the helper again, unless we only just tried.
+    fn revive() -> bool {
+        let last = TRIED.get_or_init(|| Mutex::new(None));
+        let Ok(mut when) = last.lock() else {
+            return false;
+        };
+        if when.is_some_and(|at| at.elapsed() < BEFORE_TRYING_AGAIN) {
+            return false;
+        }
+        *when = Some(Instant::now());
+        drop(when);
+
+        // Reap the old one first. Without this the zombie accumulates, and on a
+        // helper that is merely wedged rather than dead we would end up with two
+        // panels on screen.
+        if let Some(held) = CHILD.get() {
+            if let Ok(mut slot) = held.lock() {
+                if let Some(mut child) = slot.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
+        }
+
+        let path = WHERE
+            .get()
+            .and_then(|w| w.lock().ok())
+            .and_then(|w| w.clone());
+        match path {
+            Some(path) if path.exists() => {
+                eprintln!("[dictation] overlay helper died — starting it again");
+                spawn(&path);
+                true
+            }
+            // Never located, or the binary has gone. Nothing to do but let
+            // dictation carry on without its pill.
+            _ => false,
         }
     }
 
@@ -174,11 +260,21 @@ mod overlay {
     }
 
     /// Ask the helper to quit, on app shutdown.
+    ///
+    /// The path is forgotten *first*. Otherwise a `quit` that arrives after the
+    /// helper has already gone looks exactly like the helper dying, and
+    /// [`revive`] would dutifully start a fresh one on the way out of the app.
     pub fn shutdown() {
+        if let Some(w) = WHERE.get() {
+            if let Ok(mut slot) = w.lock() {
+                *slot = None;
+            }
+        }
         send("quit");
         if let Some(m) = CHILD.get() {
             if let Some(mut child) = m.lock().unwrap().take() {
                 let _ = child.kill();
+                let _ = child.wait();
             }
         }
     }
@@ -248,8 +344,8 @@ pub fn stop_overlay() {
 /// ffmpeg's avfoundation input pays a ~2s AVCaptureSession warm-up on every
 /// open, which clips (or entirely swallows) short globe-key dictations. cpal
 /// opens in tens of milliseconds. We capture at the device's native rate and
-/// let the engine resample to 16 kHz, which it does for every input anyway, so
-/// there's no benefit to matching Whisper's rate here.
+/// let the sidecar resample to 16 kHz — it re-extracts every file with ffmpeg
+/// anyway, so there's no benefit to matching Whisper's rate here.
 ///
 /// The stream is built and torn down on its own thread because a cpal `Stream`
 /// isn't `Send`; it reports the finalized path back through a channel.
@@ -786,9 +882,8 @@ const SCRATCH_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 
 /// normalised copy, so nothing here races a live dictation — but every early
 /// return between "recording stopped" and "transcript inserted" leaks the file,
 /// and a crash mid-capture leaks a *growing* one. Left alone that is unbounded:
-/// one of these directories reached 4.6 GB, of which 4.57 GB was five captures
-/// orphaned by a killed recorder that had held the microphone open for ten
-/// hours apiece.
+/// this directory reached 4.6 GB, of which 4.57 GB was five captures orphaned by
+/// a killed recorder that had kept the microphone open for ten hours.
 ///
 /// Age is the whole test, deliberately. A successful capture is deleted
 /// synchronously, so anything still here after a day is abandoned by
@@ -866,16 +961,17 @@ fn start(app: &tauri::AppHandle) {
 
             // Load the model while the user is still talking, so releasing the
             // key feels instant instead of paying a cold load at the worst
-            // possible moment. On its own thread: the load blocks for half a
-            // second and this one is driving the event tap, so every keystroke
-            // on the machine would stall behind it.
+            // possible moment. On its own thread: the load blocks for a couple
+            // of seconds and this one is driving the event tap.
             let warming = app.clone();
             std::thread::spawn(move || crate::engine::warm(&warming));
 
-            // Live preview reads the same audio the recording is capturing, and
-            // is off unless asked for — see `settings::Settings::live_preview`.
+            // Live preview reads the same buffer the recording is filling. It
+            // needs the model, so it starts after the warm-up is requested and
+            // simply skips its turn while the engine is still busy loading.
             //
-            // When it is off the receiver is dropped rather than left sitting in
+            // It can now be turned off — see `settings::Settings::live_preview`.
+            // When it is, the receiver is dropped rather than left sitting in
             // the `Option`: the capture callback sends into that channel on
             // every buffer, and with nobody draining it a long dictation would
             // bank the entire recording a second time in memory. A closed
@@ -904,7 +1000,7 @@ fn stop(app: &tauri::AppHandle) {
     let cap = state.capture.lock().unwrap().take();
 
     // First thing, before anything slower: tell the preview to stop. It checks
-    // between passes, and a pass is a few seconds of audio rather than the
+    // between passes, and a pass is now a few seconds of audio rather than the
     // whole recording, so the final transcription waits at most one chunk.
     if let Some(c) = cap.as_ref() {
         c.preview_cancel.store(true, Ordering::Relaxed);
@@ -1154,9 +1250,9 @@ fn finish(app: &tauri::AppHandle, cap: Capture) -> Result<(), String> {
         result.get("peaks").cloned().unwrap_or(serde_json::Value::Null),
         "hotkey",
         crate::engine::Run::from_result(&result),
+        true,
     )?;
 
-    // Scratch capture; the library holds the normalised copy now.
     if let Some(name) = target {
         use tauri::Manager;
         let store = app.state::<crate::store::Store>();
@@ -1166,9 +1262,14 @@ fn finish(app: &tauri::AppHandle, cap: Capture) -> Result<(), String> {
         let _ = crate::store::set_app_name(&conn, &id, &name);
     }
 
+    // Scratch capture; the library holds the normalised copy now.
     let _ = std::fs::remove_file(&path);
 
-    let _ = app.emit("ingest-done", id);
+    // Its own event rather than `ingest-done`. Both save a note, but a dictation
+    // is something the user just did on purpose and a Discord voice message
+    // arriving in the background is not, and the window opens one and not the
+    // other.
+    let _ = app.emit("dictation-saved", id);
     Ok(())
 }
 
@@ -1205,8 +1306,8 @@ pub fn spawn(app: tauri::AppHandle) {
 
         eprintln!("[dictation] tap active");
 
-        // Debounce: flagsChanged fires on both press and release of the globe
-        // key, and we only want to act on one edge.
+        // Debounce: flagsChanged fires on both press and release of every
+        // modifier, and we only want to act on the edges of *our* chord.
         let was_down = Arc::new(AtomicBool::new(false));
 
         let handle = app.clone();
@@ -1214,7 +1315,8 @@ pub fn spawn(app: tauri::AppHandle) {
             CGEventTapLocation::Session,
             CGEventTapPlacement::HeadInsertEventTap,
             // Listen-only: we observe the chord, we don't swallow it. If we
-            // consumed events the whole keyboard would route through us.
+            // consumed events the whole keyboard would route through us — which
+            // is also why the chord may only be modifiers. See `shortcut`.
             CGEventTapOptions::ListenOnly,
             vec![CGEventType::FlagsChanged],
             move |_, _, event| {
@@ -1281,4 +1383,38 @@ pub fn open_accessibility_settings() {
     let _ = Command::new("open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
         .spawn();
+}
+
+#[cfg(test)]
+mod refine_tests {
+    use super::enqueue;
+    use std::collections::VecDeque;
+
+    fn ids(q: &VecDeque<(usize, Vec<f32>)>) -> Vec<usize> {
+        q.iter().map(|(i, _)| *i).collect()
+    }
+
+    /// The panel shows a tail. When `medium` cannot keep up, the chunk worth
+    /// giving up on is the one that has already scrolled past the reader — so
+    /// the queue drops from the front, and what survives is the most recent
+    /// speech, which is the only part a correction can still be seen on.
+    #[test]
+    fn the_backlog_gives_up_on_the_oldest_chunk() {
+        let mut q = VecDeque::new();
+        for i in 0..5 {
+            enqueue(&mut q, (i, vec![0.0; 4]), 2);
+        }
+        assert_eq!(ids(&q), vec![3, 4]);
+    }
+
+    /// Under the cap nothing is discarded, and the order is the order it was
+    /// said — a correction must not arrive before the one in front of it.
+    #[test]
+    fn an_unhurried_backlog_keeps_everything_in_order() {
+        let mut q = VecDeque::new();
+        enqueue(&mut q, (0, vec![]), 2);
+        enqueue(&mut q, (1, vec![]), 2);
+        assert_eq!(ids(&q), vec![0, 1]);
+        assert_eq!(q.pop_front().map(|(i, _)| i), Some(0));
+    }
 }

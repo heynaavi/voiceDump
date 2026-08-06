@@ -12,7 +12,7 @@
 // app's own Space Grotesk and JetBrains Mono are registered from the bundle, so
 // the exported page is set in the same faces as the screen.
 //
-// The design follows Field Notes but is not a screenshot of it: paper is not a
+// The design follows QWEE V2 but is not a screenshot of it: paper is not a
 // dark UI. Forest ink on white, one sage hairline, timestamps hung in the left
 // margin the way a transcript wants them. No logo, no cover, no banner — the
 // page is the transcript.

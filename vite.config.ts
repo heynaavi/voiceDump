@@ -11,8 +11,9 @@ export default defineConfig(async () => ({
   // Don't let Vite's screen-clear hide Rust compile errors.
   clearScreen: false,
   server: {
-    // Overridable so a second dev server can run alongside the first
-    // instead of fighting it for the port.
+    // Overridable so the lite build can run next to the full qwee build
+    // instead of fighting it for the port — testing the standalone app
+    // shouldn't mean taking the team's Slack assistant offline.
     // @ts-expect-error process is a nodejs global
     port: Number(process.env.VD_PORT) || 1420,
     strictPort: true,
@@ -20,9 +21,9 @@ export default defineConfig(async () => ({
     // @ts-expect-error process is a nodejs global
     hmr: host ? { protocol: "ws", host, port: (Number(process.env.VD_PORT) || 1420) + 1 } : undefined,
     watch: {
-      // Rust sources and build output are not the dev server's business, and
-      // `src-tauri/target` alone is large enough to make the watcher struggle.
-      ignored: ["**/src-tauri/**", "**/models/**"],
+      // `.claude/worktrees` holds full checkouts of this same project, so
+      // without this the dev server watches a second copy of its own source.
+      ignored: ["**/src-tauri/**", "**/sidecar/**", "**/.claude/**"],
     },
   },
 }));

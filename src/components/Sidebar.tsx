@@ -26,6 +26,8 @@ type Props = {
   namingIds: Set<string>;
   insightsOpen: boolean;
   onInsights: () => void;
+  askOpen: boolean;
+  onAsk: () => void;
   /** Null until the backend's copy lands; the row reads "—" until then. */
   settings: Settings | null;
   settingsOpen: boolean;
@@ -40,104 +42,61 @@ type Props = {
 const ORIGIN: Record<Origin, { mark: string; label: string }> = {
   file: { mark: "FL", label: "Dropped file" },
   mic: { mark: "MIC", label: "Recorded in app" },
+  discord: { mark: "DC", label: "From Discord" },
   hotkey: { mark: "FN", label: "Dictated with the globe key" },
+  meeting: { mark: "MTG", label: "Recorded meeting" },
 };
 
 const GROUP_ORDER = ["Today", "Yesterday", "This week", "This month", "Earlier"];
 
 /**
  * Sidebar tabs. Globe-key dictations are short, throwaway, and pile up fast, so
- * they get their own lane; everything longer — recordings and dropped files —
- * reads as a "note". `match` decides which sources land in each tab.
+ * they get their own lane; everything longer (recordings, dropped files,
+ * Discord) reads as a "note". `match` decides which sources land in each tab.
+ *
+ * Two of the four are labelled with the origin mark their own rows carry rather
+ * than with the word: the dictation lane is `FN` all the way down and the
+ * meetings lane is `MTG`, so the tab is saying what is under it in the same
+ * two or three letters. It reads as a legend for the column instead of a
+ * heading over it, and it is what makes four lanes fit a 270px rail — the words
+ * did not, and an icon would not either, for the reason written above `ORIGIN`.
+ *
+ * `ALL` and `NOTES` keep their words because neither is one origin: `ALL` is
+ * every mark at once and `NOTES` is whatever is left after the other two, so
+ * there is no badge that would be telling the truth. Both are short anyway,
+ * which is why the crowding was never coming from them.
  */
-type TabKey = "all" | "dictation" | "notes";
-const TABS: { key: TabKey; label: string; match: (s: Origin) => boolean }[] = [
-  { key: "all", label: "ALL", match: () => true },
-  { key: "dictation", label: "DICTATION", match: (s) => s === "hotkey" },
-  { key: "notes", label: "NOTES", match: (s) => s !== "hotkey" },
+type TabKey = "all" | "dictation" | "meetings" | "notes";
+const TABS: {
+  key: TabKey;
+  label: string;
+  /** Spelled out on hover, since a mark is only obvious once you have scrolled. */
+  title: string;
+  match: (s: Origin) => boolean;
+}[] = [
+  { key: "all", label: "ALL", title: "Everything", match: () => true },
+  {
+    key: "dictation",
+    label: ORIGIN.hotkey.mark,
+    title: ORIGIN.hotkey.label,
+    match: (s) => s === "hotkey",
+  },
+  {
+    key: "meetings",
+    label: ORIGIN.meeting.mark,
+    title: ORIGIN.meeting.label,
+    match: (s) => s === "meeting",
+  },
+  // Meetings have their own lane now, so they leave this one. What is left is
+  // what "note" always meant here: something you brought in or recorded alone.
+  {
+    key: "notes",
+    label: "NOTES",
+    title: "Dropped files and recordings",
+    match: (s) => s !== "hotkey" && s !== "meeting",
+  },
 ];
 
-/**
- * The version, and the only thing in the app that reaches the network.
- *
- * Click once to ask GitHub whether there's a newer release; click again, when
- * there is, to open its page. Nothing checks on its own — a transcription app
- * that phones home on launch is a different product, and the version sitting
- * quietly in the footer is worth more than a badge nagging about updates.
- *
- * The result is deliberately short-lived: after a check that finds nothing, the
- * strip goes back to the version rather than keeping a green tick around. A
- * permanent "up to date" is a claim about the future.
- */
-function Version() {
-  const [version, setVersion] = useState<string | null>(null);
-  const [state, setState] = useState<
-    { at: "idle" } | { at: "checking" } | { at: "current" } | { at: "new"; version: string } | { at: "failed"; why: string }
-  >({ at: "idle" });
-
-  useEffect(() => {
-    let cancelled = false;
-    appVersion()
-      .then((v) => !cancelled && setVersion(v))
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // "Nothing new" and failures both fade back to the version. An error that
-  // stays on screen forever reads as a broken app rather than a missed request.
-  useEffect(() => {
-    if (state.at !== "current" && state.at !== "failed") return;
-    const t = setTimeout(() => setState({ at: "idle" }), 4000);
-    return () => clearTimeout(t);
-  }, [state]);
-
-  const click = () => {
-    if (state.at === "new") {
-      openRelease(state.version).catch(() => {});
-      return;
-    }
-    if (state.at === "checking") return;
-    setState({ at: "checking" });
-    checkUpdate()
-      .then((u) =>
-        setState(u.newer ? { at: "new", version: u.latest } : { at: "current" }),
-      )
-      .catch((e) => setState({ at: "failed", why: String(e) }));
-  };
-
-  const label =
-    state.at === "checking"
-      ? "CHECKING…"
-      : state.at === "current"
-        ? "UP TO DATE"
-        : state.at === "new"
-          ? `${state.version} AVAILABLE`
-          : state.at === "failed"
-            ? "CHECK FAILED"
-            : `VOICEDUMP ${version ?? ""}`.trim();
-
-  return (
-    <button
-      onClick={click}
-      title={
-        state.at === "new"
-          ? `Version ${state.version} has been published. Opens the release page.`
-          : state.at === "failed"
-            ? state.why
-            : "Check GitHub for a newer version. Nothing about you is sent."
-      }
-      className={`diagnostic transition-colors hover:text-ink ${
-        state.at === "new" ? "text-sage-dim" : state.at === "failed" ? "text-amber" : ""
-      }`}
-    >
-      {label}
-    </button>
-  );
-}
-
-/** The sheet in front: a filled 3×3. */
 const SHEET = [true, true, true, true, true, true, true, true, true];
 /**
  * The sheet behind: its top row and right column only — the rest sits under the
@@ -251,6 +210,8 @@ export function Sidebar({
   namingIds,
   insightsOpen,
   onInsights,
+  askOpen,
+  onAsk,
   settings,
   settingsOpen,
   onSettings,
@@ -269,7 +230,7 @@ export function Sidebar({
 
   // Per-tab counts come off the full list so the numbers stay put as you switch.
   const counts = useMemo(() => {
-    const c: Record<TabKey, number> = { all: 0, dictation: 0, notes: 0 };
+    const c: Record<TabKey, number> = { all: 0, dictation: 0, meetings: 0, notes: 0 };
     for (const item of items)
       for (const t of TABS) if (t.match(item.source)) c[t.key]++;
     return c;
@@ -352,6 +313,22 @@ export function Sidebar({
           <span className="micro">INSIGHTS</span>
         </button>
 
+        {/* Ask sits above search on purpose. Search finds the note that
+            contains a word; this answers the question you actually had, and
+            when you know which note you want, search is still right there. */}
+        <button
+          onClick={onAsk}
+          aria-pressed={askOpen}
+          className={`mt-2 flex w-full items-center gap-2 border px-3 py-2 text-left transition-colors ${
+            askOpen
+              ? "border-sage-dim bg-sage-dim/15 text-ink"
+              : "border-hairline text-grey hover:border-sage-dim hover:text-ink"
+          }`}
+        >
+          <PixelCluster pattern={CLUSTERS.brand} size={3} />
+          <span className="micro">ASK YOUR NOTES</span>
+        </button>
+
         <label className="mt-3 flex items-center gap-2 border border-hairline bg-panel px-2.5 py-1.5 focus-within:border-sage-dim">
           <span className="text-faint">
             <PixelCluster pattern={CLUSTERS.search} size={2.5} />
@@ -369,21 +346,33 @@ export function Sidebar({
       {/* Tabs: separate the pile of quick globe-key dictations from real notes.
           Purely a client-side filter over the already-loaded list. */}
       <div className="flex items-stretch border-b border-hairline">
-        {TABS.map((t) => {
+        {/* MTG earns its place rather than holding it: someone who has never
+            recorded a call should not pay for the lane in width. It appears
+            with the first meeting and stays. */}
+        {TABS.filter((t) => t.key !== "meetings" || counts.meetings > 0).map((t) => {
           const on = t.key === tab;
           return (
             <button
               key={t.key}
               onClick={() => setTab(t.key)}
+              title={t.title}
               className={[
-                "micro flex flex-1 items-center justify-center gap-1.5 border-r border-hairline py-2 transition-colors last:border-r-0",
+                "micro flex flex-1 items-center justify-center gap-1.5 border-r border-hairline px-1 py-2 transition-colors last:border-r-0",
                 on
                   ? "bg-ink text-surface"
                   : "text-faint hover:bg-panel/60 hover:text-grey",
               ].join(" ")}
             >
               <span>{t.label}</span>
-              <span className={on ? "text-surface/60" : "text-faint/70"}>
+              {/* Tabular figures so the count does not resize the lane as it
+                  crosses 9 to 10 to 100 — four lanes sharing a rail this narrow
+                  visibly shuffle when one of them breathes. */}
+              <span
+                className={[
+                  "tabular-nums",
+                  on ? "text-surface/60" : "text-faint/70",
+                ].join(" ")}
+              >
                 {counts[t.key]}
               </span>
             </button>
@@ -529,12 +518,12 @@ export function Sidebar({
       >
         <span
           className={`diagnostic transition-colors group-hover:text-ink ${
-            settingsOpen ? "text-ink" : ""
+            settingsOpen ? "text-ink!" : ""
           }`}
         >
           SETTINGS
         </span>
-        {/* The keys as they are printed on the keyboard — fn, or ⌃⌥. */}
+        {/* The keys as they are printed on the keyboard — 🌐, or ⌃⌥. */}
         <span className="text-[11px] leading-none text-grey">
           {settings ? glyphs(settings.shortcut) : "—"}
         </span>
@@ -544,7 +533,7 @@ export function Sidebar({
           settings pane: it's a readout of the app's current state, which is
           exactly what this strip is for. */}
       <footer className="flex items-center justify-between gap-2 border-t border-hairline px-4 py-2">
-        <Version />
+        <VersionButton />
         <div className="flex items-center gap-3">
           <button
             onClick={toggle}
@@ -578,5 +567,144 @@ export function Sidebar({
         </div>
       </footer>
     </aside>
+  );
+}
+
+/**
+ * The version, which is also the update button.
+ *
+ * Three jobs in one control, because they are the same question asked at
+ * different moments: what am I running, is there anything newer, and take me
+ * to it. A separate "check for updates" item in a menu is the version of this
+ * that nobody ever clicks.
+ *
+ * **The daily check.** Someone who never clicks the version should still learn
+ * that a release exists, so this asks once a day on its own. Once a *day*, not
+ * once a launch: this app gets opened and closed all day long, and a check per
+ * launch would be a request every few minutes from anyone using it properly —
+ * indistinguishable from telemetry in a packet capture, which is exactly the
+ * accusation an app like this cannot afford. The last check is remembered in
+ * localStorage so quitting does not reset the clock.
+ *
+ * **What it does not do.** It does not install anything. See `update.rs` for
+ * why: swapping a running application for a binary fetched over HTTPS, trusted
+ * because the connection was encrypted, turns a local transcription app into an
+ * execution service for whoever holds the domain. Installing needs a signing
+ * key that never touches this repository, and until that exists this opens the
+ * release page and lets the user decide.
+ */
+function VersionButton() {
+  const [version, setVersion] = useState<string | null>(null);
+  const [state, setState] = useState<
+    | { at: "idle" }
+    | { at: "checking" }
+    | { at: "current" }
+    | { at: "new"; version: string }
+    | { at: "failed"; why: string }
+  >({ at: "idle" });
+
+  useEffect(() => {
+    let cancelled = false;
+    appVersion()
+      .then((v) => !cancelled && setVersion(v))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Where the last automatic check is remembered. Not a setting: there is
+  // nothing here for a user to configure, and a preference row for it would
+  // imply the app does more in the background than it does.
+  const LOOKED_AT = "voicedumps.update.lastCheck";
+  const A_DAY = 24 * 60 * 60 * 1000;
+
+  useEffect(() => {
+    let cancelled = false;
+    let last = 0;
+    try {
+      last = Number(localStorage.getItem(LOOKED_AT)) || 0;
+    } catch {
+      // Private browsing, a wiped profile, a string somebody edited. Treat an
+      // unreadable clock as "never checked" rather than skipping forever.
+    }
+    if (Date.now() - last < A_DAY) return;
+
+    // Written before the request, not after: a check that fails should not
+    // retry on every mount for the rest of the day.
+    try {
+      localStorage.setItem(LOOKED_AT, String(Date.now()));
+    } catch {
+      /* nothing to do — it will simply check again next launch */
+    }
+
+    checkUpdate()
+      .then((u) => {
+        // Silent unless there is something to say. An automatic check that
+        // announces "up to date" is a notification about nothing.
+        if (!cancelled && u.newer) setState({ at: "new", version: u.latest });
+      })
+      .catch(() => {
+        // No badge, no error. Nobody asked, so nobody is owed a failure.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // "Nothing new" and failures both fade back to the version. An error that
+  // stays on screen forever reads as a broken app rather than a missed request.
+  useEffect(() => {
+    if (state.at !== "current" && state.at !== "failed") return;
+    const t = setTimeout(() => setState({ at: "idle" }), 4000);
+    return () => clearTimeout(t);
+  }, [state]);
+
+  const click = () => {
+    if (state.at === "new") {
+      openRelease(state.version).catch(() => {});
+      return;
+    }
+    if (state.at === "checking") return;
+    setState({ at: "checking" });
+    checkUpdate()
+      .then((u) =>
+        setState(u.newer ? { at: "new", version: u.latest } : { at: "current" }),
+      )
+      .catch((e) => setState({ at: "failed", why: String(e) }));
+  };
+
+  const label =
+    state.at === "checking"
+      ? "CHECKING…"
+      : state.at === "current"
+        ? "UP TO DATE"
+        : state.at === "new"
+          ? `${state.version} AVAILABLE`
+          : state.at === "failed"
+            ? "CHECK FAILED"
+            : `KUPA ${version ?? ""}`.trim();
+
+  return (
+    <button
+      onClick={click}
+      title={
+        state.at === "new"
+          ? `Version ${state.version} has been published. Opens the release page.`
+          : state.at === "failed"
+            ? state.why
+            : "Check GitHub for a newer version. Nothing about you is sent."
+      }
+      className={`diagnostic flex items-center gap-1.5 transition-colors hover:text-ink ${
+        state.at === "new" ? "text-sage-dim" : state.at === "failed" ? "text-amber" : ""
+      }`}
+    >
+      {/* A dot only when there is something to act on. The strip is a readout,
+          and a permanent marker on it would stop meaning anything. */}
+      {state.at === "new" && (
+        <span className="h-[5px] w-[5px] shrink-0 bg-sage-dim" aria-hidden />
+      )}
+      <span>{label}</span>
+    </button>
   );
 }

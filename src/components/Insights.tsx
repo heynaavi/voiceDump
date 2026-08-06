@@ -3,10 +3,14 @@ import { save } from "@tauri-apps/plugin-dialog";
 import gsap from "gsap";
 
 import {
+  analyticsAssistant,
   analyticsSummary,
+  analyticsThemes,
   writeBinaryFile,
+  type AssistantInsights,
   type Count,
   type Insights as Data,
+  type Themes,
   type WordCount,
 } from "../lib/api";
 import { EASE, prefersReducedMotion } from "../lib/motion";
@@ -93,12 +97,11 @@ function Bars({
   if (!rows.length) {
     return <p className="micro text-faint">NOTHING RECORDED YET</p>;
   }
-  // The figures used to share one fixed-width cell, which could only ever be
-  // wrong in one direction or the other: sized to fit "51 notes · 4.9kw" it
-  // left "1 note · 11w" swimming, and `whitespace-nowrap` only traded wrapping
-  // for overflowing the box. They are columns now, each sized by the grid to
-  // its own widest row — nothing wraps, nothing overflows, the count and the
-  // word total line up down the panel, and the bar takes what is left.
+  // The figures used to live in one fixed-width cell, which meant a wide row
+  // ("51 notes · 4.9kw") wrapped onto a second line while a narrow one ("1
+  // note · 11w") left the cell half empty. They are columns now: the grid
+  // sizes each to its own widest row, so nothing wraps, the count and the word
+  // total line up down the panel, and the bar keeps whatever is left over.
   const counted = rows.some((r) => r.sub);
   return (
     <ul
@@ -176,27 +179,22 @@ function Heatmap({ days }: { days: Data["by_day"] }) {
     return `color-mix(in srgb, var(--color-sage-dim) ${step * 100}%, transparent)`;
   };
 
-  // Columns are sized by the panel rather than fixed at 11px. At a fixed size
-  // the grid drew a ~250px block into an 860px panel and left two-thirds of the
-  // row empty — the squares now grow to fill whatever width they are given, so
-  // the panel is the size of its contents in both directions.
   return (
-    <div
-      className="grid w-full gap-[3px]"
-      style={{
-        gridTemplateRows: "repeat(7, 1fr)",
-        gridAutoColumns: "1fr",
-        gridAutoFlow: "column",
-      }}
-    >
-      {weeks.flat().map((d) => (
-        <span
-          key={d.date}
-          title={d.words >= 0 ? `${d.date} — ${d.words} words` : undefined}
-          className="aspect-square w-full"
-          style={{ background: shade(d.words) }}
-        />
-      ))}
+    <div className="overflow-x-auto">
+      <div className="flex gap-[3px]">
+        {weeks.map((week, i) => (
+          <div key={i} className="flex flex-col gap-[3px]">
+            {week.map((d) => (
+              <span
+                key={d.date}
+                title={d.words >= 0 ? `${d.date} — ${d.words} words` : undefined}
+                className="h-[11px] w-[11px]"
+                style={{ background: shade(d.words) }}
+              />
+            ))}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -795,12 +793,38 @@ export function Insights() {
   const [data, setData] = useState<Data | null>(null);
   const [error, setError] = useState<string | null>(null);
   const sheet = useRef<HTMLDivElement>(null);
+  /** Null in the lite build, where the command does not exist. */
+  const [extra, setExtra] = useState<AssistantInsights | null>(null);
+  const [themes, setThemes] = useState<Themes | null>(null);
+  /** Separate from `themes` being null, which is also the "nothing to say" answer. */
+  const [themesDone, setThemesDone] = useState(false);
 
   useEffect(() => {
     analyticsSummary()
       .then(setData)
       .catch((e) => setError(String(e)));
+
+    // Absence is the expected case in the standalone build, not a failure, so
+    // this stays silent rather than reporting a missing command as an error.
+    analyticsAssistant()
+      .then(setExtra)
+      .catch(() => setExtra(null));
+
+    // Separate from the rest: this one may take a minute on a cache miss, and
+    // the numbers above should not wait behind a language model.
+    analyticsThemes()
+      .then(setThemes)
+      .catch(() => setThemes(null))
+      .finally(() => setThemesDone(true));
   }, []);
+
+  const reanalyse = () => {
+    setThemesDone(false);
+    analyticsThemes(true)
+      .then(setThemes)
+      .catch(() => setThemes(null))
+      .finally(() => setThemesDone(true));
+  };
 
   // The panels arrive in reading order once the numbers are in.
   //
@@ -951,6 +975,191 @@ export function Insights() {
           period={period(data.first_day, data.last_day)}
         />
         </div>
+
+        {(!themesDone || themes) && (
+          <Panel
+            title="WHAT YOU HAVE BEEN TALKING ABOUT"
+            aside={themes ? "READ BY THE AI" : undefined}
+          >
+            {!themesDone ? (
+              <p className="micro text-faint">READING YOUR NOTES…</p>
+            ) : (
+              themes && (
+                <>
+                  <ul className="space-y-2.5">
+                    {themes.themes.map((t) => (
+                      <li key={t.label}>
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-[14px] text-ink">{t.label}</span>
+                          <span className="h-1 flex-1 bg-hairline-soft">
+                            <span
+                              className="block h-1 bg-sage-dim"
+                              style={{ width: `${Math.round(t.share * 100)}%` }}
+                            />
+                          </span>
+                          <span className="mono-data text-[10px] text-faint">
+                            {Math.round(t.share * 100)}%
+                          </span>
+                        </div>
+                        {t.note && (
+                          <p className="mt-0.5 text-[12px] text-grey">{t.note}</p>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+
+                  {themes.sentiment.note && (
+                    <div className="mt-4 border-t border-hairline pt-3">
+                      <p className="eyebrow text-faint">
+                        TONE // {themes.sentiment.overall.toUpperCase()}
+                      </p>
+                      <p className="mt-1 text-[13px] text-ink">
+                        {themes.sentiment.note}
+                      </p>
+                    </div>
+                  )}
+
+                  {themes.observation && (
+                    <p className="mt-3 border-l-2 border-sage-dim pl-3 text-[13px] text-ink">
+                      {themes.observation}
+                    </p>
+                  )}
+
+                  <button
+                    onClick={reanalyse}
+                    className="micro mt-4 border border-hairline px-2.5 py-1 text-grey transition-colors hover:border-sage-dim hover:text-ink"
+                  >
+                    RE-READ
+                  </button>
+                </>
+              )
+            )}
+          </Panel>
+        )}
+
+        {extra && (
+          <>
+            <div className="flex items-center gap-3 pt-2">
+              <span className="eyebrow shrink-0 text-faint">TEAM &amp; INTELLIGENCE</span>
+              <span className="h-px flex-1 bg-hairline" />
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <Panel
+                title="VOICE NOTES FROM THE TEAM"
+                aside={
+                  extra.ingest_by_source.length
+                    ? `${extra.ingest_by_source.reduce((n, s) => n + s.notes, 0)} TOTAL`
+                    : undefined
+                }
+              >
+                <Bars rows={toRows(extra.ingest_by_source)} />
+              </Panel>
+
+              <Panel title="AI NAMING">
+                <Bars
+                  unit="notes"
+                  rows={[
+                    { label: "Named by AI", value: extra.ai_titled },
+                    { label: "Still generic", value: extra.ai_untitled },
+                  ]}
+                />
+              </Panel>
+
+              <Panel title="OVERVIEWS">
+                <Bars
+                  unit="notes"
+                  rows={[
+                    { label: "With an overview", value: extra.briefed },
+                    { label: "Without", value: extra.unbriefed },
+                  ]}
+                />
+                <p className="micro mt-3 text-faint">
+                  GENERATED ON REQUEST, NOT ON EVERY NOTE
+                </p>
+              </Panel>
+            </div>
+
+            <Panel
+              title="KNOWLEDGE BASE"
+              aside={`${extra.kb_total.toLocaleString()} MESSAGES // ${extra.kb_channels_backfilled} CHANNELS BACKFILLED`}
+            >
+              <Heatmap days={extra.kb_by_day} />
+              <div className="mt-4 grid gap-4 md:grid-cols-2">
+                <div>
+                  <p className="eyebrow mb-2 text-faint">BY CHANNEL</p>
+                  <Bars
+                    unit="msgs"
+                    rows={extra.kb_by_channel.map((t) => ({
+                      label: t.label,
+                      value: t.count,
+                    }))}
+                  />
+                </div>
+                <div>
+                  <p className="eyebrow mb-2 text-faint">BY PERSON</p>
+                  <Bars
+                    unit="msgs"
+                    rows={extra.kb_by_person.map((t) => ({
+                      label: t.label,
+                      value: t.count,
+                    }))}
+                  />
+                </div>
+              </div>
+            </Panel>
+
+            <Panel
+              title="MODEL &amp; COST"
+              aside={
+                extra.model_unmeasured > 0
+                  ? `${extra.model_unmeasured} NOTES PREDATE THE RECORD`
+                  : undefined
+              }
+            >
+              {extra.model_usage.length === 0 ? (
+                <p className="text-[13px] text-grey">
+                  Nothing has been transcribed since the app started keeping
+                  this record. The next note you dictate will fill it in.
+                </p>
+              ) : (
+                <>
+                  <Bars
+                    unit="notes"
+                    rows={extra.model_usage.map((m) => ({
+                      label: m.label,
+                      value: m.notes,
+                      // Speed against realtime, computed from the totals rather
+                      // than averaging per-note speeds — a handful of two-second
+                      // dictations would otherwise dominate an hour of audio.
+                      sub:
+                        m.millis > 0
+                          ? `${(m.seconds / (m.millis / 1000)).toFixed(1)}× realtime`
+                          : undefined,
+                    }))}
+                  />
+                  <p className="micro mt-3 text-faint">
+                    {hours(
+                      extra.model_usage.reduce((s, m) => s + m.seconds, 0),
+                    )}{" "}
+                    OF AUDIO TRANSCRIBED IN{" "}
+                    {hours(
+                      extra.model_usage.reduce((s, m) => s + m.millis, 0) / 1000,
+                    )}{" "}
+                    OF COMPUTE
+                  </p>
+                </>
+              )}
+              <p className="mt-3 text-[13px] leading-relaxed text-grey">
+                Speech runs on this Mac, so its only cost is the time above.
+                What does cost money — titles, overviews and the themes panel —
+                is not metered yet: the sidecar knows its token usage but does
+                not record it, so no dollar figure here would be measured rather
+                than guessed.
+              </p>
+            </Panel>
+          </>
+        )}
 
         <p className="micro pb-2 text-faint">
           COMPUTED ON THIS MAC FROM YOUR HISTORY // NOTHING IS UPLOADED

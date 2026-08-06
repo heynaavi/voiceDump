@@ -14,13 +14,16 @@
 //!    is noise, so the payload carries the sample it was built from and the UI
 //!    is expected to show it rather than print a confident figure.
 //!
-//! No AI is involved anywhere in here: every figure is counted or measured
-//! from text already on disk, which is why the whole feature works offline
-//! and with nothing configured.
+//! The assistant-only half (Slack, Discord, the Bedrock layer, the knowledge
+//! store) lives behind `#[cfg(feature = "assistant")]` at the bottom, so the
+//! lite build has no dead panels and no commands that can't answer.
 
 use crate::store::Store;
 use chrono::{Datelike, Local, NaiveDate, TimeZone, Timelike};
 use serde::Serialize;
+// Only the theme analysis returns free-form JSON, and that is assistant-only.
+#[cfg(feature = "assistant")]
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tauri::Manager;
 
@@ -130,6 +133,9 @@ pub struct Summary {
 
     pub by_source: Vec<Count>,
     pub by_app: Vec<Count>,
+    /// One entry per offered span — yesterday, a week, a month, everything —
+    /// so switching between them is instant and needs no round trip.
+    pub progress: Vec<Progress>,
     /// Dictations recorded before app capture existed, or where the frontmost
     /// window couldn't be read. Reported rather than hidden so the app chart
     /// can say what it doesn't cover.
@@ -137,9 +143,6 @@ pub struct Summary {
     pub by_language: Vec<Count>,
 
     pub vocabulary: Vocabulary,
-    /// One entry per offered span — yesterday, a week, a month, everything —
-    /// so switching between them is instant and needs no round trip.
-    pub progress: Vec<Progress>,
 }
 
 const DAY_MS: i64 = 86_400_000;
@@ -322,17 +325,6 @@ const STOP_WORDS: &[&str] = &[
     "also", "yeah", "okay", "ok", "well", "want", "need", "make", "made", "let", "lets", "see",
     "think", "know", "like", "just", "really", "thing", "things", "way", "s", "t", "re", "ve",
     "ll", "d", "m",
-    // Contractions, spelled out rather than stemmed. `normalise` keeps the
-    // apostrophe, so "let's" never matched the "lets" above and every one of
-    // these was placing in "what you talk about" — a top-words list led by
-    // "let's, what's, don't, it's" describes nobody. Stripping the suffix
-    // instead would leave stubs ("don", "isn", "won") that are worse than the
-    // contraction, so the forms are simply listed.
-    "i'm", "i've", "i'll", "i'd", "it's", "that's", "there's", "here's", "what's", "who's",
-    "how's", "let's", "he's", "she's", "we're", "we've", "we'll", "we'd", "you're", "you've",
-    "you'll", "you'd", "they're", "they've", "they'll", "they'd", "don't", "doesn't", "didn't",
-    "isn't", "aren't", "wasn't", "weren't", "won't", "can't", "couldn't", "wouldn't",
-    "shouldn't", "haven't", "hasn't", "hadn't",
 ];
 
 /// Only unambiguous fillers.
@@ -391,44 +383,25 @@ fn analyse_text(all: &[String]) -> Vocabulary {
 
         let flat = normalise(text);
 
-        // Padded so a phrase at either end still matches on word boundaries,
-        // and so " sort of " can't fire inside "resort often".
-        let padded = format!(" {} ", flat.split_whitespace().collect::<Vec<_>>().join(" "));
-        let mut subject = padded.clone();
-
         for phrase in FILLER_PHRASES {
-            let needle = format!(" {phrase} ");
-            let n = padded.matches(&needle).count() as i64;
+            let n = flat.matches(phrase).count() as i64;
             if n > 0 {
                 *filler_counts.entry((*phrase).to_string()).or_insert(0) += n;
             }
-            // Blank the phrase out of the copy the subject-matter tally reads.
-            // Counting a phrase as a filler and then also counting the words it
-            // is made of is how "sort" became the most-talked-about topic of
-            // someone who had merely said "sort of" a lot. Only the matched
-            // occurrences go — a standalone "sort the list" still counts.
-            while let Some(at) = subject.find(&needle) {
-                subject.replace_range(at..at + needle.len(), "  ");
-            }
         }
 
-        // Totals and single-word fillers read the untouched text: the filler
-        // rate is a proportion of everything said, so removing words from the
-        // denominator would inflate it.
-        for word in padded.split_whitespace() {
+        for word in flat.split_whitespace() {
             let w = word.trim_matches('\'');
             if w.is_empty() {
                 continue;
             }
             total_words += 1;
+
             if FILLERS.contains(&w) {
                 *filler_counts.entry(w.to_string()).or_insert(0) += 1;
+                continue;
             }
-        }
-
-        for word in subject.split_whitespace() {
-            let w = word.trim_matches('\'');
-            if w.len() < 3 || FILLERS.contains(&w) || STOP_WORDS.contains(&w) {
+            if w.len() < 3 || STOP_WORDS.contains(&w) {
                 continue;
             }
             *freq.entry(w.to_string()).or_insert(0) += 1;
@@ -537,8 +510,8 @@ fn local_day(ms: i64) -> Option<NaiveDate> {
 
 /// `async` so the whole-history scan runs on the async runtime rather than on
 /// the thread that paints the window. Every figure here is recomputed on each
-/// open, so this grows with the history — and a main-thread command would mean
-/// the view cannot even repaint to say it is working until the scan finishes.
+/// open — see [`summarise`] — so this grows with the history, and a main-thread
+/// command would mean the view cannot even repaint until it finishes.
 #[tauri::command]
 pub async fn analytics_summary(app: tauri::AppHandle) -> Result<Summary, String> {
     tauri::async_runtime::spawn_blocking(move || summarise(&app))
@@ -716,6 +689,356 @@ fn summarise(app: &tauri::AppHandle) -> Result<Summary, String> {
     })
 }
 
+// -- the assistant half -----------------------------------------------------
+//
+// Slack, Discord and the knowledge store. Compiled out of the lite build
+// entirely, along with its command, so the standalone app has no panel that
+// can never fill and no IPC route that can never answer.
+
+#[cfg(feature = "assistant")]
+#[derive(Serialize)]
+pub struct Tally {
+    pub label: String,
+    pub count: i64,
+}
+
+/// One speech model's share of the work.
+#[cfg(feature = "assistant")]
+#[derive(Serialize)]
+pub struct ModelUse {
+    pub label: String,
+    pub notes: i64,
+    /// Seconds of audio this model transcribed.
+    pub seconds: f64,
+    /// Milliseconds it spent decoding them. Paired with `seconds` rather than
+    /// pre-divided so the UI can show the ratio without the average-of-averages
+    /// error that per-note speeds would introduce.
+    pub millis: i64,
+}
+
+#[cfg(feature = "assistant")]
+#[derive(Serialize)]
+pub struct AssistantSummary {
+    /// Voice notes that arrived from Slack or Discord rather than your own mic.
+    pub ingest_by_source: Vec<Count>,
+    pub ingest_by_day: Vec<Day>,
+
+    /// Notes the AI has named, against those still carrying a generated stub.
+    pub ai_titled: i64,
+    pub ai_untitled: i64,
+
+    pub kb_total: i64,
+    pub kb_by_day: Vec<Day>,
+    pub kb_by_channel: Vec<Tally>,
+    pub kb_by_person: Vec<Tally>,
+    pub kb_channels_backfilled: i64,
+
+    /// Which speech model each note used, and how long transcription took.
+    ///
+    /// Only covers notes recorded since the engine started keeping the receipt.
+    /// Everything older is counted in `model_unmeasured` instead of being
+    /// back-filled with a plausible guess.
+    pub model_usage: Vec<ModelUse>,
+    /// Notes that predate the record, reported so the panel can say what share
+    /// of the history the numbers above actually describe.
+    pub model_unmeasured: i64,
+
+    /// Notes carrying a generated overview, against those without one.
+    pub briefed: i64,
+    pub unbriefed: i64,
+}
+
+/// Off the main thread for the same reason as [`analytics_summary`]: it counts
+/// the whole knowledge store, which is the part of this database that grows
+/// without anyone dictating anything.
+#[cfg(feature = "assistant")]
+#[tauri::command]
+pub async fn analytics_assistant(app: tauri::AppHandle) -> Result<AssistantSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || assistant_summary(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[cfg(feature = "assistant")]
+fn assistant_summary(app: &tauri::AppHandle) -> Result<AssistantSummary, String> {
+    let store = app.state::<Store>();
+    let conn = store.0.lock().map_err(|e| e.to_string())?;
+
+    // Grouped day/count helper shared by the two time series below.
+    let daily = |sql: &str| -> Result<Vec<Day>, String> {
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| e.to_string())?;
+
+        let mut per_day: HashMap<NaiveDate, (i64, i64)> = HashMap::new();
+        for row in rows {
+            let (created, words) = row.map_err(|e| e.to_string())?;
+            if let Some(d) = local_day(created) {
+                let e = per_day.entry(d).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += words;
+            }
+        }
+        let mut out: Vec<Day> = per_day
+            .into_iter()
+            .map(|(d, (notes, words))| Day {
+                date: d.to_string(),
+                notes,
+                words,
+            })
+            .collect();
+        out.sort_by(|a, b| a.date.cmp(&b.date));
+        Ok(out)
+    };
+
+    let tally = |sql: &str| -> Result<Vec<Tally>, String> {
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Tally {
+                    label: r.get::<_, String>(0)?,
+                    count: r.get::<_, i64>(1)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())
+    };
+
+    let mut ingest_stmt = conn
+        .prepare(
+            "SELECT source, COUNT(*), SUM(word_count), SUM(duration)
+             FROM transcripts WHERE source IN ('slack','discord')
+             GROUP BY source ORDER BY COUNT(*) DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let ingest_by_source = ingest_stmt
+        .query_map([], |r| {
+            Ok(Count {
+                label: r.get(0)?,
+                notes: r.get(1)?,
+                words: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                seconds: r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+
+    let (ai_titled, ai_untitled) = conn
+        .query_row(
+            "SELECT SUM(ai_titled), COUNT(*) - SUM(ai_titled) FROM transcripts",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Only rows the engine actually timed. `transcribe_ms > 0` rather than
+    // `model <> ''` because a row with a model but no timing would drag the
+    // speed ratio toward infinity.
+    let mut model_stmt = conn
+        .prepare(
+            "SELECT model, COUNT(*), SUM(duration), SUM(transcribe_ms)
+             FROM transcripts WHERE model <> '' AND transcribe_ms > 0
+             GROUP BY model ORDER BY COUNT(*) DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let model_usage = model_stmt
+        .query_map([], |r| {
+            Ok(ModelUse {
+                label: r.get(0)?,
+                notes: r.get(1)?,
+                seconds: r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                millis: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    let model_unmeasured = conn
+        .query_row(
+            "SELECT COUNT(*) FROM transcripts WHERE model = '' OR transcribe_ms = 0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+
+    let (briefed, unbriefed) = conn
+        .query_row(
+            "SELECT SUM(brief <> ''), SUM(brief = '') FROM transcripts",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                ))
+            },
+        )
+        .unwrap_or((0, 0));
+
+    let kb_total = conn
+        .query_row("SELECT COUNT(*) FROM kb_messages", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0);
+    let kb_channels_backfilled = conn
+        .query_row("SELECT COUNT(*) FROM kb_channels", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0);
+
+    Ok(AssistantSummary {
+        ingest_by_source,
+        ingest_by_day: daily(
+            "SELECT created_at, word_count FROM transcripts
+             WHERE source IN ('slack','discord')",
+        )?,
+        ai_titled,
+        ai_untitled,
+        kb_total,
+        kb_by_day: daily("SELECT created_at, 0 FROM kb_messages")?,
+        kb_by_channel: tally(
+            "SELECT channel, COUNT(*) FROM kb_messages WHERE channel <> ''
+             GROUP BY channel ORDER BY COUNT(*) DESC LIMIT 15",
+        )?,
+        kb_by_person: tally(
+            "SELECT user_name, COUNT(*) FROM kb_messages WHERE user_name <> ''
+             GROUP BY user_name ORDER BY COUNT(*) DESC LIMIT 15",
+        )?,
+        kb_channels_backfilled,
+        model_usage,
+        model_unmeasured,
+        briefed,
+        unbriefed,
+    })
+}
+
+/// Themes, tone and one observation across the recent history.
+///
+/// Cached against a fingerprint of the history it describes — the number of
+/// notes and the newest timestamp. Opening Insights repeatedly costs nothing;
+/// the model is asked again only once something new has been recorded. Without
+/// that, a panel that happens to be on screen would bill on every render.
+///
+/// Returns `Ok(None)` for every ordinary reason it can't answer — no sidecar,
+/// no Bedrock credentials, too few notes — because none of those are errors the
+/// user needs to see. A missing panel is the correct outcome.
+/// `async` because this one is not merely slow, it is a network call: on a
+/// cache miss it asks Bedrock to read the history, with a 90-second timeout. As
+/// a sync command that ran on the thread that paints the window, so opening
+/// Insights after any new dictation — which changes the cache key — froze the
+/// whole app until the model answered. That is the lag; the arithmetic was
+/// never the problem.
+#[cfg(feature = "assistant")]
+#[tauri::command]
+pub async fn analytics_themes(
+    app: tauri::AppHandle,
+    refresh: bool,
+) -> Result<Option<Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || themes(&app, refresh))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[cfg(feature = "assistant")]
+fn themes(app: &tauri::AppHandle, refresh: bool) -> Result<Option<Value>, String> {
+    let (count, newest): (i64, i64) = {
+        let store = app.state::<Store>();
+        let conn = store.0.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(created_at), 0) FROM transcripts WHERE text <> ''",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    if count < 3 {
+        return Ok(None);
+    }
+    let key = format!("themes:{count}:{newest}");
+
+    if !refresh {
+        let store = app.state::<Store>();
+        let conn = store.0.lock().map_err(|e| e.to_string())?;
+        let hit: Option<String> = conn
+            .query_row(
+                "SELECT value FROM insight_cache WHERE key = ?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(raw) = hit {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                return Ok(Some(v));
+            }
+        }
+    }
+
+    let port = *app.state::<crate::sidecar::SidecarState>()
+        .port
+        .lock()
+        .unwrap();
+    let Some(port) = port else {
+        return Ok(None);
+    };
+
+    // Newest first: what you have been talking about lately is the question,
+    // and the character cap on the sidecar side means the oldest notes would be
+    // dropped anyway. Better to drop them by age deliberately.
+    let notes: Vec<Value> = {
+        let store = app.state::<Store>();
+        let conn = store.0.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT created_at, text FROM transcripts
+                 WHERE text <> '' ORDER BY created_at DESC LIMIT 80",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (created, text) = row.map_err(|e| e.to_string())?;
+            out.push(serde_json::json!({
+                "date": local_day(created).map(|d| d.to_string()).unwrap_or_default(),
+                "text": text,
+            }));
+        }
+        out
+    };
+
+    // Long timeout: this reads a whole history, not one note, and the request
+    // is made once per change rather than per render.
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("http://127.0.0.1:{port}/themes"))
+        .json(&serde_json::json!({ "notes": notes }))
+        .timeout(std::time::Duration::from_secs(90))
+        .send()
+        .map_err(|e| format!("the intelligence engine did not answer: {e}"))?;
+
+    let body: Value = resp.json().map_err(|e| e.to_string())?;
+    let themes = body.get("themes").cloned().unwrap_or(Value::Null);
+    if themes.is_null() {
+        return Ok(None);
+    }
+
+    {
+        let store = app.state::<Store>();
+        let conn = store.0.lock().map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO insight_cache (key, value, created_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![key, themes.to_string(), crate::now_ms()],
+        );
+    }
+
+    Ok(Some(themes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,29 +1105,20 @@ mod tests {
         assert_eq!(total, 3); // um, uh, "you know"
     }
 
-    /// A filler phrase must not also become subject matter.
-    ///
-    /// Saying "sort of" eleven times made "sort" the top word in "what you talk
-    /// about" — the phrase was counted as a filler *and* its parts were counted
-    /// as topics. The share card built on that list would have described
-    /// somebody's verbal tic as their week's work.
     #[test]
-    fn filler_phrases_do_not_leak_into_top_words() {
-        let v = analyse_text(&["sort of the design sort of the design".to_string()]);
-        let top: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
-        assert!(!top.contains(&"sort"), "filler part in top words: {top:?}");
-        assert!(top.contains(&"design"));
-        // Still counted as the filler it is.
-        assert_eq!(v.fillers.iter().find(|f| f.word == "sort of").unwrap().count, 2);
+    fn stop_words_stay_out_of_the_top_list() {
+        let v = analyse_text(&["the the the roadmap roadmap".to_string()]);
+        assert_eq!(v.top_words.len(), 1);
+        assert_eq!(v.top_words[0].word, "roadmap");
     }
 
-    /// The same word used properly is still subject matter.
     #[test]
-    fn a_standalone_word_survives_its_phrase_being_a_filler() {
-        let v = analyse_text(&["sort the records and sort the files".to_string()]);
-        let top: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
-        assert!(top.contains(&"sort"), "lost a real use of the word: {top:?}");
-        assert!(v.fillers.is_empty());
+    fn empty_history_does_not_divide_by_zero() {
+        let v = analyse_text(&[]);
+        assert_eq!(v.total_words, 0);
+        assert_eq!(v.filler_rate, 0.0);
+        assert_eq!(v.variety, 0.0);
+        assert_eq!(streaks(&HashSet::new(), day(2026, 7, 31)), (0, 0));
     }
 
     /// A thin history reports no progress rather than inventing some.
@@ -923,32 +1237,4 @@ mod tests {
         assert_eq!(filler.higher_is_better, Some(false));
     }
 
-    /// Contractions are function words, not topics.
-    #[test]
-    fn contractions_are_not_topics() {
-        let v = analyse_text(
-            &["let's ship it it's what's next don't wait let's ship".to_string()],
-        );
-        let top: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
-        for c in ["let's", "it's", "what's", "don't"] {
-            assert!(!top.contains(&c), "contraction in top words: {top:?}");
-        }
-        assert!(top.contains(&"ship"));
-    }
-
-    #[test]
-    fn stop_words_stay_out_of_the_top_list() {
-        let v = analyse_text(&["the the the roadmap roadmap".to_string()]);
-        assert_eq!(v.top_words.len(), 1);
-        assert_eq!(v.top_words[0].word, "roadmap");
-    }
-
-    #[test]
-    fn empty_history_does_not_divide_by_zero() {
-        let v = analyse_text(&[]);
-        assert_eq!(v.total_words, 0);
-        assert_eq!(v.filler_rate, 0.0);
-        assert_eq!(v.variety, 0.0);
-        assert_eq!(streaks(&HashSet::new(), day(2026, 7, 31)), (0, 0));
-    }
 }

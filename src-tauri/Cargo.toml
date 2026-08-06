@@ -1,13 +1,22 @@
 [package]
 name = "voicedumps"
-version = "1.0.0"
-description = "Local speech to text for macOS"
+version = "1.1.0"
+description = "Local audio & video transcription"
 authors = ["Naveen"]
 edition = "2021"
 
 [lib]
 name = "voicedumps_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["assistant"]
+# The full qwee build: Slack + Discord ingest, calendar reminders, the team
+# knowledge store and the Bedrock-backed brain. Switch it off
+# (`--no-default-features`) and what's left is the standalone transcription app
+# — same dictation, recording, file drop, history and reading UI, no network
+# integrations and nothing to configure. One codebase, two products.
+assistant = ["dep:tungstenite"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -19,9 +28,23 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
-# Insights buckets notes by local calendar day, and std has no timezone. Doing
-# it in UTC would slide every evening dictation onto tomorrow for anyone west of
-# London and quietly break the streak count.
+# Discord ingest. rustls rather than native-tls so the bundle doesn't depend on
+# the system OpenSSL; blocking because the poller owns its own thread and async
+# would buy nothing here.
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "multipart",
+    "rustls-tls",
+] }
+# Slack Socket Mode is a websocket. tungstenite is the blocking client (the
+# ingest owns its own thread, same as the Discord poller); rustls to match
+# reqwest and avoid a system-OpenSSL dependency in the bundle.
+tungstenite = { version = "0.23", default-features = false, optional = true, features = [
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+# Local wall-clock time for the morning-sync scheduler (std has no timezone).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 whisper-rs = { version = "0.16", default-features = false, features = ["metal"] }
 symphonia = { version = "0.5", features = ["aac", "alac", "isomp4", "mp3"] }
@@ -40,7 +63,7 @@ objc2 = "0.6"
 # Native CoreAudio capture for globe-key dictation. ffmpeg's avfoundation input
 # pays a ~2s AVCaptureSession warm-up on every open, which silently clips (or
 # eats entirely) short dictations; an in-process cpal stream opens in tens of
-# milliseconds. hound writes the WAV the engine then transcribes.
+# milliseconds. hound writes the WAV the sidecar then transcribes.
 cpal = "0.15"
 hound = "3.5"
 

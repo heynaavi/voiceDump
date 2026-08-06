@@ -13,6 +13,20 @@ const ORDER = ["globe", "control", "option", "shift", "command"] as const;
 export type Key = (typeof ORDER)[number];
 
 /**
+ * What dictation is bound to until somebody changes it. Mirrors
+ * `shortcut::DEFAULT` in Rust, and lives here rather than at each call site
+ * because the name a key is *stored* as and the name it is *printed* as are
+ * different, and only this file knows both.
+ *
+ * The distinction has already cost one bug. A screen defaulted to `"fn"` —
+ * which is what [`GLYPH`] prints for this key, not what [`parse`] answers to —
+ * so `glyphs("fn")` returned an empty string and a heading rendered as "Hold
+ * and talk" with a hole where the key should be. Typed as `Key`, that line
+ * would not have compiled.
+ */
+export const DEFAULT_CHORD: Key = "globe";
+
+/**
  * What each key is printed as on the caps.
  *
  * The globe key is "fn" rather than 🌐 on purpose: the emoji is the only thing

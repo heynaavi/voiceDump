@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 
 type Props = {
-  /** Normalised 0..1 amplitude buckets from the engine. */
+  /** Normalised 0..1 amplitude buckets from the sidecar. */
   peaks: number[];
   /** Playback position as a fraction of the total, 0..1. */
   progress: number;

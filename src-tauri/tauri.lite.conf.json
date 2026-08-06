@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "VoiceDumps",
+  "identifier": "dev.heynaavi.voicedump",
+  "build": {
+    "beforeDevCommand": "npm run dev:vite:lite",
+    "devUrl": "http://localhost:1430"
+  },
+  "bundle": {
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "shortDescription": "Local speech to text",
+    "longDescription": "Transcribe audio and video, record from the microphone, and dictate anywhere with the globe key. Everything runs on your Mac \u2014 nothing is uploaded, and there is nothing to sign in to.",
+    "copyright": "Kupa",
+    "category": "Productivity"
+  }
+}
