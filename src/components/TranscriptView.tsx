@@ -26,9 +26,11 @@ import {
   generateBrief,
   namesInMeeting,
   setTranscriptPeaks,
+  transcribeAgain,
   watchBriefFailed,
   watchBriefProgress,
   watchBriefSaved,
+  watchRereading,
   writeTextFile,
 } from "../lib/api";
 import { reconcileWords } from "../lib/diff";
@@ -46,6 +48,8 @@ type Props = {
   onRenameSpeaker: (id: string, from: string, to: string) => Promise<void>;
   /** The AI is currently generating this note's title. */
   naming?: boolean;
+  /** Reload this note after its transcript has been read again and replaced. */
+  onReread: (id: string) => void;
 };
 
 /** How long the clicked word stays lit before the caret takes over. */
@@ -151,8 +155,16 @@ export function TranscriptView({
   onEdit,
   onRenameSpeaker,
   naming = false,
+  onReread,
 }: Props) {
   const [copied, setCopied] = useState(false);
+  /** How far a re-read has got, or null when none is running. Two states in
+   *  one: it is also what disables the button and what it says while it works. */
+  const [rereading, setRereading] = useState<{
+    stage: string;
+    progress: number;
+  } | null>(null);
+  const [rereadError, setRereadError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [title, setTitle] = useState(transcript.title);
@@ -232,6 +244,13 @@ export function TranscriptView({
         if (p.id !== id) return;
         setBriefStage(p);
         setBriefing(p.progress < 1);
+      }),
+      // A re-read is minutes long, so the button has to say where it is rather
+      // than just spin. Scoped to this note like everything else here: the
+      // reader can walk away to another transcript and come back to it.
+      watchRereading((p) => {
+        if (p.id !== id) return;
+        setRereading({ stage: p.stage, progress: p.progress });
       }),
       watchBriefSaved((p) => {
         if (p.id !== id) return;
@@ -1026,6 +1045,50 @@ export function TranscriptView({
     }
   };
 
+  /**
+   * Read the audio again and replace this note's words.
+   *
+   * Confirmed first, and not out of ceremony: it throws away a transcript the
+   * reader may have edited by hand, it takes as long as the recording is long,
+   * and for a meeting it costs the speaker labels — a saved meeting keeps one
+   * mixed track, so a second reading cannot tell the two sides apart again.
+   * All three of those are things a person would want to know *before* the
+   * minutes start, not after.
+   */
+  const readAgain = async () => {
+    const meeting = transcript.source === "meeting";
+    const ok = window.confirm(
+      [
+        "Read this recording again and replace the transcript?",
+        "",
+        `This takes about as long as the recording (${formatDuration(transcript.duration)}), and`,
+        "any edits made to the text will be lost. The overview is rewritten from",
+        "whatever comes back.",
+        ...(meeting
+          ? [
+              "",
+              "This is a meeting, and a saved meeting keeps one mixed recording —",
+              "so the words will come back but the You / Others labels will not.",
+            ]
+          : []),
+      ].join("\n"),
+    );
+    if (!ok) return;
+
+    setRereadError(null);
+    setRereading({ stage: "Starting", progress: 0 });
+    try {
+      await transcribeAgain(transcript.id);
+      onReread(transcript.id);
+    } catch (e) {
+      // Every failure path leaves the old transcript in place, and the sentence
+      // the backend sent says which one this was.
+      setRereadError(String(e));
+    } finally {
+      setRereading(null);
+    }
+  };
+
   const runBrief = async () => {
     setBriefing(true);
     setBriefError(null);
@@ -1129,22 +1192,64 @@ export function TranscriptView({
               can only ever apologise is worse than no tab. A note that already
               has a brief always keeps its tab — it was readable yesterday and
               nothing about the machine should take that away. */}
-          {(canBrief?.available ||
-            canBrief?.reason === "apple-intelligence-off" ||
-            canBrief?.reason === "model-not-ready" ||
-            brief) && (
-            <div className="reading-body no-drag flex items-center gap-px pb-2">
-              <PaneTab
-                label="AI OVERVIEW"
-                active={pane === "overview"}
-                onClick={() => setPane("overview")}
-              />
-              <PaneTab
-                label="TRANSCRIPT"
-                active={pane === "transcript"}
-                onClick={() => setPane("transcript")}
-              />
-            </div>
+          {/* The tabs come and go with what this Mac can do; the way to read a
+              recording again does not, so the row is here whether or not there
+              is an overview to switch to. */}
+          <div className="reading-body no-drag flex items-center gap-px pb-2">
+            {(canBrief?.available ||
+              canBrief?.reason === "apple-intelligence-off" ||
+              canBrief?.reason === "model-not-ready" ||
+              brief) && (
+              <>
+                <PaneTab
+                  label="AI OVERVIEW"
+                  active={pane === "overview"}
+                  onClick={() => setPane("overview")}
+                />
+                <PaneTab
+                  label="TRANSCRIPT"
+                  active={pane === "transcript"}
+                  onClick={() => setPane("transcript")}
+                />
+              </>
+            )}
+
+            {/* Quiet on purpose, and pushed away from the tabs.
+
+                This is the way out of a bad transcript, which means it is worth
+                finding and not worth reaching for by accident — the tabs are
+                pressed dozens of times a day and this maybe twice a year. So it
+                sits at the far end in hairline grey, and it asks before it
+                throws anything away. */}
+            <button
+              onClick={readAgain}
+              disabled={rereading !== null}
+              title={
+                rereading
+                  ? "Reading the recording again…"
+                  : "Read the recording again and replace this transcript"
+              }
+              aria-live="polite"
+              className="micro ml-auto border border-transparent px-2.5 py-1.5 text-faint transition-colors hover:border-hairline hover:text-ink disabled:cursor-default disabled:border-hairline disabled:text-sage-dim"
+            >
+              {rereading ? (
+                <span className="flex items-center gap-1.5">
+                  <PixelCluster pattern={CLUSTERS.brand} size={2.5} pulse />
+                  {rereading.stage.toUpperCase()}{" "}
+                  <span className="tabular-nums">
+                    {Math.round(rereading.progress * 100)}%
+                  </span>
+                </span>
+              ) : (
+                "TRANSCRIBE AGAIN"
+              )}
+            </button>
+          </div>
+
+          {rereadError && (
+            <p className="reading-body mono-data pb-2 text-[10px] uppercase tracking-[0.12em] text-amber">
+              {rereadError}
+            </p>
           )}
         </header>
 

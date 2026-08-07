@@ -48,6 +48,13 @@ said what without guessing at voices. No bot joins the meeting — Zoom, Meet,
 Teams and a phone on speaker all work the same way, because it is the audio
 that is captured, not the app.
 
+**And a way back if it gets one wrong.** Every recording keeps its own copy of
+the audio, so TRANSCRIBE AGAIN reads it a second time and replaces the words.
+Speech recognition does not fail loudly — it degrades, and the person who can
+tell is the one who was in the room. It asks first: a re-read discards any edits
+you made to the text, and a saved meeting keeps one mixed track, so the words
+come back but the You / Others labels do not.
+
 **Names, overviews and answers.** On macOS 26 with Apple Intelligence switched
 on, every recording gets a short real title, an overview with its key points and
 action items, and a note of the people and projects it was about. Then ASK YOUR

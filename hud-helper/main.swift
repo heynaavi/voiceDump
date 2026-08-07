@@ -823,10 +823,20 @@ private func makePanel(size: NSSize, radius: CGFloat, content: NSView) -> NSPane
     panel.level = .statusBar
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
     panel.hidesOnDeactivate = false
-    // Unlike the dictation pill, these are meant to be pressed. A
-    // non-activating panel takes the click without pulling the app in front of
-    // the call, which is the whole reason the buttons are out here.
-    panel.ignoresMouseEvents = false
+    // Inert until something is actually shown in it. See `slideIn`.
+    //
+    // Unlike the dictation pill, these cards are meant to be pressed, and the
+    // obvious way to write that is to set this once, here, and forget it. That
+    // was the bug: every panel is ordered onto the screen at launch and simply
+    // faded to nothing, and an `NSPanel` at alpha 0 is still there as far as
+    // hit-testing is concerned. Three invisible rectangles — 360×74, 52×92 and
+    // 380×240 — sat stacked at the bottom-left corner from the moment the app
+    // started, swallowing every click that landed in them. No meeting, no
+    // window, nothing on screen, and a dead patch of desktop.
+    //
+    // Alpha and mouse events now move together, so a panel can only take a
+    // click while it is something a person can see.
+    panel.ignoresMouseEvents = true
     panel.appearance = NSAppearance(named: .darkAqua)
     panel.contentView = blur
     panel.alphaValue = 0
@@ -899,9 +909,16 @@ private final class HUD {
             width: transcriptSize.width, height: transcriptSize.height)
     }
 
+    /// Bring a card in, and let it start taking clicks.
+    ///
+    /// Only the two cards with buttons are ever slid; the transcript readout is
+    /// faded by `fadeTranscript` and stays inert for its whole life, because
+    /// nothing in it is pressable and hovering it is answered by polling the
+    /// pointer's location rather than by receiving events.
     private func slideIn(_ panel: NSPanel, to frame: NSRect, from offscreen: NSRect) {
         panel.setFrame(offscreen, display: false)
         panel.alphaValue = 0
+        panel.ignoresMouseEvents = false
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.26
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -911,6 +928,14 @@ private final class HUD {
     }
 
     private func slideOut(_ panel: NSPanel, to offscreen: NSRect) {
+        // Before the guard, not after: a panel that is already invisible is
+        // exactly the one that must not be holding on to the pointer, and the
+        // guard's early return is the path a launched-but-unused app takes.
+        //
+        // "Offscreen" here is twenty-six points to the side, which is a slide,
+        // not an exit — a 380-point card parked that way is still 354 points of
+        // screen. Alpha is what hides these; this is what makes them harmless.
+        panel.ignoresMouseEvents = true
         guard panel.alphaValue > 0.01 else { return }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.2

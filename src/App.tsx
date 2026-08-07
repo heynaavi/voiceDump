@@ -16,9 +16,10 @@ import {
   watchDictationSaved,
   watchMeetingDetected,
   watchMeetingEnded,
-  watchFarSideSilent,
+  watchSideMissing,
   watchMeetingFailed,
   watchMeetingOfferClosed,
+  watchMeetingProgress,
   watchMeetingSaved,
   watchMeetingStarted,
   modelsStatus,
@@ -38,6 +39,7 @@ import {
   type IngestProgress,
   type JobState,
   type MeetingCapability,
+  type MeetingProgress,
   type ModelStatus,
   type Origin,
   type Paragraph,
@@ -149,6 +151,10 @@ export default function App() {
     "recording" | "finishing" | null
   >(null);
   const [meetingStartedAt, setMeetingStartedAt] = useState<number | null>(null);
+  /** How far the two transcriptions have got, once a meeting is stopping. */
+  const [meetingProgress, setMeetingProgress] = useState<MeetingProgress | null>(
+    null,
+  );
   /** A refused start or a failed save, shown where the button was. */
   const [meetingError, setMeetingError] = useState<string | null>(null);
   /** The first-run walkthrough. Read once at mount — a value that changed
@@ -279,6 +285,7 @@ export default function App() {
     } catch (e) {
       setMeetingPhase(null);
       setMeetingStartedAt(null);
+      setMeetingProgress(null);
       setMeetingError(e instanceof Error ? e.message : String(e));
     }
   }, []);
@@ -292,11 +299,29 @@ export default function App() {
         setMeetingError(null);
         setDetected(null);
         setMeetingStartedAt(startedMs);
+        setMeetingProgress(null);
         setMeetingPhase("recording");
+      }),
+      // The clock stops here, not in `stopMeeting`.
+      //
+      // A meeting can be stopped from the floating card, which this window
+      // never hears about — so ending one that way used to leave the bar
+      // reading RECORDING with the elapsed time still climbing for the whole
+      // transcription. On a fifty-minute call that is fifteen minutes of the
+      // app insisting it is still listening while it is in fact writing the
+      // note. The first progress report is the honest signal that capture is
+      // over, wherever the stop came from, and it is subscribed for the life of
+      // the window rather than from the moment the phase changes — the
+      // subscription is a promise, and the "Stopping" report does not wait for
+      // it to resolve.
+      watchMeetingProgress((p) => {
+        setMeetingProgress(p);
+        setMeetingPhase((phase) => (phase === "recording" ? "finishing" : phase));
       }),
       watchMeetingSaved(async (id) => {
         setMeetingPhase(null);
         setMeetingStartedAt(null);
+        setMeetingProgress(null);
         setPane(null);
         await refreshHistory("");
         setQuery("");
@@ -312,6 +337,7 @@ export default function App() {
       watchMeetingFailed((reason) => {
         setMeetingPhase(null);
         setMeetingStartedAt(null);
+        setMeetingProgress(null);
         setMeetingError(reason);
       }),
       // Not a failure — the meeting keeps recording your side — so the phase is
@@ -319,7 +345,7 @@ export default function App() {
       // because the alternative is what actually happened once: seventy-six
       // minutes recorded, one side captured, and nothing on screen about it
       // until the transcript came back two words long.
-      watchFarSideSilent(setMeetingError),
+      watchSideMissing(setMeetingError),
     ];
     return () => {
       subs.forEach((s) => s.then((un) => un()).catch(() => {}));
@@ -743,6 +769,13 @@ export default function App() {
             onEdit={editParagraphs}
             onRenameSpeaker={renameSpeaker}
             naming={namingIds.has(active.id)}
+            // The row in the sidebar carries the word count, and the note now
+            // says something different, so both have to be re-read from the
+            // store rather than patched from what we think changed.
+            onReread={(id) => {
+              void select(id);
+              void refreshHistory(query);
+            }}
           />
         ) : (
           <DropZone
@@ -762,14 +795,26 @@ export default function App() {
 
         {/* Outside the pane switch above: a call outlives whatever was being
             read when it started, and moving to another note must not look like
-            the recording stopped. */}
-        <MeetingBar
-          phase={meetingPhase}
-          startedAt={meetingStartedAt}
-          onStop={stopMeeting}
-          detected={detected}
-          onTakeNotes={startMeeting}
-        />
+            the recording stopped.
+
+            Bottom *right*, not bottom centre. A meeting runs for an hour, and
+            for that hour the card was parked in the middle of the pane — over
+            the reading column, on top of the dictation pill, in the way of the
+            one thing the window is for. The corner is the only edge with
+            nothing already in it: the transcript's own controls (COPY, EXPORT,
+            SOURCE, DELETE) live top-right, and the dictation pill is bottom
+            centre. Right-aligned so a wide card and a narrow one share an
+            edge instead of shuffling. */}
+        <div className="pointer-events-none absolute bottom-4 right-4 z-40 flex max-w-[calc(100%-2rem)] flex-col items-end gap-2">
+          <MeetingBar
+            phase={meetingPhase}
+            startedAt={meetingStartedAt}
+            progress={meetingProgress}
+            onStop={stopMeeting}
+            detected={detected}
+            onTakeNotes={startMeeting}
+          />
+        </div>
 
         {/* A drop anywhere in the window works, even while reading. */}
         {dragging && !job && active && (

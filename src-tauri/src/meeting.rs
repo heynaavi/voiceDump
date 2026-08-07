@@ -199,7 +199,7 @@ fn record_microphone(
     stop: &Arc<AtomicBool>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<Track, String> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::traits::{DeviceTrait, StreamTrait};
 
     // Every early return below has to reach `ready`, or `meeting_start` waits
     // out its timeout for an answer that already exists.
@@ -215,10 +215,15 @@ fn record_microphone(
         }};
     }
 
-    let host = cpal::default_host();
-    let device = announce!(host
-        .default_input_device()
-        .ok_or_else(|| "no microphone found".to_string()));
+    // The microphone the user picked, not whichever one macOS is pointing at.
+    // Dictation has always asked this way; meetings went straight to the system
+    // default, so somebody who chose their headset in Settings was recorded off
+    // the laptop lid for an hour without being told. The same call also decides
+    // which device a video call is using, and it is the one most likely to have
+    // been changed out from under us.
+    let device = announce!(crate::microphone::open(
+        crate::settings::microphone(app).as_deref()
+    ));
     let config = announce!(device
         .default_input_config()
         .map_err(|e| format!("could not read the microphone's format: {e}")));
@@ -530,7 +535,7 @@ fn watch_the_far_side(app: &tauri::AppHandle, alive: Arc<AtomicBool>, stop: Arc<
         }
 
         let _ = app.emit(
-            "meeting-far-side-silent",
+            "meeting-side-missing",
             "VoiceDumps isn't hearing the other side of this call. Switching your Mac's \
 sound output away from a Bluetooth device usually fixes it — your own microphone is \
 still recording.",
@@ -1603,7 +1608,7 @@ fn finish(app: tauri::AppHandle) -> Result<String, String> {
     // would turn half a meeting into none.
     if !theirs.carried_audio {
         let _ = app.emit(
-            "meeting-far-side-silent",
+            "meeting-side-missing",
             "Only your side of that meeting was recorded — VoiceDumps never received any \
 audio from the call. Switching your Mac's sound output away from a Bluetooth device \
 usually fixes it.",
@@ -1648,6 +1653,45 @@ usually fixes it.",
         .and_then(|r| r["segments"].as_array())
         .cloned()
         .unwrap_or(empty);
+
+    // A side that recorded sound and came back with no words at all.
+    //
+    // This is how a broken meeting looks from the inside, and until now it
+    // looked like nothing: every segment attributed to one speaker, no error,
+    // no warning, an hour of conversation saved as a monologue. The fifty-one
+    // minute call that prompted this came back with all one hundred and
+    // seventy-eight of its segments marked "Others" and not one word of the
+    // user's own side, and the first anyone knew was reading it.
+    //
+    // Whatever the cause — a muted microphone, an input device the call took
+    // for itself, a decode that fell over — a transcript that is missing half a
+    // conversation should say so at the moment it is saved, not leave someone
+    // to notice a month later that they are quoted nowhere in their own meeting.
+    for (segments, track, complaint) in [
+        (
+            &my_segments,
+            &mine,
+            "Nothing you said in that meeting could be made out, so the transcript is all \
+other people. If you were speaking, check which microphone VoiceDumps is listening to \
+in Settings — it may not be the one the call was using.",
+        ),
+        (
+            &their_segments,
+            &theirs,
+            "Nothing the other side said in that meeting could be made out, so the \
+transcript is all you. The call's audio reached VoiceDumps but arrived as something it \
+could not read as speech.",
+        ),
+    ] {
+        if segments.is_empty() && track.heard_anything {
+            // The recording is saved regardless, and saying so matters: this
+            // reads like a failure and the audio is still all there.
+            let _ = app.emit(
+                "meeting-side-missing",
+                format!("{complaint} The recording itself was kept."),
+            );
+        }
+    }
 
     let segments = interleave(&my_segments, &their_segments, offset_secs);
     let paragraphs = turns(&segments);

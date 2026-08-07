@@ -361,6 +361,65 @@ fn is_non_speech(s: &str) -> bool {
         && !s[1..s.len() - 1].contains('(')
 }
 
+/// How many identical segments in a row are still allowed to be speech.
+///
+/// Two is comfortably real: "Yeah. Yeah." is how people talk. Three of exactly
+/// the same string, with the same punctuation, whisper's own sentence splitter
+/// having decided three times that a sentence ended — that is a decoder that has
+/// stopped listening.
+const A_RUN_TOO_LONG_TO_BE_SPEECH: usize = 3;
+
+/// Throw away a decoder that got stuck on one phrase.
+///
+/// The cause of the stuck decoder is fixed — see [`decoding`] — but this is not
+/// a second attempt at that fix. It is the check that would have caught it, and
+/// caught it in the one place a person would ever see it. A fifty-one minute
+/// meeting saved with "Morning." fifty-three times, "Okay." twelve times, and
+/// one sentence about a centre frame eight times; a sixth of every word in that
+/// note was a phrase the model had latched onto. Nobody needed a root cause to
+/// know it was wrong, and nothing in the app said so.
+///
+/// So a run is cut to its first two and the rest goes. Two rather than one
+/// because two is a thing people say, and because the phrase was almost
+/// certainly said at least once — cutting to nothing would put a hole in the
+/// timeline exactly where somebody was speaking.
+fn collapse_repeats(segments: Vec<Value>) -> Vec<Value> {
+    /// Same words, ignoring case and punctuation — "Okay." and "okay!" are the
+    /// same latch, and a run that alternates between them is still a run.
+    fn key(segment: &Value) -> String {
+        segment["text"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    let mut out: Vec<Value> = Vec::with_capacity(segments.len());
+    let mut run = 0usize;
+    let mut previous = String::new();
+
+    for segment in segments {
+        let this = key(&segment);
+        // An empty key is punctuation or a stray mark, not a phrase being
+        // repeated; counting those as a run would merge unrelated fragments.
+        if !this.is_empty() && this == previous {
+            run += 1;
+        } else {
+            run = 1;
+            previous = this;
+        }
+        if run < A_RUN_TOO_LONG_TO_BE_SPEECH {
+            out.push(segment);
+        }
+    }
+    out
+}
+
 /// A live-preview session: one whisper state, reused for every pass.
 ///
 /// The state is the expensive part, not the context. `whisper_init_state`
@@ -946,16 +1005,7 @@ pub fn transcribe(
     let loaded = guard.as_ref().expect("model just loaded");
 
     report("Transcribing", 0.2);
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_translate(false);
-    params.set_token_timestamps(true);
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    // Leave a couple of cores for the UI and the rest of the machine.
-    params.set_n_threads((num_threads() as i32).max(1));
-
+    let params = decoding();
     // Which weights actually ran, which is not always `wanted`: `ensure_loaded`
     // keeps an already-resident model rather than paying a reload to honour a
     // preference that changed since.
@@ -1023,6 +1073,7 @@ pub fn transcribe(
     state.touch();
     drop(guard);
 
+    let segments = collapse_repeats(segments);
     let paragraphs = build_paragraphs(&segments);
     let text = paragraphs
         .iter()
@@ -1047,6 +1098,73 @@ fn num_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4)
+}
+
+/// How every finished transcript is decoded.
+///
+/// A named thing rather than a block inside [`transcribe`], because one of the
+/// lines below is the difference between an hour-long meeting and a blank page,
+/// and a setting that important should be somewhere it can be pointed at and
+/// tested rather than buried in the middle of a long function.
+fn decoding() -> FullParams<'static, 'static> {
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_translate(false);
+
+    // Decode every window on its own, with no memory of the last one.
+    //
+    // Whisper works in thirty-second windows and, by default, prepends what it
+    // decoded in one window to the next as a prompt. On a short dictation that
+    // costs nothing — there is only ever one window — and on a long recording
+    // it was the single worst thing in this file.
+    //
+    // The prompt is a suggestion the model takes seriously, so a bad window
+    // does not stay one window wide. Once a stretch decodes as nothing, the
+    // prompt says "nothing was said here", the next window agrees more easily,
+    // and the agreement compounds. It cannot recover on its own, because the
+    // evidence that would break the loop is the thing being suppressed.
+    //
+    // Measured on a fifty-one minute call whose audio is clean end to end
+    // (RMS 0.069 at the model's input, no clipping, no dropouts), decoded by
+    // the same weights with the same sampler on the same threads:
+    //
+    //     prompt carried:  0 words — "[Silence]" for all fifty-one minutes
+    //     prompt dropped:  ~6,300 words, spread evenly across every minute
+    //
+    // The zero is not a rounding of a bad result. That call opened with five
+    // minutes of nobody speaking and a mouse being clicked; the model correctly
+    // called it non-speech, and then never stopped calling it that. The two
+    // people said hello at 2:55 and were never heard from again. The same
+    // recording split into its two sides — which is what a meeting saves —
+    // degenerated the same way, into "Okay." and then "Morning." repeated to
+    // the end of the hour.
+    //
+    // It has to be this setting, and this one is easy to get wrong: `no_context`
+    // sounds like the answer and is not. That flag clears the carry-over
+    // *between calls*, once, on the way in; the prompt is then rebuilt window by
+    // window inside the same call, which is where the damage happens. Setting it
+    // and nothing else changes the result by zero words — measured, not assumed.
+    // What actually severs the chain is capping how many past tokens may be
+    // taken at zero.
+    //
+    // What it costs: a name or a piece of punctuation can now be spelled two
+    // ways either side of a thirty-second boundary, because nothing carries
+    // across. That is a real loss, and it is nowhere near the trade — a
+    // transcript with a seam in it is still a transcript.
+    params.set_n_max_text_ctx(0);
+    // Belt and braces, for the day this runs on a state that has decoded
+    // something before: nothing from a previous recording either.
+    params.set_no_context(true);
+
+    // Per-token times, which drive the word-by-word follow-along in the reading
+    // view.
+    params.set_token_timestamps(true);
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    // Leave a couple of cores for the UI and the rest of the machine.
+    params.set_n_threads((num_threads() as i32).max(1));
+    params
 }
 
 /// Peaks for a file we're not transcribing — used to backfill the waveform on
@@ -1284,6 +1402,167 @@ mod tests {
             .join(" ");
         eprintln!("TRANSCRIPT: {}", text.trim());
         assert!(!text.trim().is_empty(), "empty transcript");
+    }
+
+    /// A long recording has to keep producing words all the way to the end.
+    ///
+    /// The failure this exists for does not look like a crash and does not look
+    /// like a bad transcript. It looks like a *short* one: a fifty-one minute
+    /// call saved as a thousand words, ending in "Morning." forty times. Every
+    /// unit test in this file passed while that was happening, because nothing
+    /// here decoded anything longer than a sentence.
+    ///
+    /// So this runs the real settings, from [`decoding`], over a real recording,
+    /// and asserts the thing the bug broke: that the last few minutes carry as
+    /// much speech as the first few. Needs weights and an hour of somebody's
+    /// audio, neither of which belongs in a repository, so it is opt-in:
+    ///
+    /// ```text
+    /// TEST_LONG_AUDIO=/path/to/an-hour.wav VOICEDUMPS_MODEL_DIR=/path/to/models \
+    ///     cargo test --release -- --ignored --nocapture keeps_transcribing
+    /// ```
+    #[test]
+    #[ignore = "needs the weights and a recording several minutes long"]
+    fn a_long_recording_keeps_transcribing_to_the_end() {
+        let (Ok(audio), Ok(models)) = (
+            std::env::var("TEST_LONG_AUDIO"),
+            std::env::var("VOICEDUMPS_MODEL_DIR"),
+        ) else {
+            panic!("set TEST_LONG_AUDIO and VOICEDUMPS_MODEL_DIR");
+        };
+
+        let samples = decode_mono_16k(Path::new(&audio)).expect("decode");
+        let seconds = samples.len() as f64 / SAMPLE_RATE as f64;
+        // Ten minutes is roughly twenty windows, which is where the prompt
+        // chain starts to matter. Anything shorter still has to come back with
+        // words — that is the regression check for ordinary dictations — but
+        // the shape assertions below are not asked of it, because on four
+        // windows they would pass whatever happened.
+        let long_enough = seconds > 600.0;
+
+        let model = Path::new(&models).join(ModelSize::Medium.file_name());
+        let ctx = WhisperContext::new_with_params(
+            model.to_string_lossy().as_ref(),
+            WhisperContextParameters::default(),
+        )
+        .expect("load model");
+        let mut st = ctx.create_state().expect("state");
+        st.full(decoding(), &samples).expect("transcribe");
+
+        // What actually reached the model, and what it made of the opening.
+        // Printed always, because when this test fails the first question is
+        // which of the two was wrong — the audio or the decode — and rerunning
+        // it costs several minutes.
+        let energy = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+        eprintln!("fed the model {:.0}s at RMS {energy:.4}", seconds);
+        for i in 0..st.full_n_segments().min(8) {
+            let Some(seg) = st.get_segment(i) else { continue };
+            eprintln!(
+                "  {:>7.1}s {:?}",
+                seg.start_timestamp() as f64 / 100.0,
+                seg.to_str_lossy().unwrap_or_default()
+            );
+        }
+
+        // Words per minute of audio, in fifths — the shape of the decay, not
+        // just its total. A run that dies halfway still passes a word count.
+        let mut fifths = [0usize; 5];
+        for i in 0..st.full_n_segments() {
+            let Some(seg) = st.get_segment(i) else { continue };
+            let text = seg.to_str_lossy().unwrap_or_default().into_owned();
+            let text = text.trim();
+            if text.is_empty() || is_non_speech(text) {
+                continue;
+            }
+            let at = seg.start_timestamp() as f64 / 100.0;
+            let fifth = ((at / seconds) * 5.0).floor().clamp(0.0, 4.0) as usize;
+            fifths[fifth] += text.split_whitespace().count();
+        }
+        eprintln!("{:.0}s of audio, words per fifth: {fifths:?}", seconds);
+
+        let total: usize = fifths.iter().sum();
+        assert!(
+            total as f64 / (seconds / 60.0) > 40.0,
+            "{total} words in {:.0} minutes is not a transcript of a conversation",
+            seconds / 60.0
+        );
+        if !long_enough {
+            eprintln!("{seconds:.0}s is too short to say anything about decay");
+            return;
+        }
+        // The specific shape of the bug: a healthy start, then nothing. A tenth
+        // of the opening pace is far below any real quiet ending.
+        let opening = fifths[0].max(1);
+        for (n, words) in fifths.iter().enumerate().skip(1) {
+            assert!(
+                *words * 10 > opening,
+                "the {} fifth of the recording produced {words} words against \
+                 {opening} in the first — the decoder stopped hearing it",
+                ["", "second", "third", "fourth", "last"][n]
+            );
+        }
+    }
+
+    fn said(lines: &[&str]) -> Vec<Value> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, t)| json!({ "start": i as f64, "end": i as f64 + 1.0, "text": t }))
+            .collect()
+    }
+
+    fn spoken(segments: &[Value]) -> Vec<String> {
+        segments
+            .iter()
+            .map(|s| s["text"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// The run that ended the fifty-one minute meeting.
+    #[test]
+    fn a_decoder_stuck_on_one_word_is_cut_short() {
+        let stuck: Vec<&str> = std::iter::repeat_n("Morning.", 53).collect();
+        let kept = collapse_repeats(said(&stuck));
+        assert_eq!(spoken(&kept), ["Morning.", "Morning."]);
+    }
+
+    /// And the longer one, which is harder to spot because it reads like prose.
+    #[test]
+    fn a_whole_sentence_on_repeat_is_cut_too() {
+        let mut lines = vec!["I'll explain the script so that you can understand."];
+        lines.extend(std::iter::repeat_n(
+            "So I'm going to change it to the center frame.",
+            8,
+        ));
+        lines.push("And then as multiple people talk about it.");
+
+        let kept = spoken(&collapse_repeats(said(&lines)));
+        assert_eq!(kept.len(), 4, "{kept:?}");
+        assert_eq!(kept.first().map(String::as_str), Some(lines[0]));
+        assert_eq!(kept.last().map(String::as_str), Some("And then as multiple people talk about it."));
+    }
+
+    /// Saying a word twice is a thing people do, and it survives untouched.
+    #[test]
+    fn people_are_allowed_to_repeat_themselves() {
+        let real = ["Yeah.", "Yeah.", "No, no — the other one.", "Okay.", "Okay."];
+        let kept = collapse_repeats(said(&real));
+        assert_eq!(spoken(&kept), real);
+    }
+
+    /// A run is a run whatever the model does with capitals and full stops.
+    #[test]
+    fn punctuation_does_not_hide_a_run() {
+        let kept = collapse_repeats(said(&["Okay.", "okay", "Okay!", "Okay."]));
+        assert_eq!(spoken(&kept), ["Okay.", "okay"]);
+    }
+
+    /// The same phrase said again later, with a conversation in between, is not
+    /// a run — only consecutive segments count.
+    #[test]
+    fn a_phrase_that_comes_back_later_is_left_alone() {
+        let real = ["Right.", "Right.", "So where were we?", "Right.", "Right."];
+        assert_eq!(spoken(&collapse_repeats(said(&real))), real);
     }
 
     /// The markers that were reaching real transcripts.

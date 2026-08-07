@@ -230,6 +230,91 @@ fn archive_transcript_media(app: tauri::AppHandle, id: String) -> Result<String,
     Ok(stored)
 }
 
+/// Read a note's audio again and replace what it says.
+///
+/// The way out when a transcript is wrong. Speech recognition is not a thing
+/// that either works or doesn't — it degrades, and it degrades quietly, and the
+/// person who can tell is the one who was in the room. They had no move to make
+/// except delete the note and lose the recording with it.
+///
+/// The audio is the durable thing here. Every note keeps its own copy in the
+/// media library, so this costs nothing but the minutes the model takes.
+///
+/// One thing it cannot give back, and the window says so before asking: a
+/// meeting's two sides are mixed down to a single track when it is saved, so a
+/// re-read of a meeting comes back as one voice. The words return; who said
+/// them does not.
+#[tauri::command]
+async fn transcribe_again(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    // Minutes of decoding. Same reasoning as a meeting finishing: not on the
+    // thread that paints.
+    tauri::async_runtime::spawn_blocking(move || read_it_again(&app, &id))
+        .await
+        .map_err(|e| format!("the transcription could not be started: {e}"))?
+}
+
+fn read_it_again(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+    let audio = {
+        let store = app.state::<Store>();
+        let conn = store.0.lock().unwrap();
+        store::get(&conn, id).map_err(|e| e.to_string())?.meta.source_path
+    };
+    if audio.is_empty() || !std::path::Path::new(&audio).exists() {
+        return Err(
+            "The recording this note was made from is no longer on disk, so there is \
+nothing to read again."
+                .into(),
+        );
+    }
+
+    let announce = |stage: &str, fraction: f64| {
+        let _ = app.emit(
+            "retranscribe-progress",
+            serde_json::json!({ "id": id, "stage": stage, "progress": fraction }),
+        );
+    };
+
+    // Nothing is written until this returns. A failed re-read leaves the note
+    // exactly as it was, which matters more here than anywhere else in the app:
+    // the transcript being replaced is the only copy of it.
+    let result = engine::transcribe(app, &audio, |stage, fraction| announce(stage, fraction))?;
+
+    let text = result["text"].as_str().unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err("Reading that recording again produced no words at all, so the \
+existing transcript has been left alone."
+            .into());
+    }
+
+    {
+        let store = app.state::<Store>();
+        let conn = store.0.lock().unwrap();
+        store::replace_transcript(
+            &conn,
+            id,
+            text,
+            &result["paragraphs"],
+            &result["segments"],
+        )
+        .map_err(|e| e.to_string())?;
+        let run = engine::Run::from_result(&result);
+        if run.measured() {
+            let _ = store::set_engine_run(&conn, id, &run.model, run.millis);
+        }
+    }
+
+    // Said before the overview is written, because the overview takes its own
+    // tens of seconds and the transcript is already there to read.
+    announce("Done", 1.0);
+    let _ = app.emit("retranscribe-done", id);
+
+    // The old overview went with the old transcript. Writing the new one is
+    // best-effort — without Apple Intelligence there is nothing to write with,
+    // and a note with a transcript and no overview is a working note.
+    let _ = write_brief(app, id);
+    Ok(())
+}
+
 /// Open the Accessibility pane. macOS shows its permission prompt only once per
 /// binary, so the UI needs a way back to Settings after that.
 #[tauri::command]
@@ -1450,6 +1535,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         update_transcript,
         set_transcript_peaks,
         archive_transcript_media,
+        transcribe_again,
             export::export_pdf,
         open_accessibility_settings,
         settings::get_settings,
@@ -1506,6 +1592,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         update_transcript,
         set_transcript_peaks,
         archive_transcript_media,
+        transcribe_again,
             export::export_pdf,
         open_accessibility_settings,
         settings::get_settings,

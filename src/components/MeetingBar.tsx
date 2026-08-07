@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { watchMeetingLevels, watchMeetingProgress } from "../lib/api";
+import { watchMeetingLevels } from "../lib/api";
 import type { Detected, MeetingProgress } from "../lib/api";
 import { formatTimestamp } from "../lib/format";
 import { CLUSTERS, PixelCluster } from "./PixelCluster";
@@ -10,6 +10,16 @@ type Props = {
   phase: "recording" | "finishing" | null;
   /** `Date.now()` at the moment recording started, for the elapsed clock. */
   startedAt: number | null;
+  /**
+   * How far the two transcriptions have got, or null before the first report.
+   *
+   * Passed in rather than subscribed to here, because the event that carries it
+   * is also the event that decides the phase: a meeting stopped from the
+   * floating card is announced to this window only as progress, and something
+   * that only listened while `phase === "finishing"` would never hear the
+   * report that was supposed to set it.
+   */
+  progress: MeetingProgress | null;
   onStop: () => void;
   /** An app has the microphone open and we have not been told to shut up. */
   detected: Detected | null;
@@ -83,19 +93,24 @@ function Meter({ label, level }: { label: string; level: number }) {
 /**
  * The meeting readout: live while recording, then the two transcriptions.
  *
- * Rendered next to the dictation pill rather than inside the empty state,
- * because a call outlives whatever the user was reading when it started —
- * moving to another note must not look like the recording stopped.
+ * Rendered over the pane rather than inside the empty state, because a call
+ * outlives whatever the user was reading when it started — moving to another
+ * note must not look like the recording stopped.
+ *
+ * Where it floats is App's business, not this file's: the cards below lay out
+ * in flow and the corner they sit in is decided once, in one place, next to
+ * everything else that floats. They used to place themselves, which is how
+ * three of them ended up claiming the bottom centre.
  */
 export function MeetingBar({
   phase,
   startedAt,
+  progress,
   onStop,
   detected,
   onTakeNotes,
 }: Props) {
   const [elapsed, setElapsed] = useState(0);
-  const [progress, setProgress] = useState<MeetingProgress | null>(null);
   const you = useDecayingLevel("you");
   const others = useDecayingLevel("others");
 
@@ -107,21 +122,10 @@ export function MeetingBar({
     return () => clearInterval(timer);
   }, [phase, startedAt]);
 
-  useEffect(() => {
-    if (phase !== "finishing") {
-      setProgress(null);
-      return;
-    }
-    const sub = watchMeetingProgress(setProgress);
-    return () => {
-      sub.then((un) => un()).catch(() => {});
-    };
-  }, [phase]);
-
   // Nothing recording, but something is on the microphone: offer, once.
   if (phase === null && detected) {
     return (
-      <div className="pointer-events-none absolute bottom-4 left-1/2 z-40 w-[420px] -translate-x-1/2">
+      <div className="w-[420px] max-w-full">
         <div className="pointer-events-auto flex items-center gap-3 border border-ink bg-panel px-3 py-2.5 shadow-[0_8px_24px_rgba(0,0,0,0.2)]">
           <span className="text-sage-dim">
             <PixelCluster pattern={CLUSTERS.brand} size={5} gap={2} pulse />
@@ -152,7 +156,7 @@ export function MeetingBar({
   if (phase === "finishing") {
     const fraction = progress?.progress ?? 0;
     return (
-      <div className="pointer-events-none absolute bottom-4 left-1/2 z-40 w-[420px] -translate-x-1/2">
+      <div className="w-[420px] max-w-full">
         <div className="border border-ink bg-panel shadow-[0_8px_24px_rgba(0,0,0,0.2)]">
           <div className="flex items-center justify-between border-b border-hairline-soft px-3 py-1.5">
             <span className="micro text-ink">FINISHING MEETING</span>
@@ -186,7 +190,7 @@ export function MeetingBar({
   }
 
   return (
-    <div className="pointer-events-none absolute bottom-4 left-1/2 z-40 -translate-x-1/2">
+    <div>
       <div className="pointer-events-auto flex items-center gap-3 border border-ink bg-panel px-3 py-2 shadow-[0_8px_24px_rgba(0,0,0,0.2)]">
         <button
           onClick={onStop}

@@ -213,14 +213,44 @@ export function watchMeetingFailed(on: (reason: string) => void) {
 }
 
 /**
- * The call's audio is not reaching us, but the meeting is otherwise fine.
+ * One side of the call is missing, but the meeting is otherwise fine.
  *
- * Fires ten seconds in when the tap has produced nothing, and again at the end
- * if it never did. Not a failure: your own side is still being recorded, and
- * the problem is usually fixable without stopping the call.
+ * Three moments fire this: ten seconds in when the tap has produced nothing,
+ * again at the end if it never did, and at the end when a side recorded sound
+ * that transcribed to nothing at all. None of them is a failure — the other
+ * side is real and worth keeping — and the first is usually fixable without
+ * stopping the call, which is the whole reason it is said at ten seconds
+ * rather than at the save.
  */
-export function watchFarSideSilent(on: (reason: string) => void) {
-  return listen<string>("meeting-far-side-silent", (e) => on(e.payload));
+export function watchSideMissing(on: (reason: string) => void) {
+  return listen<string>("meeting-side-missing", (e) => on(e.payload));
+}
+
+/**
+ * Read a note's audio again and replace what it says.
+ *
+ * Resolves when the new transcript is saved. Rejects with a sentence worth
+ * showing, and on every failure path the existing transcript is untouched —
+ * nothing is written until the decode has produced words.
+ *
+ * A meeting comes back as one voice: the two sides are mixed to a single track
+ * when it is saved, so the words return but who said them does not. Worth
+ * saying before the click, not after.
+ */
+export async function transcribeAgain(id: string): Promise<void> {
+  return invoke("transcribe_again", { id });
+}
+
+/** How far a re-read has got. Same 0..1 contract as every other progress feed. */
+export type Rereading = { id: string; stage: string; progress: number };
+
+export function watchRereading(on: (p: Rereading) => void) {
+  return listen<Rereading>("retranscribe-progress", (e) => on(e.payload));
+}
+
+/** The new transcript is saved; the overview is still being written. */
+export function watchRereadDone(on: (id: string) => void) {
+  return listen<string>("retranscribe-done", (e) => on(e.payload));
 }
 
 export function watchMeetingLevels(on: (level: MeetingLevel) => void) {

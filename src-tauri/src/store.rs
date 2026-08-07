@@ -706,6 +706,37 @@ pub fn set_conversation(
     Ok(())
 }
 
+/// Replace everything a transcription produced, for a note read a second time.
+///
+/// Wider than [`update_text`], which is a person editing prose, and than
+/// [`set_conversation`], which only relabels who spoke. This is the whole
+/// result: new words, new turns, new segments — and the overview cleared,
+/// because an overview is a reading of a transcript that no longer exists and
+/// leaving it would have the note summarising something it does not say. The
+/// caller writes a fresh one immediately; if that fails, no overview is the
+/// honest state.
+///
+/// Untouched on purpose: the title (renaming a note out from under someone who
+/// named it would be worse than a stale one), when it was recorded, the audio,
+/// and the waveform — the recording did not change, only what we heard in it.
+pub fn replace_transcript(
+    conn: &Connection,
+    id: &str,
+    text: &str,
+    paragraphs: &serde_json::Value,
+    segments: &serde_json::Value,
+) -> rusqlite::Result<()> {
+    let word_count = text.split_whitespace().count() as i64;
+    conn.execute(
+        "UPDATE transcripts
+            SET text = ?2, paragraphs = ?3, segments = ?4, word_count = ?5,
+                brief = '', brief_text = ''
+          WHERE id = ?1",
+        params![id, text, paragraphs.to_string(), segments.to_string(), word_count],
+    )?;
+    Ok(())
+}
+
 pub fn set_media_path(
     conn: &Connection,
     id: &str,
