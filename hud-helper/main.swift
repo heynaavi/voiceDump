@@ -911,10 +911,13 @@ private final class HUD {
 
     /// Bring a card in, and let it start taking clicks.
     ///
-    /// Only the two cards with buttons are ever slid; the transcript readout is
-    /// faded by `fadeTranscript` and stays inert for its whole life, because
-    /// nothing in it is pressable and hovering it is answered by polling the
-    /// pointer's location rather than by receiving events.
+    /// The transcript readout is not slid — it fades, in `fadeTranscript`, which
+    /// has to do the same thing to `ignoresMouseEvents` for the same reason.
+    /// This used to say the transcript needed no clicks because nothing in it
+    /// was pressable. That was wrong: it draws the STOP button, which is the
+    /// only way to end a meeting from the HUD, and the claim cost that button
+    /// for a whole release. Any panel that becomes visible must become clickable
+    /// in the same breath.
     private func slideIn(_ panel: NSPanel, to frame: NSRect, from offscreen: NSRect) {
         panel.setFrame(offscreen, display: false)
         panel.alphaValue = 0
@@ -982,6 +985,16 @@ private final class HUD {
     }
 
     private func fadeTranscript(visible: Bool) {
+        // Before the guard on both paths, exactly as in `slideIn`/`slideOut`:
+        // hidden means inert, shown means clickable, and the STOP button inside
+        // depends on the second half of that.
+        //
+        // Setting it while hidden is not enough on its own — the panel is only
+        // ever *reached* while it is showing, because the pointer has to be over
+        // it to keep it open. But the guard below returns early whenever the
+        // alpha is already where it is going, and a card left inert on the way
+        // in would be a card whose button does nothing.
+        transcriptPanel.ignoresMouseEvents = !visible
         let wanted: CGFloat = visible ? 1 : 0
         guard abs(transcriptPanel.alphaValue - wanted) > 0.01 else { return }
         if visible {

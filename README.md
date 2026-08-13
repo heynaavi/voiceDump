@@ -40,7 +40,9 @@ mid-sentence.
 Then there is the other half: drop in audio or video and get a readable
 transcript with real timestamps, word-level follow-along during playback, inline
 editing that keeps the timings, full-text search across everything you have ever
-dictated, and export to typeset PDF, Markdown or plain text.
+dictated, and export to typeset PDF, Markdown or plain text — or to Markdown
+with a start and end time on every single word, for whatever you want to line up
+against the audio next.
 
 **Calls, both sides.** Start a recording and your microphone and whatever the
 Mac is playing are captured as two separate tracks, so the transcript knows who
@@ -121,6 +123,16 @@ Three honest footnotes, because the table is flattering enough without them:
 
 Audio decoding is 2 ms of the budget — `symphonia`, in-process, no `ffmpeg` in
 the transcription path at all.
+
+**Long recordings.** A dictation is seconds; a meeting is not, and the question
+that actually gets asked is where this stops working. Measured on the same
+laptop, `medium`, a **3 h 14 m** recording: **13 min 12 s** to transcribe —
+about 15× faster than listening to it — for 14,198 words, with the last fifth
+of the recording denser than the first. Memory holds flat for the whole decode
+rather than climbing as it goes. What scales with length is the audio itself,
+held as one buffer at **230 MB per hour**, on top of about 1.1 GB for the model
+and its decoder. Nothing here is a wall you would meet in a day's work; a
+recording long enough to matter would have to run most of a working day.
 
 ## How it compares
 

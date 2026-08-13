@@ -36,6 +36,7 @@ import {
 import { reconcileWords } from "../lib/diff";
 import { fileName, formatDuration, formatWhen } from "../lib/format";
 import { EASE, prefersReducedMotion } from "../lib/motion";
+import { placeWords, wordTimingsMarkdown } from "../lib/timings";
 import { AudioPlayer, type PlayerHandle } from "./AudioPlayer";
 import { CLUSTERS, PixelCluster } from "./PixelCluster";
 
@@ -62,67 +63,39 @@ const FLASH_MS = 420;
 const PLAYABLE = /\.(m4a|mp4|mp3|wav|aac|aiff|aif|caf|flac)$/i;
 const playableAudio = (path: string) => PLAYABLE.test(path);
 
-type Placed = { prefix: string; text: string; from: number; to: number };
-
 /**
- * Lay a paragraph's words back onto its own text.
+ * What EXPORT can write.
  *
- * The two are not in the same shape, and neither one can be spaced by rule:
- *
- * - Fresh from whisper, `words` are *BPE tokens*, not words. "graphify" arrives
- *   as `" graph"` + `"ify"`, and each token carries the whitespace that belongs
- *   in front of it — punctuation like `","` carries none.
- * - After an edit, `reconcileWords` splits the typed text on whitespace, so its
- *   tokens are bare words with no spacing encoded at all.
- *
- * Joining with a space is right for the second and wrong for the first, which
- * is what put a gap in the middle of "graph ify" and in front of every comma.
- * Concatenating raw is right for the first and wrong for the second. There is no
- * per-token test that separates them.
- *
- * So neither is used as the source of spacing: `text` is. Each token is found in
- * the paragraph's own text in order, and whatever sits between one token and the
- * next is emitted verbatim. The rendered characters are then `text`, exactly —
- * which is what COPY has always used, and why that button was already correct
- * while selecting the same words with a cursor was not.
- *
- * The offsets come back too, so search matches land on the right words instead
- * of being hunted for in a string nothing renders.
+ * A list on screen rather than the save dialog's format popup, which is where
+ * these used to live and where nobody found them — the button looked like it
+ * only made PDFs. It has to be a list here anyway now: two of these are
+ * Markdown, and the dialog can only tell formats apart by their extension.
  */
-function placeWords(text: string, words: { text: string }[]): Placed[] {
-  const out: Placed[] = [];
-  let at = 0;
-  for (const w of words) {
-    const token = w.text.trim();
-    // One entry per input word, always: `flatWords` and the highlight sets key
-    // words by their index in `p.words`, and a skipped token here would shift
-    // every following word onto the wrong timing.
-    if (!token) {
-      out.push({ prefix: "", text: "", from: at, to: at });
-      continue;
-    }
-    const found = text.indexOf(token, at);
-    if (found === -1) {
-      // Timings that no longer describe this text — a reconcile that dropped
-      // out of step. Keep the word clickable and readable rather than losing it.
-      out.push({
-        prefix: out.length ? " " : "",
-        text: token,
-        from: at,
-        to: at + token.length,
-      });
-      continue;
-    }
-    out.push({
-      prefix: text.slice(at, found),
-      text: token,
-      from: found,
-      to: found + token.length,
-    });
-    at = found + token.length;
-  }
-  return out;
-}
+type Format = {
+  key: "pdf" | "md" | "words" | "txt";
+  label: string;
+  /** What you get, in the fewest words that distinguish it from its neighbours. */
+  hint: string;
+  extension: string;
+  /** Names the format in the save dialog. */
+  filter: string;
+  /** Added to the file name, so two exports of one note don't collide. */
+  suffix?: string;
+};
+
+const FORMATS: Format[] = [
+  { key: "pdf", label: "PDF", hint: "typeset for reading", extension: "pdf", filter: "PDF" },
+  { key: "md", label: "MARKDOWN", hint: "headings and prose", extension: "md", filter: "Markdown" },
+  {
+    key: "words",
+    label: "WORD TIMINGS",
+    hint: "every word, in seconds",
+    extension: "md",
+    filter: "Markdown",
+    suffix: " word timings",
+  },
+  { key: "txt", label: "PLAIN TEXT", hint: "the words, nothing else", extension: "txt", filter: "Plain text" },
+];
 
 /** Type scale for the focused paragraph vs the rest, *while following audio*. */
 const FOCUS_SIZE = 19.5;
@@ -167,6 +140,10 @@ export function TranscriptView({
   const [rereadError, setRereadError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  /** Whether the format list under EXPORT is showing. */
+  const [choosing, setChoosing] = useState(false);
+  /** The list and its button, so a click on either doesn't count as "away". */
+  const formatList = useRef<HTMLDivElement>(null);
   const [title, setTitle] = useState(transcript.title);
   const [time, setTime] = useState(0);
   const [paragraphs, setParagraphs] = useState<Paragraph[]>([]);
@@ -999,21 +976,46 @@ export function TranscriptView({
       .filter(Boolean)
       .join(" · ");
 
-  const exportFile = async () => {
+  /**
+   * Close the format list on Escape, or on a click that lands anywhere else.
+   *
+   * `pointerdown` rather than `click`, and without swallowing the event: a
+   * click meant for something behind the list should close it *and* do what it
+   * was for, which is what a stray click on a menu you've changed your mind
+   * about is nearly always trying to do.
+   */
+  useEffect(() => {
+    if (!choosing) return;
+    const away = (e: PointerEvent) => {
+      if (!formatList.current?.contains(e.target as Node)) setChoosing(false);
+    };
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setChoosing(false);
+    };
+    document.addEventListener("pointerdown", away);
+    window.addEventListener("keydown", key);
+    return () => {
+      document.removeEventListener("pointerdown", away);
+      window.removeEventListener("keydown", key);
+    };
+  }, [choosing]);
+
+  const exportAs = async (format: Format) => {
+    setChoosing(false);
     const target = await save({
-      defaultPath: `${transcript.title}.pdf`,
-      filters: [
-        { name: "PDF", extensions: ["pdf"] },
-        { name: "Markdown", extensions: ["md"] },
-        { name: "Plain text", extensions: ["txt"] },
-      ],
+      defaultPath: `${transcript.title}${format.suffix ?? ""}.${format.extension}`,
+      filters: [{ name: format.filter, extensions: [format.extension] }],
     });
     if (!target) return;
 
     setExporting(true);
     setExportError(null);
     try {
-      if (target.endsWith(".pdf")) {
+      // What gets written is what was picked from the list, not what the file
+      // name ends in. It used to be sniffed from the extension, which cannot
+      // tell the two Markdown formats apart, and which quietly wrote the wrong
+      // thing if someone renamed the file in the dialog.
+      if (format.key === "pdf") {
         await exportPdf(target, {
           title: transcript.title,
           meta: dateline(),
@@ -1030,11 +1032,22 @@ export function TranscriptView({
         });
         return;
       }
-      const body = target.endsWith(".txt")
-        ? fullText()
-        : [`# ${transcript.title}`, "", `*${dateline()}*`, "", fullText()].join(
-            "\n",
-          );
+      const body =
+        format.key === "txt"
+          ? fullText()
+          : format.key === "words"
+            ? wordTimingsMarkdown({
+                title: transcript.title,
+                dateline: dateline(),
+                paragraphs,
+              })
+            : [
+                `# ${transcript.title}`,
+                "",
+                `*${dateline()}*`,
+                "",
+                fullText(),
+              ].join("\n");
       await writeTextFile(target, body);
     } catch (err) {
       // Saving is the one place a silent failure is unforgivable: the user
@@ -1164,10 +1177,42 @@ export function TranscriptView({
 
             <div className="no-drag flex shrink-0 items-center gap-px pt-1">
               <RailButton onClick={copyAll} label={copied ? "COPIED" : "COPY"} />
-              <RailButton
-                onClick={exportFile}
-                label={exporting ? "SAVING…" : "EXPORT"}
-              />
+              <div ref={formatList} className="relative">
+                <RailButton
+                  onClick={() => setChoosing((open) => !open)}
+                  label={exporting ? "SAVING…" : "EXPORT"}
+                />
+                {choosing && (
+                  <div className="absolute right-0 top-full z-30 mt-px w-[248px] border border-ink bg-panel shadow-[0_8px_24px_rgba(0,0,0,0.2)]">
+                    {FORMATS.map((format) => {
+                      // Word timings need words. Older notes were read before
+                      // whisper's token times were kept, and a file of empty
+                      // headings would look like the export broke.
+                      const off = format.key === "words" && !hasWords;
+                      return (
+                        <button
+                          key={format.key}
+                          disabled={off}
+                          onClick={() => exportAs(format)}
+                          className={[
+                            "group flex w-full items-baseline justify-between gap-3 border-b border-hairline-soft px-3 py-2 text-left last:border-b-0",
+                            off
+                              ? "cursor-default opacity-40"
+                              : "transition-colors hover:bg-ink hover:text-surface",
+                          ].join(" ")}
+                        >
+                          <span className="micro">{format.label}</span>
+                          {/* The hint has to lift off `faint` on hover too, or
+                              it disappears into the filled row behind it. */}
+                          <span className="text-[10px] text-faint group-hover:text-surface/75">
+                            {off ? "no word times" : format.hint}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
               <RailButton
                 onClick={() =>
                   // Prefer where the file came from; fall back to the archived

@@ -191,11 +191,39 @@ pub struct EngineState {
     /// Always locked *after* `inner`, everywhere, so the reaper and a running
     /// transcription can't deadlock against each other.
     last_use: Mutex<Option<std::time::Instant>>,
+    /// How many transcriptions are decoding right now.
+    ///
+    /// The slot's lock used to be what said "busy", because it was held for the
+    /// whole of a decode. It no longer is — see [`transcribe`] — so the reaper
+    /// needs its own way to tell a model nobody has touched for five minutes
+    /// from one that has been chewing through an hour of meeting for twenty.
+    /// Dropping the latter is safe but pointless: the decode carries on, and the
+    /// next dictation pays to load a second copy of weights already in memory.
+    running: std::sync::atomic::AtomicUsize,
 }
 
 struct Loaded {
     size: ModelSize,
     ctx: WhisperContext,
+}
+
+/// Counts one decode in and out again, whatever way it leaves.
+///
+/// A plain increment and decrement around `full()` would leak the count on the
+/// error path and pin the model in memory until quit.
+struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn enter(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        InFlight(counter)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl EngineState {
@@ -240,10 +268,18 @@ fn idle_timeout() -> Option<std::time::Duration> {
 /// for it is a sub-second utterance that is also the first one after an idle
 /// spell.
 ///
-/// Safety comes from taking the same lock `run` holds for the entire length of
-/// a transcription: the reaper simply blocks until the work is finished, so it
-/// can never drop a context out from under whisper. The idle check happens
-/// *after* the lock is acquired, so it can't act on a stale reading either.
+/// Safety no longer comes from the lock. A transcription used to hold `inner`
+/// for its whole length, so the reaper simply blocked until the work finished;
+/// now it hands the lock back as soon as it has a state, so that a second
+/// transcription can start. Two things replace it:
+///
+/// * A live `WhisperState` owns an `Arc` on the model, so clearing the slot
+///   cannot free weights something is still decoding with. The context outlives
+///   the slot for exactly as long as it has to.
+/// * `running` says whether anything is decoding, and the reaper leaves the
+///   model alone while it is. Not for safety — for sense. Collecting a model
+///   halfway through an hour of meeting only means the next dictation loads a
+///   second copy of what is already resident.
 pub fn start_idle_unload(app: tauri::AppHandle) {
     use tauri::Manager;
 
@@ -262,6 +298,12 @@ pub fn start_idle_unload(app: tauri::AppHandle) {
         std::thread::sleep(tick);
 
         let state = app.state::<EngineState>();
+        // Asked before the lock, because a decode no longer holds it: a busy
+        // model would otherwise look exactly like an abandoned one.
+        if state.running.load(Ordering::SeqCst) > 0 {
+            state.touch();
+            continue;
+        }
         let mut guard = state.inner.lock().unwrap();
         if guard.is_none() {
             continue;
@@ -654,6 +696,18 @@ impl Refine {
     pub fn start(app: &tauri::AppHandle) -> Refinable {
         use tauri::Manager;
         let state = app.state::<EngineState>();
+        // Not while a real transcription is decoding.
+        //
+        // This never used to be reachable: `transcribe` held the slot's lock for
+        // the whole of a decode, so the `try_lock` below simply failed. Now that
+        // it doesn't, a dictation started during an hour-long meeting would add
+        // a third heavy state — 530 MB of caches and compute buffers on
+        // `medium` — to buy a better *preview*. The pasted text is unaffected;
+        // it comes from the final pass. `NotYet` is already the word for "ask
+        // again in a moment", and a moment is all this is.
+        if state.running.load(Ordering::SeqCst) > 0 {
+            return Refinable::NotYet;
+        }
         let Ok(guard) = state.inner.try_lock() else {
             return Refinable::NotYet;
         };
@@ -1016,6 +1070,34 @@ pub fn transcribe(
         .create_state()
         .map_err(|e| format!("could not start the transcriber: {e}"))?;
 
+    // Hand the model back before decoding, so this is not the only thing in the
+    // app that can transcribe for the next twenty minutes.
+    //
+    // The lock used to be held all the way through `full`, which made every
+    // transcription in the app strictly one at a time. That is invisible for
+    // dictation — a sentence takes under a second — and unbearable for a
+    // meeting: an hour-long call transcribes both of its sides for tens of
+    // minutes, and for all of that time the dictation key did nothing, an
+    // uploaded file sat in the queue, and nothing said why.
+    //
+    // The weights are not copied to make this work. `create_state` is
+    // whisper.cpp's own answer to the same question: one set of weights, one
+    // set of KV caches and compute buffers per decode. On `medium` that is
+    // 539 MB held once against 530 MB per concurrent decode — so two at a time
+    // costs about 1.1 GB rather than the 2.1 GB a second loaded model would,
+    // and the second one is given back the moment it finishes. Proven, on this
+    // machine and under Metal, by `two_transcriptions_can_share_one_model`:
+    // both clips come back byte for byte what they decode to on their own.
+    //
+    // A live state holds an `Arc` on the context, so the model cannot be freed
+    // under it. That matters in two places now that the lock is released early:
+    // the reaper may clear the slot, and another thread may swap it for a
+    // different size. Both leave this decode's weights alive until it is done.
+    //
+    // `running` is what tells the reaper this is work rather than idleness.
+    drop(guard);
+    let _busy = InFlight::enter(&state.running);
+
     // Time the decode alone. Reading the file, loading weights and building
     // paragraphs all vary with things that have nothing to do with the model —
     // a cold load would make the same audio look three times slower on the
@@ -1069,9 +1151,9 @@ pub fn transcribe(
     }
     // Again on the way out: a long file can transcribe for minutes, and dating
     // the model's last use from when the job *started* would make an hour-long
-    // recording look idle the moment it finished.
+    // recording look idle the moment it finished. The slot's lock is long gone
+    // by here; this touches the clock, which has its own.
     state.touch();
-    drop(guard);
 
     let segments = collapse_repeats(segments);
     let paragraphs = build_paragraphs(&segments);
@@ -1503,6 +1585,93 @@ mod tests {
         }
     }
 
+    /// Two decodes at once, on one set of weights, and both come back right.
+    ///
+    /// This is the claim [`transcribe`] now rests on. It hands the model back
+    /// before decoding so that a dictation is not stuck behind an hour-long
+    /// meeting, which is only sound if whisper.cpp really does allow several
+    /// states to run against one context at the same time — and the app has
+    /// never actually done that. `Refine` comes closest and always runs while
+    /// nothing else is decoding.
+    ///
+    /// It is not enough for both to finish: a shared buffer would corrupt the
+    /// results rather than crash, and two threads decoding two different clips
+    /// would be very hard to tell from one decoding both. So each thread gets
+    /// its own audio and has to return its own words — the same words a solo
+    /// run of that clip returns, taken first, on the same weights.
+    ///
+    /// ```text
+    /// TEST_AUDIO=/path/a.wav TEST_AUDIO_TWO=/path/b.wav \
+    ///   VOICEDUMPS_MODEL_DIR=/path/to/models \
+    ///   cargo test --release -- --ignored --nocapture two_transcriptions
+    /// ```
+    #[test]
+    #[ignore = "needs the weights and two different recordings"]
+    fn two_transcriptions_can_share_one_model() {
+        let (Ok(first), Ok(second), Ok(models)) = (
+            std::env::var("TEST_AUDIO"),
+            std::env::var("TEST_AUDIO_TWO"),
+            std::env::var("VOICEDUMPS_MODEL_DIR"),
+        ) else {
+            panic!("set TEST_AUDIO, TEST_AUDIO_TWO and VOICEDUMPS_MODEL_DIR");
+        };
+
+        let clips: Vec<Vec<f32>> = [&first, &second]
+            .iter()
+            .map(|p| decode_mono_16k(Path::new(p)).expect("decode"))
+            .collect();
+
+        let model = Path::new(&models).join(ModelSize::Medium.file_name());
+        let ctx = Arc::new(
+            WhisperContext::new_with_params(
+                model.to_string_lossy().as_ref(),
+                WhisperContextParameters::default(),
+            )
+            .expect("load model"),
+        );
+
+        let read = |ctx: &WhisperContext, samples: &[f32]| -> String {
+            let mut st = ctx.create_state().expect("state");
+            st.full(decoding(), samples).expect("transcribe");
+            (0..st.full_n_segments())
+                .filter_map(|i| st.get_segment(i))
+                .filter_map(|s| s.to_str_lossy().ok().map(|c| c.trim().to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        // Alone first, so there is something to compare against that cannot
+        // itself be wrong for the reason under test.
+        let alone: Vec<String> = clips.iter().map(|c| read(&ctx, c)).collect();
+        for (i, text) in alone.iter().enumerate() {
+            assert!(!text.is_empty(), "clip {i} was empty even on its own");
+        }
+
+        let began = std::time::Instant::now();
+        let together: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = clips
+                .iter()
+                .map(|clip| {
+                    let ctx = Arc::clone(&ctx);
+                    scope.spawn(move || read(&ctx, clip))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("thread")).collect()
+        });
+        eprintln!("both together in {:?}", began.elapsed());
+
+        for (i, (solo, shared)) in alone.iter().zip(&together).enumerate() {
+            eprintln!("clip {i} alone:    {solo}");
+            eprintln!("clip {i} together: {shared}");
+            assert_eq!(
+                solo, shared,
+                "clip {i} decoded differently when it shared the model — the \
+                 states are not independent and `transcribe` must go back to \
+                 holding the lock across the decode"
+            );
+        }
+    }
+
     fn said(lines: &[&str]) -> Vec<Value> {
         lines
             .iter()
@@ -1638,6 +1807,44 @@ mod tests {
         state.touch();
         let fresh = state.last_use.lock().unwrap().map(|t| t.elapsed()).unwrap();
         assert!(fresh < timeout, "a just-used model must survive");
+    }
+
+    /// A decode in flight is not idleness, however stale the clock looks.
+    ///
+    /// The reaper used to get this for free: a transcription held the slot's
+    /// lock the whole way through, so the collection simply blocked. It doesn't
+    /// any more, and nothing touches the clock during the twenty minutes a long
+    /// meeting spends inside `full()` — so on the old rule the model would be
+    /// collected after five, and the next dictation would load a second copy of
+    /// weights that are still in memory and still in use.
+    #[test]
+    fn a_decode_in_flight_is_not_idle() {
+        use std::time::{Duration, Instant};
+
+        let state = EngineState::default();
+        // As stale as it ever gets: nothing has touched this in an hour.
+        *state.last_use.lock().unwrap() = Some(Instant::now() - Duration::from_secs(3600));
+        assert_eq!(state.running.load(Ordering::SeqCst), 0);
+
+        {
+            let _busy = InFlight::enter(&state.running);
+            assert_eq!(state.running.load(Ordering::SeqCst), 1);
+            {
+                // Two at once — a dictation started while a meeting transcribes,
+                // which is the whole point of the change. Both have to be
+                // counted, or the first to finish would declare the model idle
+                // while the second is still decoding with it.
+                let _also = InFlight::enter(&state.running);
+                assert_eq!(state.running.load(Ordering::SeqCst), 2);
+            }
+            assert_eq!(state.running.load(Ordering::SeqCst), 1);
+        }
+
+        assert_eq!(
+            state.running.load(Ordering::SeqCst),
+            0,
+            "the count must come back down however the decode left"
+        );
     }
 
     /// The reaper drops a real model from a background thread.
