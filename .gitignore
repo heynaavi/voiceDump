@@ -58,3 +58,10 @@ brain-helper/voicedumps-brain
 *.db-shm
 *.sqlite
 *.sqlite3
+
+# Speaker diarizer: a prebuilt binary and the ONNX runtime it loads, fetched by
+#   node scripts/fetch-diarizer.mjs
+# Downloaded rather than compiled — sherpa-onnx is a large C++ project and
+# building it from source would put an hour between a clean checkout and a
+# running app. Never committed, for the same reason the Swift helpers are not.
+diarize-helper/

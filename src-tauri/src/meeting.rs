@@ -906,7 +906,7 @@ fn interleave(mine: &[Value], theirs: &[Value], offset_secs: f64) -> Vec<Value> 
 /// This is what makes a meeting readable. Whisper's segments are breath-length,
 /// so rendering them one per line turns a two-minute answer into forty ragged
 /// fragments; a turn is the unit a person actually remembers.
-fn turns(segments: &[Value]) -> Vec<Value> {
+pub fn turns(segments: &[Value]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for segment in segments {
         let speaker = segment["speaker"].as_str().unwrap_or(LABEL_YOU);
@@ -967,7 +967,7 @@ fn turns(segments: &[Value]) -> Vec<Value> {
 /// this string is what the overview reads. A rename that relabelled the turns on
 /// screen but not this would leave the next overview attributing decisions to a
 /// name nobody can see any more.
-fn transcript_text(paragraphs: &[Value]) -> String {
+pub fn transcript_text(paragraphs: &[Value]) -> String {
     paragraphs
         .iter()
         .map(|turn| {

@@ -26,6 +26,7 @@ import {
   renameSpeaker as apiRenameSpeaker,
   renameTranscript,
   saveTranscript,
+  setDiarization,
   setLivePreview,
   setMicrophone,
   setShortcut,
@@ -359,6 +360,15 @@ export default function App() {
     setSettings((s) => (s ? { ...s, live_preview: enabled } : s));
     setLivePreview(enabled).then(setSettings).catch(() => {
       setSettings((s) => (s ? { ...s, live_preview: !enabled } : s));
+    });
+  }, []);
+
+  const applyDiarization = useCallback((enabled: boolean) => {
+    // Optimistic, then reconciled — same as the preview switch above. A toggle
+    // that waits on the disk feels broken even when it works.
+    setSettings((s) => (s ? { ...s, diarization: enabled } : s));
+    setDiarization(enabled).then(setSettings).catch(() => {
+      setSettings((s) => (s ? { ...s, diarization: !enabled } : s));
     });
   }, []);
 
@@ -737,6 +747,7 @@ export default function App() {
           <Settings
             settings={settings}
             onLivePreview={applyLivePreview}
+            onDiarization={applyDiarization}
             onMicrophone={applyMicrophone}
             onShortcut={applyShortcut}
             meeting={meeting}
@@ -768,6 +779,7 @@ export default function App() {
             onDelete={remove}
             onEdit={editParagraphs}
             onRenameSpeaker={renameSpeaker}
+            canFindSpeakers={settings?.diarization ?? false}
             naming={namingIds.has(active.id)}
             // The row in the sidebar carries the word count, and the note now
             // says something different, so both have to be re-read from the

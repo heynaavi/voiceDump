@@ -1,15 +1,15 @@
 {
   "name": "voicedumps",
   "private": true,
-  "version": "1.1.2",
+  "version": "1.1.3",
   "type": "module",
   "scripts": {
-    "dev": "node scripts/build-overlay.mjs && node scripts/build-capture.mjs && node scripts/build-hud.mjs && node scripts/build-brain.mjs && node scripts/free-port.mjs 1420 && vite",
-    "build": "node scripts/build-overlay.mjs && node scripts/build-capture.mjs && node scripts/build-hud.mjs && node scripts/build-brain.mjs && tsc && vite build",
+    "dev": "node scripts/build-overlay.mjs && node scripts/build-capture.mjs && node scripts/build-hud.mjs && node scripts/build-brain.mjs && node scripts/fetch-diarizer.mjs && node scripts/free-port.mjs 1420 && vite",
+    "build": "node scripts/build-overlay.mjs && node scripts/build-capture.mjs && node scripts/build-hud.mjs && node scripts/build-brain.mjs && node scripts/fetch-diarizer.mjs && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "//": "Two products, one codebase. `VoiceDumps-qwee` is the full internal build (Slack, Discord, calendar, Bedrock); `VoiceDumps` is the public one, which drops the `assistant` Cargo feature and keeps transcription, dictation, recording, history and the reading UI \u2014 nothing to configure, nothing to sign in to. Names differ, identifiers are load-bearing: macOS keys each app's data directory off `identifier`, so changing `ai.qwee.voicedumps` or `dev.heynaavi.voicedump` orphans an existing install's database, ledger and knowledge store. Rename the product freely; never the identifier. (tauri.conf.json rejects unknown keys, so this note cannot live next to them.)",
-    "dev:vite:lite": "node scripts/build-overlay.mjs && node scripts/build-capture.mjs && node scripts/build-hud.mjs && node scripts/build-brain.mjs && node scripts/free-port.mjs 1430 && VD_PORT=1430 vite",
+    "dev:vite:lite": "node scripts/build-overlay.mjs && node scripts/build-capture.mjs && node scripts/build-hud.mjs && node scripts/build-brain.mjs && node scripts/fetch-diarizer.mjs && node scripts/free-port.mjs 1430 && VD_PORT=1430 vite",
     "dev:lite": "tauri dev --config src-tauri/tauri.lite.conf.json -- --no-default-features",
     "build:lite": "tauri build --config src-tauri/tauri.lite.conf.json -- --no-default-features && ./scripts/finish-dmg.sh",
     "build:qwee": "tauri build --config src-tauri/tauri.qwee.conf.json"

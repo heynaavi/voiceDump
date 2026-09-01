@@ -44,6 +44,15 @@ dictated, and export to typeset PDF, Markdown or plain text — or to Markdown
 with a start and end time on every single word, for whatever you want to line up
 against the audio next.
 
+**Who said what, when there is only one microphone.** Switch on *Find speakers*
+and a recording made in a room — an interview, a conversation, a file you dropped
+in — comes back labelled Speaker 1, Speaker 2, and so on in the order they first
+talk. Rename any of them and the name follows through the whole transcript. It
+runs on the Neural Engine, so it does not slow a transcription down, and the two
+models it needs (42 MB) download the first time you turn it on. Meetings are left
+alone on purpose: both sides of a call were already recorded separately, so who
+spoke is a fact there rather than something to infer.
+
 **Calls, both sides.** Start a recording and your microphone and whatever the
 Mac is playing are captured as two separate tracks, so the transcript knows who
 said what without guessing at voices. No bot joins the meeting — Zoom, Meet,
@@ -516,6 +525,13 @@ Stated plainly, because a README that only lists wins is not worth reading:
   4,096-token window shared between the question, the notes and the answer, so a
   question that really needs forty notes gets the six that matched best. It
   cites them, so you can see what it read.
+- **Speaker labelling is new, and honest about it.** On four clearly different
+  voices it gets all four, and on a real two-person call it is well above chance
+  but splits one person into several — the extra labels are sub-splits of the
+  same speaker rather than confusions between people, so renaming still works,
+  but you may have more names than there were people. It is off by default for
+  that reason. The case it is built for, several people around one microphone,
+  is exactly the case that needs more real recordings to tune against.
 - **Turning an answer into an email is unreliable.** Reformatting works —
   paragraph, bullets, shorter, a poem — but "make that an email" sometimes
   returns the input unchanged when the answer it is working from is thin.

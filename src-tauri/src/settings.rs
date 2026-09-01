@@ -50,6 +50,20 @@ pub struct Settings {
     /// the way in; anything unparseable that reaches here anyway is ignored at
     /// arming time rather than disabling dictation.
     pub shortcut: String,
+
+    /// Put names to the voices in recordings that have only one track.
+    ///
+    /// **Off by default, and that is the honest posture rather than a timid
+    /// one.** The case this exists for — one microphone, several people in a
+    /// room — has never been measured, because no recording of that kind
+    /// existed to measure it on. What has been measured is a clean four-voice
+    /// fixture at 93-99% and a two-track call at 70.9%, and the second of those
+    /// is a case this must never run on anyway, since the two sides were
+    /// recorded separately and already know who spoke.
+    ///
+    /// It also costs a 42 MB download the first time it is switched on, which
+    /// nobody should pay for silently.
+    pub diarization: bool,
 }
 
 impl Default for Settings {
@@ -58,6 +72,7 @@ impl Default for Settings {
             live_preview: cfg!(feature = "assistant"),
             microphone: None,
             shortcut: crate::shortcut::DEFAULT.to_string(),
+            diarization: false,
         }
     }
 }
@@ -105,6 +120,32 @@ pub fn microphone(app: &tauri::AppHandle) -> Option<String> {
     app.try_state::<SettingsState>()
         .and_then(|s| s.0.lock().ok().map(|g| g.microphone.clone()))
         .unwrap_or_default()
+}
+
+/// Whether to look for speakers in single-track recordings.
+pub fn diarization(app: &tauri::AppHandle) -> bool {
+    app.try_state::<SettingsState>()
+        .and_then(|s| s.0.lock().ok().map(|g| g.diarization))
+        .unwrap_or_default()
+}
+
+/// Turn speaker labelling on or off.
+///
+/// Fetching the models is the caller's job, not this one's: a settings write
+/// that blocks on a 42 MB download would look like the switch was broken.
+#[tauri::command]
+pub fn set_diarization(
+    app: tauri::AppHandle,
+    state: tauri::State<SettingsState>,
+    enabled: bool,
+) -> Result<Settings, String> {
+    let updated = {
+        let mut guard = state.0.lock().unwrap();
+        guard.diarization = enabled;
+        guard.clone()
+    };
+    persist(&app, &updated)?;
+    Ok(updated)
 }
 
 #[tauri::command]

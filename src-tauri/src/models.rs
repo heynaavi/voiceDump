@@ -337,7 +337,7 @@ fn verify(part: &std::path::Path, s: &Spec) -> Result<(), String> {
 }
 
 /// sha256 of a file as lowercase hex, or None if it can't be computed.
-fn digest(path: &std::path::Path) -> Option<String> {
+pub(crate) fn digest(path: &std::path::Path) -> Option<String> {
     let out = Command::new(SHASUM)
         .args(["-a", "256"])
         .arg(path)

@@ -430,6 +430,18 @@ export async function renameTranscript(id: string, title: string): Promise<void>
  * paragraph and every segment changed, and the overview's action-item owners
  * along with them.
  */
+/**
+ * Show a note's recording in Finder.
+ *
+ * A command rather than the opener plugin's `revealItemInDir`, because choosing
+ * *which* file to reveal means knowing which ones are still on disk, and only
+ * the backend can look. See `reveal_source` for why the obvious choice is
+ * usually the dead one.
+ */
+export function revealSource(id: string): Promise<void> {
+  return invoke("reveal_source", { id });
+}
+
 export async function renameSpeaker(
   id: string,
   from: string,
@@ -688,6 +700,7 @@ export async function analyticsThemes(refresh = false): Promise<Themes | null> {
 export type Settings = {
   /** Draft transcript in the overlay while you speak. On by default here. */
   live_preview: boolean;
+  diarization: boolean;
   /** Microphone to record from, by name. `null` follows the system input. */
   microphone: string | null;
   /** Modifier names joined with `+` — the keys held to dictate. See lib/shortcut. */
@@ -700,6 +713,21 @@ export async function getSettings(): Promise<Settings> {
 
 export async function setLivePreview(enabled: boolean): Promise<Settings> {
   return invoke("set_live_preview", { enabled });
+}
+
+export async function setDiarization(enabled: boolean): Promise<Settings> {
+  return invoke("set_diarization", { enabled });
+}
+
+/**
+ * Look for separate voices in one recording, and label them.
+ *
+ * Resolves with how many speakers were found — zero when there was only ever
+ * one, which is not a failure and is the answer for most notes. Downloads the
+ * models the first time, so the first call is slow in a way later ones are not.
+ */
+export async function findSpeakers(id: string): Promise<number> {
+  return invoke("find_speakers", { id });
 }
 
 /** One attached input device. */

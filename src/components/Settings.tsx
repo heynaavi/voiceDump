@@ -23,6 +23,7 @@ import { CLUSTERS, PixelCluster } from "./PixelCluster";
 type Props = {
   settings: Stored | null;
   onLivePreview: (enabled: boolean) => void;
+  onDiarization: (enabled: boolean) => void;
   onMicrophone: (name: string | null) => void;
   onShortcut: (chord: string) => Promise<void>;
   /** Null until the backend has been asked whether this Mac can record calls. */
@@ -315,6 +316,7 @@ function Microphones({
 export function Settings({
   settings,
   onLivePreview,
+  onDiarization,
   onMicrophone,
   onShortcut,
   meeting,
@@ -407,6 +409,17 @@ export function Settings({
               <Switch
                 on={settings.live_preview}
                 onClick={() => onLivePreview(!settings.live_preview)}
+              />
+            }
+          />
+          <div className="border-t border-hairline" />
+          <Row
+            label="Find speakers"
+            note="Label the different voices in a recording made on one microphone — a room, an interview, a file you dropped in. Downloads 42 MB the first time. Meetings are left alone: both sides were recorded separately, so they already know who spoke."
+            control={
+              <Switch
+                on={settings.diarization}
+                onClick={() => onDiarization(!settings.diarization)}
               />
             }
           />

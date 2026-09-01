@@ -8,6 +8,11 @@ mod chat;
 mod clipboard;
 #[cfg(target_os = "macos")]
 mod dictation;
+// Putting names to the voices in one track. Exploratory: nothing calls it yet,
+// so the entry points have no callers — hence the allow, which comes off when a
+// diarizer is wired to it. See `docs/speaker-diarization.md`.
+#[allow(dead_code)]
+mod diarize;
 mod engine;
 mod export;
 mod graph;
@@ -168,6 +173,109 @@ fn save_transcript(
         },
         true,
     )
+}
+
+/// Show a note's recording in Finder.
+///
+/// The original is preferred when it is still there: revealing the file somebody
+/// dropped in is more useful than revealing our copy of it. But `origin_path` is
+/// a record of where a recording *came from*, not a promise that it is still
+/// there — a dictation's temporary WAV is deleted the moment it has been
+/// archived, which is every dictation ever made. Reaching for it and giving up
+/// when it is missing is why this button did nothing at all.
+///
+/// So both are tried, in order of usefulness, and a note whose audio is genuinely
+/// gone says so instead of failing silently.
+#[tauri::command]
+fn reveal_source(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let (origin, archived) = {
+        let store = app.state::<Store>();
+        let conn = store.0.lock().unwrap();
+        let t = store::get(&conn, &id).map_err(|e| e.to_string())?;
+        (t.meta.origin_path.clone(), t.meta.source_path.clone())
+    };
+
+    for candidate in [origin, archived] {
+        if candidate.is_empty() || !std::path::Path::new(&candidate).exists() {
+            continue;
+        }
+        // `-R` reveals the file in its folder rather than opening it, and the
+        // absolute path is deliberate: a bundled app inherits launchd's PATH,
+        // not a login shell's. See `media.rs` for the time that assumption cost
+        // us a release.
+        return std::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(&candidate)
+            .status()
+            .map_err(|e| e.to_string())
+            .and_then(|s| {
+                if s.success() {
+                    Ok(())
+                } else {
+                    Err("Finder would not open that folder".into())
+                }
+            });
+    }
+
+    Err("that recording is no longer on disk".into())
+}
+
+/// Put names to the voices in one note, and save the result.
+///
+/// Deliberately on demand rather than at ingest. It costs a 42 MB download the
+/// first time and a minute or two of work after that, and it is wrong for most
+/// notes — a dictation has one voice in it by definition. Making it a thing
+/// somebody asks for keeps it away from the notes it cannot help.
+///
+/// Meetings are refused outright. Their two sides were recorded separately, so
+/// who spoke is a fact already in the database; replacing it with a 70.9% guess
+/// would be a downgrade, and no threshold fixes that.
+#[tauri::command]
+async fn find_speakers(app: tauri::AppHandle, id: String) -> Result<usize, String> {
+    let (source, audio, mut segments) = {
+        let store = app.state::<Store>();
+        let conn = store.0.lock().unwrap();
+        let t = store::get(&conn, &id).map_err(|e| e.to_string())?;
+        (t.meta.source.clone(), t.meta.source_path.clone(), t.segments.clone())
+    };
+
+    if source == "meeting" {
+        return Err("this meeting already recorded who was speaking".into());
+    }
+    if !std::path::Path::new(&audio).exists() {
+        return Err("that recording is no longer on disk".into());
+    }
+
+    // Blocking work off the async runtime: a download, then a decode.
+    let handle = app.clone();
+    let turns = tauri::async_runtime::spawn_blocking(move || {
+        diarize::fetch(&handle)?;
+        diarize::run(&handle, &audio)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    if !diarize::worth_labelling(&turns) {
+        return Ok(0);
+    }
+    let labelled = diarize::label_segments(&mut segments, &turns);
+    if labelled == 0 {
+        return Ok(0);
+    }
+
+    // Re-grouped from the segments rather than patched in place, so the reading
+    // view gets turns that break where the speaker changes — and the flat text
+    // rewritten with them, because that string is what an overview reads. The
+    // same three things a rename rewrites, for the same reason.
+    let list: Vec<serde_json::Value> = segments.as_array().cloned().unwrap_or_default();
+    let paragraphs = meeting::turns(&list);
+    let text = meeting::transcript_text(&paragraphs);
+
+    let store = app.state::<Store>();
+    let conn = store.0.lock().unwrap();
+    store::set_conversation(&conn, &id, &text, &serde_json::json!(paragraphs), &segments)
+        .map_err(|e| e.to_string())?;
+    Ok(diarize::speaking_order(&turns).len())
 }
 
 #[tauri::command]
@@ -1532,6 +1640,8 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         list_transcripts,
         get_transcript,
         save_transcript,
+        reveal_source,
+        find_speakers,
         update_transcript,
         set_transcript_peaks,
         archive_transcript_media,
@@ -1589,6 +1699,8 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         list_transcripts,
         get_transcript,
         save_transcript,
+        reveal_source,
+        find_speakers,
         update_transcript,
         set_transcript_peaks,
         archive_transcript_media,

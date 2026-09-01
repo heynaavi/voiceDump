@@ -8,7 +8,6 @@ import {
   useState,
 } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import gsap from "gsap";
 
 import type {
@@ -24,7 +23,9 @@ import {
   exportPdf,
   fetchPeaks,
   generateBrief,
+  findSpeakers,
   namesInMeeting,
+  revealSource,
   setTranscriptPeaks,
   transcribeAgain,
   watchBriefFailed,
@@ -49,6 +50,8 @@ type Props = {
   onRenameSpeaker: (id: string, from: string, to: string) => Promise<void>;
   /** The AI is currently generating this note's title. */
   naming?: boolean;
+  /** Whether the speaker-labelling switch is on. Off is the default. */
+  canFindSpeakers?: boolean;
   /** Reload this note after its transcript has been read again and replaced. */
   onReread: (id: string) => void;
 };
@@ -128,6 +131,7 @@ export function TranscriptView({
   onEdit,
   onRenameSpeaker,
   naming = false,
+  canFindSpeakers = false,
   onReread,
 }: Props) {
   const [copied, setCopied] = useState(false);
@@ -140,6 +144,8 @@ export function TranscriptView({
   const [rereadError, setRereadError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [sourceError, setSourceError] = useState<string | null>(null);
+  const [speakers, setSpeakers] = useState<string | null>(null);
   /** Whether the format list under EXPORT is showing. */
   const [choosing, setChoosing] = useState(false);
   /** The list and its button, so a click on either doesn't count as "away". */
@@ -1166,6 +1172,14 @@ export function TranscriptView({
                   </>
                 )}
               </p>
+              {sourceError && (
+                // Same reasoning as the export line below: a button that does
+                // nothing and says nothing is indistinguishable from a broken
+                // app, which is exactly how this one read.
+                <p className="mono-data mt-1 text-[10px] uppercase tracking-[0.12em] text-amber">
+                  {sourceError}
+                </p>
+              )}
               {exportError && (
                 // A save that quietly did nothing is the worst outcome here —
                 // the user closes the window believing the file is on disk.
@@ -1215,14 +1229,32 @@ export function TranscriptView({
               </div>
               <RailButton
                 onClick={() =>
-                  // Prefer where the file came from; fall back to the archived
-                  // copy for anything that arrived without an original on disk.
-                  revealItemInDir(
-                    transcript.origin_path || transcript.source_path,
-                  ).catch(() => {})
+                  // Which file still exists is a question only the backend
+                  // can answer, and a failure here used to be swallowed — which
+                  // is why this button spent a release doing nothing.
+                  revealSource(transcript.id).catch((e: unknown) =>
+                    setSourceError(String(e)),
+                  )
                 }
                 label="SOURCE"
               />
+              {canFindSpeakers && transcript.source !== "meeting" && (
+                // Meetings are absent on purpose: both sides were recorded
+                // separately, so who spoke is already a fact there and this
+                // would replace it with a guess.
+                <RailButton
+                  onClick={() => {
+                    setSpeakers("LOOKING…");
+                    findSpeakers(transcript.id)
+                      .then((n) => {
+                        setSpeakers(n > 0 ? `FOUND ${n}` : "ONE VOICE");
+                        if (n > 0) onReread(transcript.id);
+                      })
+                      .catch((e: unknown) => setSpeakers(String(e)));
+                  }}
+                  label={speakers ?? "SPEAKERS"}
+                />
+              )}
               <RailButton
                 onClick={() => onDelete(transcript.id)}
                 label="DELETE"
