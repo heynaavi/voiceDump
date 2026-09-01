@@ -183,12 +183,14 @@ not use it for.
 
 ## Two things found on the way
 
-**One meeting's audio is defective.** In `659c7b19a9518` the silence floor is RMS
-1030 and the user's own voice measures 968 — quieter than the room tone — while
-the far side reaches 3003. `Editing Techniques` on the same code is balanced:
-3398 / 3369 with a silence floor of 7. Whisper never noticed because it
-transcribes each side before the mixdown, but playback of that meeting is
-missing half the conversation. Worth its own investigation.
+**Some recordings have a broken level balance, and it is invisible.** One
+meeting measured here had a silence floor of RMS 1030 with the local
+microphone's own speech at 968 — quieter than the room tone — while the far side
+reached 3003. Another, recorded by the same code, was balanced at 3398 / 3369
+over a silence floor of 7. Whisper never notices, because it transcribes each
+side before the mixdown, so the transcript is perfect and only playback is
+wrong. Worth its own investigation, and worth knowing before trusting any
+measurement taken from a mixed meeting file.
 
 **Benchmarks need the right ground truth twice over.** The first attempt scored
 against paragraphs, which are turn-groupings spanning up to forty seconds
