@@ -662,7 +662,7 @@ function VersionButton() {
 
   const click = () => {
     if (state.at === "new") {
-      openRelease(state.version).catch(() => {});
+      openRelease().catch(() => {});
       return;
     }
     if (state.at === "checking") return;

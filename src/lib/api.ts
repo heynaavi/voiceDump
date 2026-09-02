@@ -905,8 +905,14 @@ export async function checkUpdate(): Promise<Update> {
  * address from a fixed repository, so nothing the network said can decide
  * where this goes.
  */
-export async function openRelease(version: string): Promise<void> {
-  return invoke("open_release", { version });
+/**
+ * Open the update page in the browser.
+ *
+ * Takes no version: the running one is read from the bundle on the other side,
+ * which knows it better than this window does and cannot be talked out of it.
+ */
+export async function openRelease(): Promise<void> {
+  return invoke("open_release");
 }
 
 /**

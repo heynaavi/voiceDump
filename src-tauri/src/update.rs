@@ -37,6 +37,16 @@ use serde::Serialize;
 
 /// Where releases live. A constant, so the response can never redirect us.
 const REPO: &str = "heynaavi/voiceDump";
+
+/// Where somebody is sent when they press the button.
+///
+/// Our own page rather than the GitHub release, and the difference is not
+/// branding. The release page is a fine place to read a changelog and a poor
+/// place to be sent by a button that already means "get the update": the
+/// download is one link among several, and nothing there knows you asked. The
+/// update page starts the download itself after a few seconds with the notes on
+/// screen — see `voiceDumpWeb`, `src/update.ts`.
+const SITE: &str = "https://voicedumps.qwee.ai";
 const CURL: &str = "/usr/bin/curl";
 
 #[derive(Serialize)]
@@ -151,15 +161,25 @@ pub async fn check_update(app: tauri::AppHandle) -> Result<Update, String> {
     })
 }
 
-/// Open the release page for a version in the browser.
+/// Open the update page in the browser.
 ///
-/// Takes a version, not a URL. The webview cannot name a destination — it can
-/// only name a tag, which is re-validated here before it is put anywhere near
-/// a URL.
+/// **Takes nothing from the webview.** It used to accept a version string, which
+/// was validated before going anywhere near a URL — sound, but it left the
+/// window naming part of a destination for no reason. The only version this
+/// needs is the one already running, and the bundle knows that better than the
+/// page does.
+///
+/// The version travels as `?v=` so the page can tell an upgrade from somebody
+/// who is already current — and so a direct visit, which has no `v`, never
+/// starts a download on its own.
 #[tauri::command]
-pub fn open_release(version: String) -> Result<(), String> {
-    parts(&version).ok_or("not a version")?;
-    let url = format!("https://github.com/{REPO}/releases/tag/v{}", version);
+pub fn open_release(app: tauri::AppHandle) -> Result<(), String> {
+    let current = app.package_info().version.to_string();
+    // Validated even though it came from our own bundle: this is the one
+    // function that turns a string into something the browser opens, and it
+    // should be true by inspection rather than by trusting a caller.
+    parts(&current).ok_or("not a version")?;
+    let url = format!("{SITE}/update/?v={current}");
     tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
 
