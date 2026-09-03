@@ -254,6 +254,25 @@ async fn find_speakers(app: tauri::AppHandle, id: String) -> Result<usize, Strin
         .map_err(|e| e.to_string())?
 }
 
+/// One labelling job at a time, whoever asked for it.
+///
+/// Two reasons, and the first one shipped as a bug. The models are fetched
+/// lazily by whoever needs them first, so two jobs starting together meant two
+/// downloads of the same 40 MB file into the same `.part` — see
+/// `diarize::FETCHING`. And past that, a second job is a second ONNX session
+/// and a second decode of a whole recording held in memory, to do work that
+/// gains nothing by overlapping. The queue is the optimisation, not a
+/// limitation.
+static LABELLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Say where a note's labelling has got to.
+fn speaker_stage(app: &tauri::AppHandle, id: &str, stage: &str) {
+    let _ = app.emit(
+        "speakers-progress",
+        serde_json::json!({ "id": id, "stage": stage }),
+    );
+}
+
 /// Put names to the voices in one recording, in place.
 ///
 /// Blocking, and shared by the two ways this happens: the SPEAKERS button on a
@@ -276,8 +295,44 @@ fn label_speakers(app: &tauri::AppHandle, id: &str) -> Result<usize, String> {
         return Err("that recording is no longer on disk".into());
     }
 
-    diarize::fetch(app)?;
+    // Queued behind any job already running — including its download, which is
+    // the whole point. `LABELLING` is held for the rest of this function.
+    if LABELLING.try_lock().is_err() {
+        speaker_stage(app, id, "queued");
+    }
+    let _turn = LABELLING.lock().unwrap_or_else(|e| e.into_inner());
+
+    if !diarize::ready(app) {
+        speaker_stage(app, id, "downloading");
+        let handle = app.clone();
+        let note = id.to_string();
+        diarize::fetch_or_wait(app, &move |at| {
+            let _ = handle.emit(
+                "speakers-progress",
+                serde_json::json!({
+                    "id": note,
+                    "stage": if at.verifying { "verifying" } else { "downloading" },
+                    "received": at.received,
+                    "total": at.total,
+                    "index": at.index,
+                    "count": at.count,
+                }),
+            );
+        })?;
+    }
+
+    speaker_stage(app, id, "listening");
     let turns = diarize::run(app, &audio)?;
+
+    // Marked before the outcome is known, and on every path out from here: the
+    // point of the flag is "we looked", not "we found somebody". A one-voice
+    // recording writes no labels, so without this it stays a backfill candidate
+    // for ever and the sweep never finishes.
+    {
+        let store = app.state::<Store>();
+        let conn = store.0.lock().unwrap();
+        let _ = store::mark_speakers_checked(&conn, id);
+    }
 
     if !diarize::worth_labelling(&turns) {
         return Ok(0);
@@ -293,6 +348,22 @@ fn label_speakers(app: &tauri::AppHandle, id: &str) -> Result<usize, String> {
     // same three things a rename rewrites, for the same reason.
     let list: Vec<serde_json::Value> = segments.as_array().cloned().unwrap_or_default();
     let paragraphs = meeting::turns(&list);
+
+    // The turns are what get saved, so they are what has to be judged — not the
+    // diarizer's raw clusters, which is what `worth_labelling` already checked.
+    // Those two can disagree: a 32-second dictation came back with two clusters,
+    // survived that check, and after grouping was a single turn labelled
+    // "Speaker 2" — one voice, named as though it were the second of several,
+    // with no first anywhere. Labels that say nothing are worse than none,
+    // because they claim a recording had people in it.
+    let named: std::collections::HashSet<&str> = paragraphs
+        .iter()
+        .filter_map(|t| t["speaker"].as_str())
+        .collect();
+    if named.len() < 2 {
+        return Ok(0);
+    }
+
     let text = meeting::transcript_text(&paragraphs);
 
     let store = app.state::<Store>();
@@ -302,25 +373,169 @@ fn label_speakers(app: &tauri::AppHandle, id: &str) -> Result<usize, String> {
     Ok(diarize::speaking_order(&turns).len())
 }
 
+/// Go back over notes saved before this feature existed, one at a time.
+///
+/// The same sweep the AI titler does for names, and for the same reason: a
+/// feature that only ever applies to what you record next is invisible to
+/// somebody who already has a library. On the machine this was written for
+/// that was 565 notes and nine hours of audio, which is the other half of the
+/// design — it must be impossible to notice.
+///
+/// So it is deliberately slow. One note at a time behind [`LABELLING`], which
+/// the live path also holds, so anything recorded now goes first and the sweep
+/// simply waits its turn. [`BETWEEN_BACKFILL`] then idles between notes, which
+/// costs nothing anybody is waiting for and keeps a fan quiet.
+///
+/// Resumable, because nine hours will not finish in one sitting: each note is
+/// marked as looked-at the moment the diarizer has been over it, whatever it
+/// found, so a restart picks up where it stopped rather than starting again.
+///
+/// Newest first — if it only ever gets halfway, this morning's recording is
+/// likelier to be opened again than one from March.
+fn spawn_speaker_backfill(app: &tauri::AppHandle) {
+    if !settings::diarization(app) {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // Behind the models. Starting the sweep first would mean 565 notes each
+        // waiting on the same download, and the first one holding `LABELLING`
+        // while it did — which is exactly the queue that made this feature look
+        // broken in the first place.
+        // Bounded. If the models never arrive — the setting is on but the
+        // download keeps failing — this thread should end rather than wake up
+        // every twenty seconds for the life of the process. The next launch
+        // tries again, which is soon enough for a sweep over old notes.
+        let mut patience = 90; // half an hour
+        while !diarize::ready(&app) {
+            patience -= 1;
+            if patience == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(20));
+        }
+
+        let waiting = {
+            let store = app.state::<Store>();
+            let conn = store.0.lock().unwrap();
+            store::list_unlabelled(&conn, LONG_ENOUGH_FOR_TWO).unwrap_or_default()
+        };
+        if waiting.is_empty() {
+            return;
+        }
+        let minutes: f64 = waiting.iter().map(|(_, secs)| secs / 60.0).sum();
+        eprintln!(
+            "[speakers] backfilling {} note(s), {minutes:.0} minutes of audio",
+            waiting.len()
+        );
+
+        let mut labelled = 0usize;
+        for (id, _) in &waiting {
+            match label_speakers(&app, id) {
+                Ok(n) if n > 0 => {
+                    labelled += 1;
+                    let _ = app.emit(
+                        "speakers-found",
+                        serde_json::json!({ "id": id, "speakers": n }),
+                    );
+                }
+                Ok(_) => {}
+                // One unreadable recording must not end the sweep — the audio
+                // may simply be gone, which is ordinary for an old note. And
+                // nothing ran, so there is nothing to rest after: a library
+                // with a hundred missing files would otherwise spend five
+                // minutes asleep to discover that.
+                Err(why) => {
+                    eprintln!("[speakers] {id}: {why}");
+                    continue;
+                }
+            }
+            std::thread::sleep(BETWEEN_BACKFILL);
+        }
+        eprintln!("[speakers] backfill done; {labelled} note(s) gained labels");
+    });
+}
+
+/// How long the backfill rests between notes.
+///
+/// Long enough that the sweep is background noise rather than a machine that
+/// has become busy for reasons its owner did not ask for. It makes the whole
+/// pass take longer, which costs nothing: nobody is waiting on a note they
+/// recorded in March.
+const BETWEEN_BACKFILL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Fetch the speaker models at launch, so nobody waits for them mid-recording.
+///
+/// The Whisper models are fetched up front by [`crate::models`] because the app
+/// cannot transcribe without them — there is a setup screen and you wait at it.
+/// These are not like that: everything works without them, so blocking first
+/// run on an optional 40 MB would be a worse trade than the one it prevents.
+///
+/// The trade it *does* prevent is the one that shipped: the first recording
+/// somebody dropped in started a download nobody had been told about, took
+/// eight minutes, and looked exactly like a feature hanging. Fetching quietly
+/// at launch means that by the time a recording needs them they are already
+/// there, which is what "downloaded already when you update" has to mean.
+///
+/// Only when the setting is on, and only when something is actually missing —
+/// so this is a directory listing and nothing else on almost every launch.
+fn spawn_model_prefetch(app: &tauri::AppHandle) {
+    if !settings::diarization(app) || diarize::ready(app) {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let report = |at: diarize::Fetching| {
+            let _ = app.emit(
+                "speakers-progress",
+                serde_json::json!({
+                    "stage": if at.verifying { "verifying" } else { "downloading" },
+                    "received": at.received,
+                    "total": at.total,
+                    "index": at.index,
+                    "count": at.count,
+                }),
+            );
+        };
+        match diarize::fetch_or_wait(&app, &report) {
+            Ok(()) => eprintln!("[speakers] models ready"),
+            // Never a dialog and never a retry loop. The next recording that
+            // wants them tries again, and until then nothing is worse than it
+            // was — the app has simply not got an optional model yet.
+            Err(why) => eprintln!("[speakers] models not fetched: {why}"),
+        }
+    });
+}
+
+/// The shortest recording that could hold a conversation.
+///
+/// Not a cost dodge — with the models already on disk a pass is a second or so
+/// — but an honest floor. Two people cannot take a turn each inside a few
+/// seconds, so "testing the mic, testing the mic" at 2.5s is a run whose answer
+/// is known before it starts.
+const LONG_ENOUGH_FOR_TWO: f64 = 15.0;
+
 /// Which recordings are worth looking for speakers in without being asked.
 ///
-/// Only files somebody brought in — a dropped recording, an import, anything
-/// saved through the window. That is the case this feature was built for: one
-/// microphone, several people in a room.
+/// Everything transcribed that is long enough to hold a conversation. That is
+/// the whole rule now, and it is deliberately broader than it was: the first
+/// version ran only on files, on the grounds that a dictation is one person
+/// holding a key and 94% of a real library, so a pass over them would cost
+/// almost everything to learn almost nothing.
 ///
-/// Everything else is excluded for a reason rather than out of caution. A
-/// `meeting` recorded its two sides separately and already knows who spoke;
-/// [`label_speakers`] refuses it outright. A `hotkey` note is somebody holding
-/// a key and talking, which is one voice by construction — and it is not a
-/// rare case to spend a minute of CPU on, it is 94% of a real library, so an
-/// automatic pass there would cost almost everything and learn almost nothing.
-/// `discord` and `slack` arrive from services that may carry their own idea of
-/// who was speaking, and guessing over that would be a downgrade.
+/// That reasoning was about the *download*, which used to be triggered by
+/// whoever needed the models first. It is not any more — `spawn_model_prefetch`
+/// gets them at launch — and once they are local a pass is cheap and its answer
+/// is usually "one voice", which changes nothing and shows nothing. Being wrong
+/// about a dictation that did have two people in it is the more expensive
+/// mistake, because there is nothing on screen to suggest looking.
 ///
-/// The SPEAKERS button still exists for every one of these, because "usually
-/// pointless" is not "never wanted" — the difference is whether somebody asked.
-fn wants_speakers(source: &str) -> bool {
-    source == "file"
+/// Meetings stay out, and firmly. Their two sides were recorded separately, so
+/// who spoke is a fact there rather than a guess, and `label_speakers` refuses
+/// them outright as well — this is the cheaper of the two refusals, not the
+/// only one.
+fn wants_speakers(source: &str, duration: f64) -> bool {
+    source != "meeting" && duration >= LONG_ENOUGH_FOR_TWO
 }
 
 /// Look for speakers in a note that has just been saved, in the background.
@@ -850,9 +1065,9 @@ pub fn insert_transcript(
     // words. Never blocks the save — on any failure the fallback title we just
     // stored simply stands.
     // Voices, in the background, when the setting is on and the recording is
-    // the kind that can have more than one in it. Off by default, and the
-    // switch is what turns this on — see `settings::Settings::diarization`.
-    if settings::diarization(app) && wants_speakers(source) {
+    // long enough to have more than one in it. On by default — see
+    // `settings::Settings::diarization`.
+    if settings::diarization(app) && wants_speakers(source, duration) {
         spawn_speaker_job(app, id.clone());
     }
 
@@ -1603,6 +1818,11 @@ pub fn run() {
             shortcut::arm_hold(loaded.hold_to_talk);
             app.manage(settings::SettingsState(Mutex::new(loaded)));
 
+            // Speaker models, quietly, before anything needs them. Reads the
+            // setting that was just managed, so it goes after that line.
+            spawn_model_prefetch(app.handle());
+            spawn_speaker_backfill(app.handle());
+
             // Launch the native dictation-overlay helper. The pill is drawn by a
             // separate accessory process because a Tauri webview window cannot
             // float over another app's full-screen Space; a native NSPanel can.
@@ -1845,6 +2065,37 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The rule that decides whether a note labels itself, which is the
+    /// difference between the feature working and the feature being a button
+    /// somebody has to know about.
+    #[test]
+    fn anything_long_enough_to_be_a_conversation_labels_itself() {
+        // A dictation counts. It usually holds one voice and the pass will say
+        // so cheaply — but a dictation with two people in it is the case with
+        // nothing on screen to suggest looking, so it is the expensive one to
+        // get wrong.
+        assert!(wants_speakers("hotkey", 60.0));
+        assert!(wants_speakers("file", 110.0));
+        assert!(wants_speakers("discord", 30.0));
+    }
+
+    #[test]
+    fn a_meeting_is_never_guessed_at() {
+        // Both sides were recorded separately, so who spoke is a fact there.
+        // `label_speakers` refuses it too; this is the cheaper of the two.
+        assert!(!wants_speakers("meeting", 3_600.0));
+    }
+
+    #[test]
+    fn a_few_seconds_cannot_hold_two_people() {
+        // "testing the mic, testing the mic" at 2.5s has a known answer.
+        assert!(!wants_speakers("hotkey", 2.5));
+        assert!(!wants_speakers("file", LONG_ENOUGH_FOR_TWO - 0.1));
+        assert!(wants_speakers("file", LONG_ENOUGH_FOR_TWO));
+    }
+
     use super::*;
 
     /// The two floors answer different questions and must not be conflated. A

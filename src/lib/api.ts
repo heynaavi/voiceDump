@@ -746,6 +746,29 @@ export async function cloudSentence(words: string[]): Promise<string> {
   return invoke("cloud_sentence", { words });
 }
 
+/** How far a speaker pass has got. `id` is absent for the launch prefetch. */
+export type SpeakerProgress = {
+  id?: string;
+  stage: "queued" | "downloading" | "verifying" | "listening";
+  received?: number;
+  total?: number;
+  index?: number;
+  count?: number;
+};
+
+/**
+ * Where a speaker pass has got to, including the model download.
+ *
+ * Exists because the download is the slow part and used to be invisible: the
+ * first recording that needed it sat on "LOOKING…" for eight minutes with
+ * nothing to say it was fetching 40 MB.
+ */
+export function watchSpeakerProgress(
+  run: (at: SpeakerProgress) => void,
+): Promise<() => void> {
+  return listen<SpeakerProgress>("speakers-progress", (e) => run(e.payload));
+}
+
 /**
  * The automatic speaker pass finished on a note.
  *

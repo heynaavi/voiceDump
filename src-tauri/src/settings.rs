@@ -175,17 +175,6 @@ pub fn diarization(app: &tauri::AppHandle) -> bool {
         .unwrap_or_default()
 }
 
-/// Whether the dictation chord must be held down.
-///
-/// Not read on the tap thread — [`crate::shortcut::is_hold_to_talk`] is, and it
-/// is armed from this. This is here so startup and the settings command have
-/// one place to read the stored value from.
-pub fn hold_to_talk(app: &tauri::AppHandle) -> bool {
-    app.try_state::<SettingsState>()
-        .and_then(|s| s.0.lock().ok().map(|g| g.hold_to_talk))
-        .unwrap_or_else(|| Settings::default().hold_to_talk)
-}
-
 /// Whether to put the previous clipboard contents back after pasting.
 ///
 /// Same contract as [`live_preview`]: read from the dictation path, so a

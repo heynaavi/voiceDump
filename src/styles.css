@@ -1,12 +1,18 @@
 @import "tailwindcss";
 
 /* ---------------------------------------------------------------------------
-   QWEE Design System V2 — "Field Notes", adapted for a resizable app window.
+   QWEE Design System V3 — "Field Notes, spoken", on the app surface.
 
-   V2 is a print system: fixed 960x540pt pages, absolute measurements. What
-   carries over verbatim is the *language* — forest & sage, two families only,
-   square everything, the emphasis ladder, mono-as-data. What doesn't carry
-   over is the fixed canvas, so sizes here are screen px on a fluid layout.
+   The system itself lives at ~/Dev/2026/QWEE/QWEE_DS/QWEE_DESIGN_SYSTEM_V3.md,
+   with the same tokens in machine-readable form at tokens/qwee-v3.tokens.json.
+   This file is the app's binding of them, and is one of V3's four reference
+   implementations (§8.1) — so a value here and a value there must not drift.
+
+   V3 is one system for four surfaces: this app, client documents, the website
+   and the films. What the app takes is the whole language — forest & sage, two
+   families, square everything, the emphasis ladder, mono-as-data — and none of
+   the web surface's softness: per §4 the app is the surface that stays at
+   radius 0, and per §8.1 it keeps 13px body and 8.5px labels.
 
    Surface mapping: light theme = paper pages, dark theme = forest cover.
 --------------------------------------------------------------------------- */
@@ -26,7 +32,7 @@
 }
 
 @theme {
-  /* Core palette — §3. One green, two surfaces, a grey ramp. */
+  /* Brand constants — §3. Identical on every surface and in both themes. */
   --color-forest-950: #14180f;
   --color-forest: #1e2618;
   --color-sage: #b8d4a4;
@@ -34,25 +40,52 @@
   --color-sage-dim: #8fb07c;
   --color-paper: #faf9f4;
   --color-card: #ffffff;
-  --color-ink: #1b2015;
-  --color-grey: #71716a;
-  --color-amber: #a8741d;
 
-  /* Derived ink levels. Kept as tokens so dark mode can swap them wholesale. */
-  --color-faint: color-mix(in srgb, #1b2015 45%, transparent);
-  --color-hairline: color-mix(in srgb, #1b2015 12%, transparent);
-  --color-hairline-soft: color-mix(in srgb, #1b2015 6%, transparent);
-
-  /* Semantic surfaces — what components actually reference. */
+  /* Semantic surfaces — what components actually reference. Dark swaps them
+     wholesale below, which is the reason they are tokens at all. */
   --color-surface: #faf9f4;
   --color-panel: #ffffff;
   --color-rail: #f4f2ec;
+  --color-ink: #1b2015;
+  --color-grey: #71716a;
+
+  /* Derived ink levels. The percentages are measured, not chosen: `faint`
+     draws every 8.5px micro-label and 9px eyebrow in this app, which is small
+     text by WCAG and wants 4.5:1. At V2's 45% it measures **2.79:1** on paper
+     — short even of the 3:1 large-text bar — where 62% measures **4.61:1**.
+     Dark mode fixed this a while ago and light mode never did. */
+  --color-faint: color-mix(in srgb, #1b2015 62%, transparent);
+  --color-ahead: color-mix(in srgb, #1b2015 74%, transparent);
+  --color-hairline: color-mix(in srgb, #1b2015 14%, transparent);
+  --color-hairline-soft: color-mix(in srgb, #1b2015 7%, transparent);
+
+  /* The one saturated accent for text-sized marks: focus rings, live status.
+     Sage and sage-dim are fills on paper, never text and never indicators —
+     sage-dim measures 2.30:1 there, under WCAG 2.2's 3:1 for a focus ring,
+     where this reads 3.72:1. */
+  --color-cursor: #688a54;
+
+  /* Caution only, never decorative. Darkened from V2's #a8741d because every
+     amber in this app is either amber-on-paper or paper-on-amber — both of
+     which measure 3.85:1 at the old value and **4.69:1** at this one. (Dark
+     text on an amber fill would get worse, and the app has none.) */
+  --color-amber: #96671a;
 
   --font-sans: "Space Grotesk", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
 
   /* §6 spacing scale: 4 8 12 16 20 24 32 48 */
   --spacing-rail: 52px;
+}
+
+/* Geometry — V3 §4. The app is the surface that stays square: `radius-0`
+   everywhere, `radius-pill` on the dictation overlay, and nothing between.
+   Declared outside `@theme` deliberately — Tailwind mints a `rounded-*`
+   utility for every radius token it is given, and under the rule below every
+   one of them would be dead. */
+:root {
+  --radius-0: 0;
+  --radius-pill: 999px;
 }
 
 /* Dark = the forest cover. Sage becomes legible as text only here, per §3:
@@ -77,27 +110,29 @@
 
      **Faint stops being invisible.** Every eyebrow, every micro-label and every
      "not recorded" note is drawn in it, and 45% on this ground was a guess at
-     what the label said. 62% is still clearly secondary.
+     what the label said. 64% measures 6.78:1 and is still clearly secondary.
 
-     **Amber brightens.** #a8741d is a *light-mode* amber: on near-black it is
-     mud, and every warning banner sets dark text on it, which at that value is
-     about 3:1. On #e0ad58 the same dark text is legible, and `text-amber` on
-     the surface finally reads as a warning rather than a smudge. */
+     **Amber brightens.** The light amber is tuned for paper; on near-black it
+     is mud, and a warning banner sets dark text on it. #e0ad58 keeps that text
+     legible and makes `text-amber` on the surface read as a warning rather
+     than a smudge. */
   --color-surface: #0e130c;
   --color-panel: #192217;
   --color-rail: #131a11;
   --color-ink: #e0edd6;
   --color-grey: #9ab889;
   --color-amber: #e0ad58;
-  --color-faint: color-mix(in srgb, #e0edd6 62%, transparent);
+  --color-cursor: #9bc486;
+  --color-faint: color-mix(in srgb, #e0edd6 64%, transparent);
+  --color-ahead: color-mix(in srgb, #e0edd6 76%, transparent);
   --color-hairline: color-mix(in srgb, #b8d4a4 24%, transparent);
   --color-hairline-soft: color-mix(in srgb, #b8d4a4 11%, transparent);
 }
 
 @layer base {
   * {
-    /* §1: the rectangle is the signature, non-negotiable. */
-    border-radius: 0 !important;
+    /* §1: the rectangle is the signature, non-negotiable on this surface. */
+    border-radius: var(--radius-0) !important;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
@@ -166,7 +201,9 @@
   button {
     font: inherit;
     color: inherit;
-    outline-color: var(--color-sage-dim);
+    /* The focus ring is an indicator, not a fill: WCAG 2.2 wants 3:1 against
+       what surrounds it, and sage-dim manages 2.30:1 on paper. */
+    outline-color: var(--color-cursor);
   }
 
   input {
@@ -184,13 +221,16 @@
    a system error, not as a quiet status HUD.
 --------------------------------------------------------------------------- */
 .overlay-pill {
-  border-radius: 999px !important;
+  border-radius: var(--radius-pill) !important;
+  /* Forest and sage by token, but never the *theme's* forest and sage: this
+     floats over somebody else's window, so it stays dark whichever surface the
+     app is on. Those tokens are brand constants, which is what makes that safe. */
   background: linear-gradient(
     180deg,
-    rgba(30, 38, 24, 0.92) 0%,
-    rgba(20, 24, 15, 0.94) 100%
+    color-mix(in srgb, var(--color-forest) 92%, transparent) 0%,
+    color-mix(in srgb, var(--color-forest-950) 94%, transparent) 100%
   );
-  border: 1px solid rgba(184, 212, 164, 0.16);
+  border: 1px solid color-mix(in srgb, var(--color-sage) 16%, transparent);
   /* A wide, very soft shadow reads as depth; the tight dark one it replaced
      read as a heavy box sitting on the screen. */
   box-shadow:
@@ -200,10 +240,14 @@
   -webkit-backdrop-filter: blur(20px) saturate(1.2);
 }
 
+/* The recording dot keeps a literal amber rather than the token. The pill does
+   not follow the theme, so a token that changes with it would drive this to the
+   light-mode value over a dark pill; and the breathe keyframe below has to
+   match whatever this is. */
 .overlay-dot {
   width: 7px;
   height: 7px;
-  border-radius: 999px !important;
+  border-radius: var(--radius-pill) !important;
   background: #e0a33f;
   flex-shrink: 0;
   animation: overlay-breathe 1.6s ease-in-out infinite;
@@ -217,9 +261,9 @@
 .overlay-spinner {
   width: 12px;
   height: 12px;
-  border-radius: 999px !important;
-  border: 2px solid rgba(184, 212, 164, 0.25);
-  border-top-color: #b8d4a4;
+  border-radius: var(--radius-pill) !important;
+  border: 2px solid color-mix(in srgb, var(--color-sage) 25%, transparent);
+  border-top-color: var(--color-sage);
   flex-shrink: 0;
   animation: overlay-spin 0.7s linear infinite;
 }
@@ -249,13 +293,16 @@
      up from here via getComputedStyle. Declared on the element itself so the
      dark-scheme override below wins by cascade order, not specificity. */
   .wave-canvas {
-    --wave-played: #1b2015;
-    --wave-ahead: color-mix(in srgb, #1b2015 22%, #faf9f4);
+    --wave-played: var(--color-ink);
+    --wave-ahead: color-mix(in srgb, var(--color-ink) 22%, var(--color-surface));
   }
 
+  /* Played is sage rather than ink here, per §3 — on forest, sage is the ink.
+     Both mix against `surface` so the unplayed part sits on the real ground;
+     written as a literal it was still mixing against the pre-V3 #14180f. */
   :root[data-theme="dark"] .wave-canvas {
-    --wave-played: #b8d4a4;
-    --wave-ahead: color-mix(in srgb, #b8d4a4 30%, #14180f);
+    --wave-played: var(--color-sage);
+    --wave-ahead: color-mix(in srgb, var(--color-sage) 30%, var(--color-surface));
   }
 
   /* A word the user typed. Legible as a change without shouting: the tint does
@@ -265,10 +312,11 @@
     box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--color-amber) 40%, transparent);
   }
 
+  /* The dark amber is already the lifted, sandy one — this used to hard-code a
+     third value (#d8a24a) that agreed with neither theme's token. */
   :root[data-theme="dark"] .word-edited {
-    /* The light-mode amber goes muddy on forest, so lift it toward sand. */
-    color: #d8a24a;
-    box-shadow: inset 0 -1px 0 color-mix(in srgb, #d8a24a 40%, transparent);
+    color: var(--color-amber);
+    box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--color-amber) 40%, transparent);
   }
 
   /* The reading column and its timestamp gutter.

@@ -781,7 +781,7 @@ pub fn to_engine_rate(input: &[f32], src_rate: u32) -> Vec<f32> {
 /// symphonia is pure Rust, so this is what lets the app drop its `ffmpeg`
 /// dependency: mp3, m4a/aac, wav, flac, ogg and mp4/mov audio tracks all decode
 /// in-process.
-fn decode_mono_16k(path: &Path) -> Result<Vec<f32>, String> {
+pub(crate) fn decode_mono_16k(path: &Path) -> Result<Vec<f32>, String> {
     let (samples, rate) = decode_mono(path)?;
     Ok(resample_to_16k(&samples, rate))
 }

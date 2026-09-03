@@ -1,7 +1,7 @@
 {
   "name": "voicedumps",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "scripts": {
     "dev": "node scripts/build-overlay.mjs && node scripts/build-capture.mjs && node scripts/build-hud.mjs && node scripts/build-brain.mjs && node scripts/fetch-diarizer.mjs && node scripts/free-port.mjs 1420 && vite",

@@ -24,6 +24,7 @@ import {
   fetchPeaks,
   generateBrief,
   findSpeakers,
+  watchSpeakerProgress,
   namesInMeeting,
   revealSource,
   setTranscriptPeaks,
@@ -146,6 +147,36 @@ export function TranscriptView({
   const [exportError, setExportError] = useState<string | null>(null);
   const [sourceError, setSourceError] = useState<string | null>(null);
   const [speakers, setSpeakers] = useState<string | null>(null);
+  /**
+   * What the speaker pass is doing right now, for this note.
+   *
+   * The label used to go to "LOOKING…" and stay there however long the work
+   * took — which on a first run is a 40 MB download, so the honest reading of
+   * the old button was "something may be happening". This follows the job.
+   */
+  useEffect(() => {
+    // A status belongs to the note it was about. Without this the label is
+    // component state that outlives the transcript under it: press SPEAKERS on
+    // one note, walk to any other, and it still says QUEUED — about a job that
+    // was never running on the note you are looking at.
+    setSpeakers(null);
+    let live = true;
+    const sub = watchSpeakerProgress((at) => {
+      if (!live || at.id !== transcript.id) return;
+      if (at.stage === "queued") return setSpeakers("QUEUED");
+      if (at.stage === "listening") return setSpeakers("LISTENING…");
+      if (at.stage === "verifying") return setSpeakers("CHECKING…");
+      const pct =
+        at.total && at.received !== undefined
+          ? Math.round((at.received / at.total) * 100)
+          : 0;
+      setSpeakers(`GETTING MODEL ${pct}%`);
+    });
+    return () => {
+      live = false;
+      sub.then((un) => un()).catch(() => {});
+    };
+  }, [transcript.id]);
   /** Whether the format list under EXPORT is showing. */
   const [choosing, setChoosing] = useState(false);
   /** The list and its button, so a click on either doesn't count as "away". */
@@ -1250,7 +1281,11 @@ export function TranscriptView({
                         setSpeakers(n > 0 ? `FOUND ${n}` : "ONE VOICE");
                         if (n > 0) onReread(transcript.id);
                       })
-                      .catch((e: unknown) => setSpeakers(String(e)));
+                      // Errors here are sentences, and the useful ones say
+                      // what to do next; the label shows them as they are.
+                      .catch((e: unknown) =>
+                        setSpeakers(String(e).replace(/^Error:\s*/, "")),
+                      );
                   }}
                   label={speakers ?? "SPEAKERS"}
                 />

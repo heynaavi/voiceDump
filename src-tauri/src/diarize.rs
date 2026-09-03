@@ -18,6 +18,7 @@
 //! intersection over data already in the database — nothing is re-transcribed.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::process::Command;
 
 use serde_json::{json, Value};
@@ -87,10 +88,55 @@ pub fn model_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Whether every model is already on disk.
+pub fn ready(app: &tauri::AppHandle) -> bool {
+    model_dir(app)
+        .map(|dir| ASSETS.iter().all(|a| dir.join(a.file).exists()))
+        .unwrap_or(false)
+}
+
+/// A download in flight.
+///
+/// Two curls racing for the same `.part` interleave their writes and produce a
+/// file that fails its digest for no visible reason — which is not a
+/// hypothetical: saving a recording started the automatic pass, pressing
+/// SPEAKERS started a second one, and the two of them spent eight minutes
+/// building 37 MB of garbage before the hash caught it and threw all of it
+/// away. `models.rs` has carried this exact guard, with this exact comment,
+/// since the Whisper downloads were written; this module simply never borrowed
+/// it.
+static FETCHING: AtomicBool = AtomicBool::new(false);
+
+/// How far along the models are, emitted as `speakers-progress`.
+#[derive(Clone, serde::Serialize)]
+pub struct Fetching {
+    /// 1-based position and total, so the UI can say "2 of 2".
+    pub index: usize,
+    pub count: usize,
+    pub received: u64,
+    pub total: u64,
+    /// The bytes are all here and the digest is being checked. Hashing 40 MB
+    /// is quick but not instant, and a bar sitting full with nothing happening
+    /// is how a working download looks broken.
+    pub verifying: bool,
+}
+
 /// Fetch whatever is missing. Does nothing when both are already there.
-pub fn fetch(app: &tauri::AppHandle) -> Result<(), String> {
+///
+/// Refuses rather than queues when another fetch is already running: the
+/// caller wanted the models present, and the answer "somebody else is already
+/// getting them" is a different thing from an error, which is why
+/// [`fetch_or_wait`] exists to tell them apart.
+pub fn fetch(app: &tauri::AppHandle, report: &dyn Fn(Fetching)) -> Result<(), String> {
     let dir = model_dir(app)?;
-    for asset in ASSETS.iter() {
+    if FETCHING.swap(true, Ordering::SeqCst) {
+        return Err(BUSY.to_string());
+    }
+    // Released however this returns, including on the `?`s below.
+    let _guard = Guard;
+
+    let count = ASSETS.len();
+    for (index, asset) in ASSETS.iter().enumerate() {
         let done = dir.join(asset.file);
         if done.exists() {
             continue;
@@ -103,16 +149,56 @@ pub fn fetch(app: &tauri::AppHandle) -> Result<(), String> {
             let _ = std::fs::remove_file(&part);
         }
 
-        let status = Command::new(CURL)
+        let mut child = Command::new(CURL)
             .args(["--fail", "--location", "--silent", "--show-error",
                    "--retry", "3", "--retry-delay", "2", "--continue-at", "-", "--output"])
             .arg(&part)
             .arg(asset.url)
-            .status()
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .map_err(|e| format!("could not start the download: {e}"))?;
-        if !status.success() {
-            return Err(format!("could not download {}", asset.file));
+
+        // Progress by watching the file grow rather than parsing curl's own
+        // meter, which is a terminal animation and not an interface.
+        loop {
+            match child.try_wait() {
+                Err(e) => return Err(format!("download failed: {e}")),
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        let mut why = String::new();
+                        if let Some(mut err) = child.stderr.take() {
+                            use std::io::Read;
+                            let _ = err.read_to_string(&mut why);
+                        }
+                        let why = why.trim();
+                        return Err(if why.is_empty() {
+                            format!("could not download {}", asset.file)
+                        } else {
+                            format!("could not download {}: {why}", asset.file)
+                        });
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    report(Fetching {
+                        index: index + 1,
+                        count,
+                        received: std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0),
+                        total: asset.bytes,
+                        verifying: false,
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
         }
+
+        report(Fetching {
+            index: index + 1,
+            count,
+            received: asset.bytes,
+            total: asset.bytes,
+            verifying: true,
+        });
 
         // Verified before it is unpacked or used, and deleted when wrong: a
         // half-file left on disk is found by the next launch and handed to a
@@ -122,10 +208,13 @@ pub fn fetch(app: &tauri::AppHandle) -> Result<(), String> {
             Some(got) if got == asset.sha256 => {}
             other => {
                 let _ = std::fs::remove_file(&part);
-                return Err(match other {
-                    Some(got) => format!("{} downloaded corrupt ({got})", asset.file),
-                    None => format!("could not check {}", asset.file),
-                });
+                if other.is_some() {
+                    eprintln!("[speakers] {} failed its digest; deleted", asset.file);
+                }
+                return Err(format!(
+                    "the {} model did not arrive intact — it will try again",
+                    asset.file.split('.').next().unwrap_or("speaker")
+                ));
             }
         }
 
@@ -153,6 +242,99 @@ pub fn fetch(app: &tauri::AppHandle) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// What [`fetch`] says when another one is already running.
+///
+/// A sentinel rather than an error string anybody parses: [`fetch_or_wait`] is
+/// the only reader, and it turns it into waiting.
+const BUSY: &str = "another download is already running";
+
+/// Clears [`FETCHING`] however the fetch it belongs to ends.
+struct Guard;
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        FETCHING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Make sure the models are there, waiting rather than racing if somebody else
+/// is already fetching them.
+///
+/// The distinction matters because both things happen at once in normal use: a
+/// recording is saved and starts the automatic pass, and while that is still
+/// downloading somebody presses SPEAKERS on another note. The second one has
+/// nothing useful to do but wait, and it must not start its own curl.
+pub fn fetch_or_wait(app: &tauri::AppHandle, report: &dyn Fn(Fetching)) -> Result<(), String> {
+    loop {
+        match fetch(app, report) {
+            Err(busy) if busy == BUSY => {
+                if ready(app) {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// A 16 kHz mono WAV of a recording, deleted when it goes out of scope.
+///
+/// **The helper reads WAV and nothing else.** sherpa's wave reader wants a
+/// RIFF header and says so — `Expected chunk_id RIFF. Given: 0x1c000000` — and
+/// then `Failed to read`. Dictations are saved as WAV and worked; anything
+/// brought in is archived as `.m4a` and did not, which is to say the feature
+/// failed on exactly the recordings it exists for and worked on the ones it
+/// has nothing to say about.
+///
+/// Decoded with `engine::decode_mono_16k`, the same symphonia path that feeds
+/// Whisper, rather than by shelling out — see `media.rs` on why this app does
+/// not have ffmpeg. 16 kHz mono is also what both models want, so this is a
+/// conversion that had to happen somewhere regardless.
+struct Decoded {
+    path: PathBuf,
+}
+
+impl Drop for Decoded {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn decode_for_helper(audio: &Path) -> Result<Decoded, String> {
+    let samples = crate::engine::decode_mono_16k(audio)?;
+    if samples.is_empty() {
+        return Err("that recording decoded to no audio".into());
+    }
+
+    // Named for this process and this moment: jobs are serialised, but a second
+    // copy of the app is not something this can rule out.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("voicedumps-diarize-{}-{stamp}.wav", std::process::id()));
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut wav = hound::WavWriter::create(&path, spec)
+        .map_err(|e| format!("could not open a working file: {e}"))?;
+    for sample in samples {
+        // Clamped before scaling: a decoder is allowed to hand back values
+        // slightly outside ±1, and wrapping those into i16 is a click.
+        let clamped = sample.clamp(-1.0, 1.0);
+        wav.write_sample((clamped * i16::MAX as f32) as i16)
+            .map_err(|e| format!("could not write a working file: {e}"))?;
+    }
+    wav.finalize()
+        .map_err(|e| format!("could not finish a working file: {e}"))?;
+    Ok(Decoded { path })
 }
 
 /// Read the helper's output into turns.
@@ -215,6 +397,10 @@ pub fn run(app: &tauri::AppHandle, audio: &str) -> Result<Vec<Turn>, String> {
         return Err("the speaker models have not been downloaded".into());
     }
 
+    // Whatever the recording is, the helper gets a WAV. See `Decoded`.
+    let decoded = decode_for_helper(Path::new(audio))?;
+    let audio = decoded.path.to_string_lossy().into_owned();
+
     let out = Command::new(&helper)
         .arg(format!("--segmentation.pyannote-model={}", segmentation.display()))
         .arg(format!("--embedding.model={}", embedding.display()))
@@ -223,7 +409,7 @@ pub fn run(app: &tauri::AppHandle, audio: &str) -> Result<Vec<Turn>, String> {
         .arg("--segmentation.num-threads=4")
         .arg("--embedding.num-threads=4")
         .arg(format!("--clustering.cluster-threshold={THRESHOLD}"))
-        .arg(audio)
+        .arg(&audio)
         .output()
         .map_err(|e| format!("could not run the speaker helper: {e}"))?;
 
@@ -352,11 +538,152 @@ pub fn label_segments(segments: &mut Value, turns: &[Turn]) -> usize {
         segment["speaker"] = json!(label_of(ordinal));
         labelled += 1;
     }
+
+    if labelled > 0 {
+        fill_gaps(items);
+    }
     labelled
+}
+
+/// Give every remaining segment the speaker of its nearest labelled neighbour.
+///
+/// The diarizer's turns do not cover a recording end to end — they skip
+/// silence, and `cluster_for_segment` gives up on a segment no turn holds most
+/// of. Those segments used to reach [`crate::meeting::turns`] with no speaker
+/// at all, and that function reads a missing speaker as `You`, because for a
+/// meeting it means the local microphone.
+///
+/// On a diarized note there is no "you". A 13-minute interview came back
+/// reading as a conversation between "You" and "Speaker 1" — 58 of its 148
+/// segments were uncovered, and every one of them was attributed to somebody
+/// who is not in the recording. A fabricated name is worse than a missing one:
+/// nothing about it looks like a gap.
+///
+/// Carrying the previous speaker forward is the assumption a listener makes
+/// anyway — the words either side of a pause are usually the same person — and
+/// where the gap is at the very start there is no previous, so the first
+/// labelled speaker is carried backwards instead.
+fn fill_gaps(items: &mut [Value]) {
+    let mut carried: Option<String> = None;
+    for segment in items.iter_mut() {
+        match segment["speaker"].as_str() {
+            Some(name) => carried = Some(name.to_string()),
+            None => {
+                if let Some(name) = &carried {
+                    segment["speaker"] = json!(name);
+                }
+            }
+        }
+    }
+
+    // Anything before the first label has nothing behind it to inherit.
+    let first = items
+        .iter()
+        .find_map(|s| s["speaker"].as_str().map(str::to_string));
+    if let Some(first) = first {
+        for segment in items.iter_mut() {
+            if segment["speaker"].as_str().is_some() {
+                break;
+            }
+            segment["speaker"] = json!(first);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A segment no turn covers must not reach the grouper unlabelled.
+    ///
+    /// `meeting::turns` reads a missing speaker as "You", because in a meeting
+    /// that is what it means. On a diarized note there is no "you", and a
+    /// 13-minute interview came back as a conversation between "You" and
+    /// "Speaker 1" — 58 of 148 segments uncovered, every one attributed to
+    /// somebody not in the room.
+    #[test]
+    fn segments_between_turns_take_the_voice_around_them() {
+        let turns = vec![
+            Turn { start: 0.0, end: 5.0, cluster: 0 },
+            Turn { start: 9.0, end: 14.0, cluster: 1 },
+        ];
+        let mut segments = json!([
+            { "start": 0.0, "end": 4.0, "text": "one" },
+            { "start": 5.5, "end": 8.0, "text": "in the gap" },
+            { "start": 9.5, "end": 13.0, "text": "two" },
+        ]);
+        assert!(label_segments(&mut segments, &turns) > 0);
+
+        let got: Vec<&str> = segments
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["speaker"].as_str().unwrap_or("MISSING"))
+            .collect();
+        assert!(
+            !got.contains(&"MISSING"),
+            "every segment must be named, or the grouper invents one: {got:?}"
+        );
+        assert_eq!(got[1], got[0], "a gap carries the voice before it");
+    }
+
+    #[test]
+    fn a_gap_at_the_very_start_takes_the_voice_after_it() {
+        let turns = vec![
+            Turn { start: 6.0, end: 10.0, cluster: 0 },
+            Turn { start: 11.0, end: 16.0, cluster: 1 },
+        ];
+        let mut segments = json!([
+            { "start": 0.0, "end": 4.0, "text": "before anybody was recognised" },
+            { "start": 6.5, "end": 9.0, "text": "one" },
+            { "start": 11.5, "end": 15.0, "text": "two" },
+        ]);
+        assert!(label_segments(&mut segments, &turns) > 0);
+        let got: Vec<&str> = segments
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["speaker"].as_str().unwrap_or("MISSING"))
+            .collect();
+        assert_eq!(got[0], got[1], "nothing precedes it, so it takes what follows");
+    }
+
+    /// The helper reads one shape of WAV, and it is not the only shape there is.
+    ///
+    /// sherpa's reader wants a canonical PCM header — `fmt ` exactly 16 bytes —
+    /// and refuses anything else with `Expected subchunk1_size 16`. macOS's own
+    /// `afconvert` writes 40, because it emits WAVE_FORMAT_EXTENSIBLE, and is
+    /// refused. `hound` with this spec writes 16.
+    ///
+    /// Asserted on the bytes rather than trusted, because the failure is not a
+    /// compile error or a panic: it is a feature that quietly cannot read the
+    /// recordings it exists for.
+    #[test]
+    fn the_working_file_has_a_header_the_helper_accepts() {
+        let path = std::env::temp_dir().join("voicedumps-wav-shape-test.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut wav = hound::WavWriter::create(&path, spec).unwrap();
+        for i in 0..64 {
+            wav.write_sample(i as i16).unwrap();
+        }
+        wav.finalize().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(&bytes[0..4], b"RIFF", "sherpa checks this first");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[12..16], b"fmt ");
+        let fmt_size = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        assert_eq!(fmt_size, 16, "an extensible header is refused by the helper");
+        let channels = u16::from_le_bytes(bytes[22..24].try_into().unwrap());
+        let rate = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        assert_eq!((channels, rate), (1, 16_000), "both models want 16 kHz mono");
+    }
+
     use super::*;
 
     fn turn(start: f64, end: f64, cluster: u32) -> Turn {
@@ -449,8 +776,18 @@ not a turn at all
     }
 
     #[test]
-    fn uncovered_segments_are_left_alone() {
-        // Silence, music and crosstalk land here. Guessing would be inventing.
+    fn uncovered_segments_take_the_voice_before_them() {
+        // This used to assert the opposite — that an uncovered segment keeps no
+        // speaker, on the grounds that silence, music and crosstalk land there
+        // and guessing would be inventing. The principle is right and the
+        // conclusion was wrong, because "no speaker" is not what the reader
+        // ends up seeing: `meeting::turns` reads a missing speaker as "You",
+        // so leaving it blank does not decline to guess, it hands the words to
+        // somebody who is not in the recording. Carrying the previous voice is
+        // the smaller invention, and the one a listener makes anyway.
+        //
+        // The count is still the number *recognised*, not the number named:
+        // filling a gap is not evidence of anybody.
         let turns = vec![turn(0.0, 5.0, 0), turn(5.0, 9.0, 1)];
         let mut segments = json!([
             segment(0.0, 4.0, &[(0.0, 4.0)]),
@@ -458,6 +795,6 @@ not a turn at all
         ]);
         assert_eq!(label_segments(&mut segments, &turns), 1);
         assert_eq!(segments[0]["speaker"], "Speaker 1");
-        assert!(segments[1].get("speaker").is_none());
+        assert_eq!(segments[1]["speaker"], "Speaker 1");
     }
 }

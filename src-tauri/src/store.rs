@@ -99,6 +99,17 @@ pub fn open(dir: &PathBuf) -> rusqlite::Result<Connection> {
         [],
     )
     .ok();
+    // Whether the diarizer has been over this note. Drives the one-time
+    // backfill of older transcripts, and — the part the flag is really for —
+    // stops it re-running the ones where the answer was "one voice". Those
+    // finish with no labels, so without a mark of having looked they stay
+    // candidates forever and the sweep never ends. Existing rows default to 0
+    // so the backfill sees them once.
+    conn.execute(
+        "ALTER TABLE transcripts ADD COLUMN speakers_checked INTEGER NOT NULL DEFAULT 0",
+        [],
+    )
+    .ok();
     // Which app had focus when a dictation was spoken — the one number that
     // turns "you dictated 4,000 words" into something worth knowing. Only the
     // hotkey path fills it; everything else stays empty rather than guessing,
@@ -938,6 +949,43 @@ pub fn ai_titled(conn: &Connection, id: &str) -> bool {
 /// Notes that still want an AI title: never titled, have text, and — for
 /// dictations, which are mostly short throwaways — long enough to be worth it.
 /// Returns `(id, text)` newest first.
+/// Note that the diarizer has been over this one, whatever it found.
+pub fn mark_speakers_checked(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE transcripts SET speakers_checked = 1 WHERE id = ?1",
+        [id],
+    )?;
+    Ok(())
+}
+
+/// Notes the diarizer has never been over, newest first.
+///
+/// Newest first because that is the order somebody would want them in if they
+/// only ever get through half — the note from this morning is likelier to be
+/// looked at again than one from March. `meeting` is excluded here as well as
+/// in `wants_speakers`, so a sweep cannot spend an hour on the recordings that
+/// already know who spoke.
+pub fn list_unlabelled(
+    conn: &Connection,
+    min_seconds: f64,
+) -> rusqlite::Result<Vec<(String, f64)>> {
+    let mut stmt = conn.prepare(
+        // `paragraphs NOT LIKE` excludes anything already carrying speaker
+        // names, which the flag alone cannot: every note saved before that
+        // column existed has `speakers_checked = 0`, including ones labelled by
+        // hand or by an earlier run. Re-diarizing those overwrites real names
+        // with guesses.
+        "SELECT id, duration FROM transcripts
+          WHERE speakers_checked = 0
+            AND source != 'meeting'
+            AND duration >= ?1
+            AND paragraphs NOT LIKE '%\"speaker\"%'
+          ORDER BY created_at DESC",
+    )?;
+    let rows = stmt.query_map([min_seconds], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
 pub fn list_untitled(
     conn: &Connection,
     hotkey_min_words: i64,
