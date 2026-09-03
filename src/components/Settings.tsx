@@ -24,6 +24,8 @@ type Props = {
   settings: Stored | null;
   onLivePreview: (enabled: boolean) => void;
   onDiarization: (enabled: boolean) => void;
+  onHoldToTalk: (enabled: boolean) => void;
+  onRestoreClipboard: (enabled: boolean) => void;
   onMicrophone: (name: string | null) => void;
   onShortcut: (chord: string) => Promise<void>;
   /** Null until the backend has been asked whether this Mac can record calls. */
@@ -317,6 +319,8 @@ export function Settings({
   settings,
   onLivePreview,
   onDiarization,
+  onHoldToTalk,
+  onRestoreClipboard,
   onMicrophone,
   onShortcut,
   meeting,
@@ -396,9 +400,35 @@ export function Settings({
         <Group title="DICTATION">
           <Row
             label="Shortcut"
-            note="Hold these keys to record, let go to stop. Modifiers only — the keyboard is watched, not taken over, so a letter would also reach whatever you are dictating into."
+            note="The keys that start a dictation. Modifiers only — the keyboard is watched, not taken over, so a letter would also reach whatever you are dictating into."
             control={
               <ShortcutRecorder chord={settings.shortcut} onChoose={onShortcut} />
+            }
+          />
+          <div className="border-t border-hairline" />
+          <Row
+            label="Hold to talk"
+            note={
+              settings.hold_to_talk
+                ? "Hold the keys down while you speak, and let go to stop. Turn this off and they become a switch: press once to start, press again to stop."
+                : "The keys are a switch — press once to start, press again to stop. Nothing ends the recording on its own for the first half hour, so the pill on screen is what tells you it is still listening."
+            }
+            control={
+              <Switch
+                on={settings.hold_to_talk}
+                onClick={() => onHoldToTalk(!settings.hold_to_talk)}
+              />
+            }
+          />
+          <div className="border-t border-hairline" />
+          <Row
+            label="Give the clipboard back"
+            note="Your words are pasted through the clipboard. This puts back whatever was on it a moment later, so you can keep something copied across a dictation. Turn it off to leave the transcript there instead, ready to paste again."
+            control={
+              <Switch
+                on={settings.restore_clipboard}
+                onClick={() => onRestoreClipboard(!settings.restore_clipboard)}
+              />
             }
           />
           <div className="border-t border-hairline" />
@@ -415,7 +445,7 @@ export function Settings({
           <div className="border-t border-hairline" />
           <Row
             label="Find speakers"
-            note="Label the different voices in a recording made on one microphone — a room, an interview, a file you dropped in. Downloads 42 MB the first time. Meetings are left alone: both sides were recorded separately, so they already know who spoke."
+            note="Labels the different voices in a recording made on one microphone — a room, an interview, a file you dropped in. Files you bring in are labelled on their own, once the transcript is saved; dictations are not, since holding a key to talk is one voice. Every note also gets a SPEAKERS button you can press yourself. Downloads 42 MB the first time. Meetings are left alone: both sides were recorded separately, so they already know who spoke."
             control={
               <Switch
                 on={settings.diarization}

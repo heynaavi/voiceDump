@@ -17,6 +17,7 @@ import {
   watchMeetingDetected,
   watchMeetingEnded,
   watchSideMissing,
+  watchSpeakersFound,
   watchMeetingFailed,
   watchMeetingOfferClosed,
   watchMeetingProgress,
@@ -27,8 +28,10 @@ import {
   renameTranscript,
   saveTranscript,
   setDiarization,
+  setHoldToTalk,
   setLivePreview,
   setMicrophone,
+  setRestoreClipboard,
   setShortcut,
   sidecarStatus,
   startJob,
@@ -372,6 +375,20 @@ export default function App() {
     });
   }, []);
 
+  const applyHoldToTalk = useCallback((enabled: boolean) => {
+    setSettings((s) => (s ? { ...s, hold_to_talk: enabled } : s));
+    setHoldToTalk(enabled).then(setSettings).catch(() => {
+      setSettings((s) => (s ? { ...s, hold_to_talk: !enabled } : s));
+    });
+  }, []);
+
+  const applyRestoreClipboard = useCallback((enabled: boolean) => {
+    setSettings((s) => (s ? { ...s, restore_clipboard: enabled } : s));
+    setRestoreClipboard(enabled).then(setSettings).catch(() => {
+      setSettings((s) => (s ? { ...s, restore_clipboard: !enabled } : s));
+    });
+  }, []);
+
   const applyMicrophone = useCallback((name: string | null) => {
     setSettings((s) => (s ? { ...s, microphone: name } : s));
     setMicrophone(name)
@@ -407,6 +424,19 @@ export default function App() {
           if (naming) next.add(id);
           else next.delete(id);
           return next;
+        });
+      }),
+      // Speakers were found on a note that was just saved. Its text and its
+      // turns have both been rewritten, so unlike a rename there is nothing to
+      // patch in place — the open note is re-read, and only when it is the one
+      // that changed.
+      watchSpeakersFound(({ id, speakers }) => {
+        if (speakers < 1) return;
+        setActive((a) => {
+          if (a && a.id === id) {
+            getTranscript(id).then(setActive).catch(() => {});
+          }
+          return a;
         });
       }),
       // The AI title landed; swap it in place so the card renames itself
@@ -748,6 +778,8 @@ export default function App() {
             settings={settings}
             onLivePreview={applyLivePreview}
             onDiarization={applyDiarization}
+            onHoldToTalk={applyHoldToTalk}
+            onRestoreClipboard={applyRestoreClipboard}
             onMicrophone={applyMicrophone}
             onShortcut={applyShortcut}
             meeting={meeting}

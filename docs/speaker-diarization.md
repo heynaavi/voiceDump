@@ -79,9 +79,6 @@ most to gain.
 
 ## Open, pending the prototype
 
-- **When it runs.** At ingest for meetings, or on demand behind a button? Long
-  notes already brief themselves in the background, so there is a pattern for
-  doing it unasked — but only if it is fast enough to be invisible.
 - **How honest to be visually.** A diarized name is a guess and a typed name is
   not. Whether the reading view should say so is a real question, not an obvious
   yes: a hedge on every line is its own kind of noise.
@@ -252,3 +249,26 @@ Four megabytes for thirteen points is the wrong direction.
    a room, one microphone, several people — has never been measured, because no
    recording of that kind exists on this machine. Beta users are how that gets
    answered, and a switch is how they stop paying for it if the answer is bad.
+
+## What shipped
+
+All six, as the `find_speakers` command and the "Find speakers" switch beside it.
+
+The "when it runs" question this document left open is answered, and the answer
+turned out to be neither of the two it offered. Not at ingest for everything,
+and not only on demand: **at ingest for the recordings that can have several
+voices in them, on demand for the rest.**
+
+A file somebody brings in is labelled by itself once its transcript is saved.
+Dictations are not, and that exclusion is the whole point — holding a key to
+talk is one voice by construction, and on a real 796-note library it is 94% of
+the notes, so an ingest-time pass there would spend a minute of CPU each on
+almost everything to learn almost nothing. Meetings are excluded too, and more
+firmly: they recorded their two sides separately and already know who spoke, so
+a guess would be a downgrade.
+
+The switch does both jobs. On, it turns on that automatic pass and puts a
+SPEAKERS button on every note, which is how a dictation or an older recording
+gets labelled despite being excluded above. Off, neither happens and nothing is
+downloaded. It ships on, so the 42 MB arrives with the first recording that
+could actually use it — and never at all for somebody who only dictates.

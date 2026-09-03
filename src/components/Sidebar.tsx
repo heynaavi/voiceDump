@@ -47,6 +47,22 @@ const ORIGIN: Record<Origin, { mark: string; label: string }> = {
   meeting: { mark: "MTG", label: "Recorded meeting" },
 };
 
+/**
+ * How many rows get the entrance.
+ *
+ * The rail is about fifteen rows tall, so this is the ones somebody can
+ * actually watch arrive, plus a few for a fast scroll. Everything below is put
+ * straight at its resting state.
+ *
+ * It used to be all of them, and that is the kind of bug that grows with the
+ * library rather than being either there or not: `stagger: 0.022` across 789
+ * notes is a seventeen-second animation, re-triggered on every tab switch,
+ * every save, every rename and every search keystroke — with GSAP writing
+ * inline styles to 789 elements on every frame of it. On a young library that
+ * is a pleasant wipe. On a real one it is the app hanging.
+ */
+const ENTERING = 20;
+
 const GROUP_ORDER = ["Today", "Yesterday", "This week", "This month", "Earlier"];
 
 /**
@@ -222,11 +238,16 @@ export function Sidebar({
   // Remember each row's last title so we can play the reveal only when a title
   // actually *changes* (an AI rename), not on first paint or when filtering.
   const prevTitles = useRef<Map<string, string>>(new Map());
+  // Keyed on `items` rather than running every render. What this has to be
+  // true for is the *next* render's comparison, and nothing but a change to
+  // `items` can change the answer — so with 789 notes the version without a
+  // dependency array rebuilt a 789-entry Map on every keystroke, hover and
+  // selection, to arrive at exactly what it already held.
   useEffect(() => {
     const m = prevTitles.current;
     m.clear();
     for (const it of items) m.set(it.id, it.title);
-  });
+  }, [items]);
 
   // Per-tab counts come off the full list so the numbers stay put as you switch.
   const counts = useMemo(() => {
@@ -254,19 +275,30 @@ export function Sidebar({
 
   // Rows wipe in from the left edge — like rows printing, not cards floating.
   const scope = useGsap(({ scope }) => {
+    const rows = Array.from(scope.querySelectorAll("[data-row]"));
+    // Anything below the fold is not animated at all — just put at its resting
+    // state, in case an earlier entrance left it part-way through one.
+    gsap.set(rows.slice(ENTERING), { clearProps: "opacity,transform" });
     gsap.fromTo(
-      scope.querySelectorAll("[data-row]"),
+      rows.slice(0, ENTERING),
       { opacity: 0, x: -6 },
       {
         opacity: 1,
         x: 0,
         duration: 0.28,
         ease: EASE.snap,
-        stagger: 0.022,
+        // `amount` rather than a per-row `each`: the whole stagger is spread
+        // over a third of a second however many rows there are, so this cannot
+        // get slower again as somebody's library grows.
+        stagger: { amount: 0.35 },
         overwrite: true,
       },
     );
-  }, [tab, items.map((i) => i.id).join(",")]);
+    // Depending on how many notes there are and which is newest, rather than on
+    // a joined string of every id — that key was ~10 KB of string built on
+    // every single render, to detect a change that these two numbers already
+    // show.
+  }, [tab, items.length, items[0]?.id]);
 
   return (
     <aside
@@ -430,7 +462,14 @@ export function Sidebar({
                     <li
                       key={item.id}
                       data-row
-                      className="group/row relative gsap-init"
+                      // `content-visibility` is what makes a long library
+                      // scroll: the browser skips layout and paint for rows
+                      // outside the viewport instead of doing the work for all
+                      // 789 of them. `contain-intrinsic-size` gives it a height
+                      // to reserve so the scrollbar doesn't jump, and `auto`
+                      // means it remembers each row's real height once it has
+                      // been rendered once.
+                      className="group/row relative gsap-init [content-visibility:auto] [contain-intrinsic-size:auto_44px]"
                     >
                       <button
                         onClick={() => onSelect(item.id)}

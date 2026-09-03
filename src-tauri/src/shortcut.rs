@@ -21,7 +21,7 @@
 //! human. It is turned into a bitmask once, at the edge, and compared as an
 //! integer on the tap thread.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // `CGEventFlags` bits. Named here rather than pulled from `core-graphics` so
 // this module builds and tests on any host.
@@ -117,9 +117,49 @@ pub fn is_held(flags: u64) -> bool {
     matches(flags, HELD.load(Ordering::Relaxed))
 }
 
+// -- hold, or switch --------------------------------------------------------
+
+/// Whether the chord has to stay down for the whole dictation.
+///
+/// Holding is the default and stays it: the key is down for exactly as long as
+/// you are talking, so there is no state to remember and no way to leave the
+/// microphone running by walking away. It is also the harder thing to do on a
+/// laptop with one hand busy, and a long dictation with the globe key held is
+/// genuinely uncomfortable — which is the whole reason the other mode exists.
+///
+/// The alternative is a switch: one press starts, the next one stops, and the
+/// releases in between mean nothing. See [`crate::dictation::spawn`] for how
+/// the two edges are read differently.
+///
+/// An `AtomicBool` for the same reason [`HELD`] is an atomic — this is read
+/// inside the event-tap callback, which runs on every modifier press on the
+/// machine and must never wait on a lock.
+static HOLD: AtomicBool = AtomicBool::new(true);
+
+/// Tell the tap which of the two the chord is. Called at startup from the
+/// stored settings, and again whenever the switch is flipped.
+pub fn arm_hold(hold: bool) {
+    HOLD.store(hold, Ordering::Relaxed);
+}
+
+/// Whether the chord is push-to-talk right now.
+pub fn is_hold_to_talk() -> bool {
+    HOLD.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn holding_is_what_the_tap_assumes_until_told_otherwise() {
+        // The stored setting arms this at startup; a build that never got that
+        // far must still behave the way dictation always has.
+        assert!(is_hold_to_talk());
+        arm_hold(false);
+        assert!(!is_hold_to_talk());
+        arm_hold(true);
+    }
 
     #[test]
     fn the_default_is_the_globe_key() {

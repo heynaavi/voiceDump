@@ -53,17 +53,61 @@ pub struct Settings {
 
     /// Put names to the voices in recordings that have only one track.
     ///
-    /// **Off by default, and that is the honest posture rather than a timid
-    /// one.** The case this exists for — one microphone, several people in a
-    /// room — has never been measured, because no recording of that kind
-    /// existed to measure it on. What has been measured is a clean four-voice
-    /// fixture at 93-99% and a two-track call at 70.9%, and the second of those
-    /// is a case this must never run on anyway, since the two sides were
-    /// recorded separately and already know who spoke.
+    /// **On by default**, which is a change and worth stating the cost of. It
+    /// used to be off on the grounds that the case it exists for — one
+    /// microphone, several people in a room — had never been measured, and
+    /// that switching it on costs a 42 MB download nobody should pay for
+    /// silently. Both of those are still true. What changed is the judgement
+    /// about who should carry them: somebody who drops a recording of three
+    /// people into this app wants the names, and finding a switch first is a
+    /// worse trade than a download they only pay for once.
     ///
-    /// It also costs a 42 MB download the first time it is switched on, which
-    /// nobody should pay for silently.
+    /// What *has* been measured stays worth knowing: a clean four-voice fixture
+    /// at 93-99%, and a two-track call at 70.9%. The second of those is a case
+    /// this must never run on anyway, since the two sides were recorded
+    /// separately and already know who spoke.
+    ///
+    /// The download is still not silent and still not paid by everybody. It
+    /// happens on the first recording that could actually have several voices
+    /// in it — see `wants_speakers`, which excludes dictations and meetings —
+    /// so a person who only ever dictates never fetches a model at all.
+    ///
+    /// This only reaches somebody whose settings file has no opinion yet, which
+    /// is a fresh install. Anybody who has ever saved a setting has a stored
+    /// `false` and keeps it, deliberately: a default is what to do absent an
+    /// answer, not licence to overrule one.
     pub diarization: bool,
+
+    /// Whether the dictation chord has to be held down for the whole recording.
+    ///
+    /// **On by default, because it is what the app has always done** and a
+    /// setting should explain the behaviour rather than quietly change it.
+    ///
+    /// Holding is the safer of the two — the microphone is live for exactly as
+    /// long as your finger is, and there is no state to lose track of. It is
+    /// also the one that hurts on a long dictation, and the one you cannot do
+    /// while your other hand is on the mouse. Off, the chord is a switch:
+    /// press and release to start, press and release again to stop.
+    ///
+    /// A switch can be left on, which holding cannot — see
+    /// [`crate::dictation::LATCHED_LIMIT`] for what stops that becoming an
+    /// overnight recording.
+    pub hold_to_talk: bool,
+
+    /// Whether whatever was on the clipboard goes back after a dictation.
+    ///
+    /// **On by default**, again because it is the existing behaviour: the text
+    /// is pasted through the clipboard, and putting back what it displaced is
+    /// what makes the clipboard a place you can keep something across a
+    /// dictation rather than a channel this happens to use.
+    ///
+    /// Off, the transcript stays there — which is what you want if the paste is
+    /// the start of what you are doing with the words rather than the end of
+    /// it, or if it landed somewhere that mangled it and you want to try again
+    /// with a plain paste. The tray's "Copy Last Transcript" covers that case
+    /// either way; this makes it the default for people who reach for it every
+    /// time.
+    pub restore_clipboard: bool,
 }
 
 impl Default for Settings {
@@ -72,7 +116,9 @@ impl Default for Settings {
             live_preview: cfg!(feature = "assistant"),
             microphone: None,
             shortcut: crate::shortcut::DEFAULT.to_string(),
-            diarization: false,
+            diarization: true,
+            hold_to_talk: true,
+            restore_clipboard: true,
         }
     }
 }
@@ -129,9 +175,44 @@ pub fn diarization(app: &tauri::AppHandle) -> bool {
         .unwrap_or_default()
 }
 
+/// Whether the dictation chord must be held down.
+///
+/// Not read on the tap thread — [`crate::shortcut::is_hold_to_talk`] is, and it
+/// is armed from this. This is here so startup and the settings command have
+/// one place to read the stored value from.
+pub fn hold_to_talk(app: &tauri::AppHandle) -> bool {
+    app.try_state::<SettingsState>()
+        .and_then(|s| s.0.lock().ok().map(|g| g.hold_to_talk))
+        .unwrap_or_else(|| Settings::default().hold_to_talk)
+}
+
+/// Whether to put the previous clipboard contents back after pasting.
+///
+/// Same contract as [`live_preview`]: read from the dictation path, so a
+/// poisoned lock gives back the default rather than taking the paste down.
+pub fn restore_clipboard(app: &tauri::AppHandle) -> bool {
+    app.try_state::<SettingsState>()
+        .and_then(|s| s.0.lock().ok().map(|g| g.restore_clipboard))
+        .unwrap_or_else(|| Settings::default().restore_clipboard)
+}
+
 /// Turn speaker labelling on or off.
 ///
-/// Fetching the models is the caller's job, not this one's: a settings write
+/// On, a recording brought in as a file is labelled by itself once its
+/// transcript is saved — see `wants_speakers`, which is where the judgement
+/// about *which* recordings lives. Dictations are excluded there rather than
+/// here: holding a key to talk is one voice, and it is 94% of a real library,
+/// so an automatic pass over them would cost nearly everything and learn
+/// nearly nothing.
+///
+/// The switch does two things, and it is worth being clear that it is both.
+/// It reveals the SPEAKERS button on every note, which is how a dictation or
+/// an old recording gets labelled despite being excluded above — "usually
+/// pointless" is not "never wanted". And it turns on the automatic pass for
+/// the recordings where it usually is wanted. Off, neither happens and nothing
+/// is downloaded.
+///
+/// Fetching the models is that action's job, not this one's: a settings write
 /// that blocks on a 42 MB download would look like the switch was broken.
 #[tauri::command]
 pub fn set_diarization(
@@ -142,6 +223,43 @@ pub fn set_diarization(
     let updated = {
         let mut guard = state.0.lock().unwrap();
         guard.diarization = enabled;
+        guard.clone()
+    };
+    persist(&app, &updated)?;
+    Ok(updated)
+}
+
+/// Choose between holding the chord and switching it.
+///
+/// The tap is re-pointed before the write, for the same reason
+/// [`set_shortcut`] does it: the keyboard should agree with the switch on the
+/// very next press, whether or not the file lands.
+#[tauri::command]
+pub fn set_hold_to_talk(
+    app: tauri::AppHandle,
+    state: tauri::State<SettingsState>,
+    enabled: bool,
+) -> Result<Settings, String> {
+    crate::shortcut::arm_hold(enabled);
+    let updated = {
+        let mut guard = state.0.lock().unwrap();
+        guard.hold_to_talk = enabled;
+        guard.clone()
+    };
+    persist(&app, &updated)?;
+    Ok(updated)
+}
+
+/// Choose whether a dictation costs you your clipboard.
+#[tauri::command]
+pub fn set_restore_clipboard(
+    app: tauri::AppHandle,
+    state: tauri::State<SettingsState>,
+    enabled: bool,
+) -> Result<Settings, String> {
+    let updated = {
+        let mut guard = state.0.lock().unwrap();
+        guard.restore_clipboard = enabled;
         guard.clone()
     };
     persist(&app, &updated)?;

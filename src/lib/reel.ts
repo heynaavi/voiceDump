@@ -3,8 +3,13 @@
  *
  * Same card, same drawing code as the PNG — `share.paint` takes a `Reveal` and
  * this animates it with GSAP instead of passing `FULL`. Keeping one painter
- * means the still and the reel cannot drift apart, and the last frame of the
- * video is the PNG.
+ * means the still and the reel cannot drift apart.
+ *
+ * The two no longer end in the same place. When the model has written a
+ * sentence out of the words, the reel finishes by rearranging the cloud into
+ * it and the still image does not — see `FULL` in `share.ts` for why that is a
+ * decision rather than an oversight. Up to that point the last frame is still
+ * the PNG.
  *
  * Recorded rather than encoded frame by frame: `canvas.captureStream()` plus
  * `MediaRecorder` is the only encoder available without shipping one, and it
@@ -74,7 +79,14 @@ export async function renderReel(
 
   // First frame before the recorder starts, so the video never opens on a
   // transparent flash while the timeline is still being built.
-  const at: Reveal = { grain: 0, header: 0, words: 0, footer: 0, brand: 0 };
+  const at: Reveal = {
+    grain: 0,
+    header: 0,
+    words: 0,
+    footer: 0,
+    brand: 0,
+    sentence: 0,
+  };
   paint(ctx, data, at);
 
   // The score shares the recording. `openScore` returns null where Web Audio
@@ -116,8 +128,20 @@ export async function renderReel(
     // The words are the point, so they get the middle and most of the runtime.
     // `none` because each word has its own ease inside `paint` — easing the
     // counter as well would bunch the arrivals at both ends.
-    .to(at, { words, duration: Math.max(1.8, words * 0.085), ease: "none" }, 0.95)
-    .to(at, { footer: 1, duration: 0.6, ease: "power2.out" }, ">-0.1")
+    .to(at, { words, duration: Math.max(1.8, words * 0.085), ease: "none" }, 0.95);
+
+  // The turn: the cloud collects itself into a sentence.
+  //
+  // A beat first, because the cloud is the thing being read and it has only
+  // just finished arriving — moving it immediately would mean nobody saw it
+  // whole. `none` again, for the same reason the words use it: every word has
+  // its own window and its own ease inside `paint`, and easing this counter as
+  // well would bunch them at both ends.
+  if (data.sentence) {
+    tl.to(at, { sentence: 1, duration: 3.4, ease: "none" }, ">+0.5");
+  }
+
+  tl.to(at, { footer: 1, duration: 0.6, ease: "power2.out" }, ">-0.1")
     // Branding last and quietly, assembling cell by cell like the app's own
     // mark does — a logo that announces itself over the content gets cropped.
     .to(at, { brand: 1, duration: 0.9, ease: "power1.out" }, ">-0.2")
@@ -144,7 +168,10 @@ export async function renderReel(
         while (sounded < Math.floor(at.words) - 1 && sounded < words - 1) {
           score.word(++sounded);
         }
-        if (!sweptAt && at.footer > 0) {
+        // The sweep marks the first structural move after the words: the
+        // sentence when there is one, the footer's rule when there is not. It
+        // fires once either way, so a reel with a sentence does not get two.
+        if (!sweptAt && (at.sentence > 0 || at.footer > 0)) {
           sweptAt = true;
           score.sweep();
         }

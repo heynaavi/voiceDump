@@ -327,6 +327,72 @@ const STOP_WORDS: &[&str] = &[
     "ll", "d", "m",
 ];
 
+/// Contractions, which are function words wearing an apostrophe.
+///
+/// These belong in [`STOP_WORDS`] and are separate only because of *why* they
+/// were missing, which is worth recording. That list ends with `"s", "t", "re",
+/// "ve", "ll", "d", "m"` — the tails of exactly these words, which only ever
+/// match if something has already split the contraction on its apostrophe.
+/// Nothing does: [`normalise`] deliberately keeps `'` so possessives survive.
+///
+/// It half worked, which is why it lasted. A curly apostrophe is not `'` and
+/// not alphabetic, so `it’s` *is* split, into `it` and `s`, and both are
+/// stopped. Whisper writes straight apostrophes, so `it's` came through whole
+/// and matched nothing. On a real 796-note library that put `it's`, `don't`,
+/// `let's`, `i'm`, `that's` and `i'll` into the top twenty-five — six of the
+/// twenty-five words on a card that is supposed to say what somebody talks
+/// about.
+const CONTRACTIONS: &[&str] = &[
+    "i'm", "i'll", "i've", "i'd", "it's", "it'll", "that's", "that'll", "there's", "there'll",
+    "here's", "what's", "who's", "let's", "he's", "she's", "we're", "we've", "we'll", "we'd",
+    "you're", "you've", "you'll", "you'd", "they're", "they've", "they'll", "they'd", "don't",
+    "doesn't", "didn't", "isn't", "aren't", "wasn't", "weren't", "can't", "won't",
+    "wouldn't", "couldn't", "shouldn't", "haven't", "hasn't", "hadn't", "ain't", "y'all",
+];
+
+/// Ordinary conversational English — the words everybody uses, whatever they do.
+///
+/// [`STOP_WORDS`] holds function words: articles, pronouns, prepositions. This
+/// holds the layer above them, and it exists because filtering only function
+/// words does not produce a list of what somebody talks about. Measured on a
+/// real 796-note library, the top of the card was `right, good, maybe, time,
+/// something, nice, little, first, better, sure, bit, give, take, feel` —
+/// every one of them true, none of them a subject. The words that actually
+/// said what this person does — `project, client, design, transcript, editor,
+/// production, animation` — sat below them, unseen.
+///
+/// **Built with the on-device model and then reviewed, not generated.** The
+/// model sorted the 320 commonest words in that library into general English
+/// and subject words; it was right about most and wrong in a way that matters,
+/// calling `cut`, `footage`, `save`, `download`, `test` and `build` ordinary.
+/// Each of those is what somebody's job is made of — an editor talks about
+/// cuts, a developer about builds — and this list ships to everybody, so a
+/// wrong entry deletes a real subject from a stranger's card. Thirty-five were
+/// refused on that ground and forty-eight obvious ones the model had missed were
+/// added by hand.
+///
+/// The bias is deliberate and one-directional: when a word could be either, it
+/// stays out of this list. A general word ranking a little high costs a row on
+/// a card. A subject word in here can never appear at all.
+const GENERAL_WORDS: &[&str] = &[
+    "able", "actually", "added", "ahead", "already", "alright", "always", "another", "anybody",
+    "anything", "around", "ask", "automatically", "back", "based", "basically", "believe", "best",
+    "better", "big", "bit", "bring", "bye", "came", "case", "come", "comes", "coming", "correct",
+    "day", "days", "different", "done", "earlier", "else", "end", "entire", "even", "every",
+    "everyone", "everything", "feel", "find", "fine", "first", "five", "four", "give", "goes",
+    "gonna", "good", "great", "happening", "happens", "hear", "help", "hope", "idea",
+    "keep", "last", "later", "left", "less", "little", "long", "look", "looking", "looks",
+    "lot", "lots", "main", "makes", "making", "many", "maybe", "minutes", "month",
+    "morning", "mostly", "much", "name", "needed", "new", "next", "nice", "nobody", "nothing",
+    "noticed", "number", "obviously", "part", "particular", "people", "perhaps", "place", "please",
+    "plenty", "point", "pretty", "probably", "put", "quite", "remember", "right", "said", "say",
+    "saying", "says", "second", "seconds", "seems", "sense", "show", "small", "somebody",
+    "something", "sometimes", "sorry", "started", "still", "stuff", "sure", "take", "takes",
+    "talking", "tell", "testing", "thank", "thing", "things", "thinking", "thought", "three",
+    "time", "today", "try", "trying", "understand", "use", "used", "useful", "using", "usually",
+    "wanted", "went", "whatever", "whole", "word", "words", "worked", "works", "year", "yes"
+];
+
 /// Only unambiguous fillers.
 ///
 /// "like", "just", "so" and "really" are the loudest fillers in real speech and
@@ -350,6 +416,54 @@ const FILLER_PHRASES: &[&str] = &[
     "i guess",
 ];
 
+/// A meeting transcript without its speaker labels.
+///
+/// Meetings are stored as `"You: ..."` / `"Others: ..."` lines — see
+/// [`crate::meeting::transcript_text`] — and those names are not words anybody
+/// said. Left in, `others` was the **third most-used word** in a real 796-note
+/// library, 491 times, every one of them a label. A word the app wrote itself,
+/// on a card titled "what I talked about".
+///
+/// **Repetition decides, but it decides about the text, not the label.** A
+/// single `"Priority: high"` in a dictated note is not a speaker, so stripping
+/// every `word:` at a line start would quietly eat a word somebody did say.
+/// But once *some* prefix opens two or more lines, this text is a labelled
+/// conversation, and then every prefix in it is a label — including a
+/// participant who only spoke once, who would otherwise keep their name in the
+/// count purely for having been brief.
+///
+/// Case-sensitive and untrimmed of its own accord: labels are written by the
+/// app, or by the user renaming a speaker, so they are stable strings rather
+/// than something to normalise first.
+fn without_speaker_labels(text: &str) -> String {
+    fn prefix(line: &str) -> Option<&str> {
+        let (name, rest) = line.split_once(": ")?;
+        let name = name.trim();
+        let ok = !name.is_empty()
+            && name.chars().count() <= 32
+            && !name.contains(['.', '?', '!', ',']);
+        (ok && !rest.trim().is_empty()).then_some(name)
+    }
+
+    let mut seen: HashMap<&str, i64> = HashMap::new();
+    for line in text.lines() {
+        if let Some(name) = prefix(line) {
+            *seen.entry(name).or_insert(0) += 1;
+        }
+    }
+    if !seen.values().any(|n| *n >= 2) {
+        return text.to_string();
+    }
+
+    text.lines()
+        .map(|line| match prefix(line) {
+            Some(_) => line.split_once(": ").map(|(_, rest)| rest).unwrap_or(line),
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Lowercase, strip anything that isn't a letter, apostrophe or space.
 fn normalise(text: &str) -> String {
     text.chars()
@@ -361,6 +475,34 @@ fn normalise(text: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Count a plural with its singular, where the singular is a word this library
+/// actually uses.
+///
+/// Not a stemmer, and deliberately not: stemming English properly needs rules
+/// this does not have, and a card that says `imag` has failed at the one thing
+/// it does. The condition that makes this safe is the last one — `videos` folds
+/// into `video` only because `video` is itself something somebody said here. A
+/// word whose singular never appears is left exactly as it is.
+///
+/// `-ss`, `-us` and `-is` are excluded outright, since `class`, `focus` and
+/// `analysis` are not plurals of anything.
+fn fold_plurals(freq: &HashMap<String, i64>) -> HashMap<String, i64> {
+    let mut out: HashMap<String, i64> = HashMap::new();
+    for (word, n) in freq {
+        let singular = word
+            .strip_suffix('s')
+            .filter(|_| {
+                word.chars().count() > 4
+                    && !word.ends_with("ss")
+                    && !word.ends_with("us")
+                    && !word.ends_with("is")
+            })
+            .filter(|s| freq.contains_key(*s));
+        *out.entry(singular.unwrap_or(word).to_string()).or_insert(0) += n;
+    }
+    out
 }
 
 fn analyse_text(all: &[String]) -> Vocabulary {
@@ -381,36 +523,58 @@ fn analyse_text(all: &[String]) -> Vocabulary {
             }
         }
 
-        let flat = normalise(text);
+        let flat = normalise(&without_speaker_labels(text));
 
+        // A filler phrase is counted once as a filler and then taken out of the
+        // text the subject matter is read from. It used to be counted and left
+        // in, so its words were also counted as things somebody talks about —
+        // and since "of" is a stop word and "sort" is not, `sort` came top of a
+        // real library's list, 584 times, 110 of them "can sort of". The phrase
+        // was already being called a filler two lines above.
+        let mut content = flat.clone();
         for phrase in FILLER_PHRASES {
             let n = flat.matches(phrase).count() as i64;
             if n > 0 {
                 *filler_counts.entry((*phrase).to_string()).or_insert(0) += n;
+                content = content.replace(phrase, " ");
             }
         }
 
+        // Everything said, for the filler rate's denominator — including the
+        // filler words themselves, which is the point of a rate.
         for word in flat.split_whitespace() {
             let w = word.trim_matches('\'');
             if w.is_empty() {
                 continue;
             }
             total_words += 1;
-
             if FILLERS.contains(&w) {
                 *filler_counts.entry(w.to_string()).or_insert(0) += 1;
-                continue;
             }
-            if w.len() < 3 || STOP_WORDS.contains(&w) {
+        }
+
+        // And what is left once the machinery of speech is out of the way.
+        for word in content.split_whitespace() {
+            let w = word.trim_matches('\'');
+            if w.is_empty()
+                || w.len() < 3
+                || FILLERS.contains(&w)
+                || STOP_WORDS.contains(&w)
+                || CONTRACTIONS.contains(&w)
+                || GENERAL_WORDS.contains(&w)
+            {
                 continue;
             }
             *freq.entry(w.to_string()).or_insert(0) += 1;
         }
     }
 
+    // How large a vocabulary somebody uses, counted before anything is folded:
+    // `video` and `videos` are two words a person knows, whatever the card
+    // chooses to show.
     let unique_words = freq.len() as i64;
 
-    let mut top: Vec<Word> = freq
+    let mut top: Vec<Word> = fold_plurals(&freq)
         .into_iter()
         .map(|(word, count)| Word { word, count })
         .collect();
@@ -1041,6 +1205,128 @@ fn themes(app: &tauri::AppHandle, refresh: bool) -> Result<Option<Value>, String
 
 #[cfg(test)]
 mod tests {
+    // -- what the word cloud counts ----------------------------------------
+
+    #[test]
+    fn ordinary_english_is_not_a_subject() {
+        // The words that used to fill the card, against the words that say what
+        // somebody actually does.
+        let text = "the client project is nice and the design is better, \
+                    really good, maybe the best client project";
+        let v = analyse_text(&[text.to_string()]);
+        let said: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
+        assert!(said.contains(&"client"), "{said:?}");
+        assert!(said.contains(&"project"), "{said:?}");
+        assert!(said.contains(&"design"), "{said:?}");
+        for general in ["nice", "better", "good", "maybe", "best"] {
+            assert!(!said.contains(&general), "{general:?} is not a subject: {said:?}");
+        }
+    }
+
+    #[test]
+    fn a_plural_counts_with_its_singular() {
+        let text = "one video, two videos, three videos about the video";
+        let v = analyse_text(&[text.to_string()]);
+        let video = v.top_words.iter().find(|w| w.word == "video");
+        assert_eq!(video.map(|w| w.count), Some(4));
+        let said: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
+        assert!(!said.contains(&"videos"), "{said:?}");
+    }
+
+    #[test]
+    fn a_word_that_merely_ends_in_s_is_left_alone() {
+        // `focus` is not the plural of `focu`, and nothing here has ever seen
+        // `focu`. The guard is that the singular has to be a word somebody used.
+        let text = "the focus of the focus group was focus and analysis";
+        let v = analyse_text(&[text.to_string()]);
+        let said: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
+        assert!(said.contains(&"focus"), "{said:?}");
+        assert!(said.contains(&"analysis"), "{said:?}");
+        assert!(!said.iter().any(|w| w.ends_with("cu") || w.ends_with("si")), "{said:?}");
+    }
+
+    #[test]
+    fn vocabulary_size_counts_words_a_person_knows() {
+        // Folding is for the card, not for this: `video` and `videos` are two
+        // words somebody knows however the card chooses to show them.
+        let v = analyse_text(&["video videos".to_string()]);
+        assert_eq!(v.unique_words, 2);
+    }
+
+    #[test]
+    fn speaker_labels_are_not_words_anybody_said() {
+        // How `meeting::transcript_text` writes a conversation.
+        let meeting = "You: we should ship the pricing change\n\
+                       Others: agreed, ship the pricing change\n\
+                       You: pricing it is";
+        let v = analyse_text(&[meeting.to_string()]);
+        let said: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
+        assert!(
+            !said.contains(&"others"),
+            "the app's own label must not be a word somebody talks about: {said:?}"
+        );
+        // And the actual subject survives, three times.
+        let pricing = v.top_words.iter().find(|w| w.word == "pricing");
+        assert_eq!(pricing.map(|w| w.count), Some(3));
+    }
+
+    #[test]
+    fn a_colon_that_is_not_a_speaker_keeps_its_word() {
+        // The reason labels have to repeat before they are believed: a dictated
+        // note is full of one-off colons, and eating the word in front of them
+        // would undercount real speech to fix an artefact.
+        let note = "Priority: rewrite the onboarding copy\n\
+                    Deadline: before the onboarding review";
+        let v = analyse_text(&[note.to_string()]);
+        let said: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
+        assert!(said.contains(&"priority"), "{said:?}");
+        assert!(said.contains(&"deadline"), "{said:?}");
+    }
+
+    #[test]
+    fn a_filler_phrase_is_counted_once_and_not_twice() {
+        // "sort of" is already called a filler. Counting `sort` as subject
+        // matter as well made it the single most-used word in a real library.
+        let text = "we can sort of ship it, kind of, you know";
+        let v = analyse_text(&[text.to_string()]);
+        let said: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
+        assert!(!said.contains(&"sort"), "{said:?}");
+        assert!(!said.contains(&"kind"), "{said:?}");
+        // Still counted as fillers, which is the other half of being right.
+        let names: Vec<&str> = v.fillers.iter().map(|f| f.word.as_str()).collect();
+        assert!(names.contains(&"sort of"), "{names:?}");
+        assert!(names.contains(&"kind of"), "{names:?}");
+    }
+
+    #[test]
+    fn a_word_that_only_looks_like_a_filler_survives() {
+        // "sort" on its own is an ordinary word. Only the phrase is a filler,
+        // so only the phrase is removed.
+        let text = "the sort order on the sort column needs a sort key";
+        let v = analyse_text(&[text.to_string()]);
+        let sort = v.top_words.iter().find(|w| w.word == "sort");
+        let names: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
+        assert_eq!(sort.map(|w| w.count), Some(3), "{names:?}");
+    }
+
+    #[test]
+    fn contractions_do_not_count_as_subject_matter() {
+        let text = "it's don't let's i'm that's i'll pricing pricing";
+        let v = analyse_text(&[text.to_string()]);
+        let said: Vec<&str> = v.top_words.iter().map(|w| w.word.as_str()).collect();
+        assert_eq!(said, vec!["pricing"], "only the real word should survive");
+    }
+
+    #[test]
+    fn the_filler_rate_still_counts_every_word_said() {
+        // The denominator is everything spoken, fillers included — that is what
+        // makes it a rate. Taking phrase words out of the *subject* count must
+        // not quietly take them out of this one too.
+        let text = "you know we can sort of ship it";
+        let v = analyse_text(&[text.to_string()]);
+        assert_eq!(v.total_words, 8, "every spoken word counts here");
+    }
+
     use super::*;
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {

@@ -705,6 +705,10 @@ export type Settings = {
   microphone: string | null;
   /** Modifier names joined with `+` — the keys held to dictate. See lib/shortcut. */
   shortcut: string;
+  /** Hold the chord for the whole recording, rather than pressing it twice. */
+  hold_to_talk: boolean;
+  /** Put back whatever the transcript displaced on the clipboard. */
+  restore_clipboard: boolean;
 };
 
 export async function getSettings(): Promise<Settings> {
@@ -728,6 +732,34 @@ export async function setDiarization(enabled: boolean): Promise<Settings> {
  */
 export async function findSpeakers(id: string): Promise<number> {
   return invoke("find_speakers", { id });
+}
+
+/**
+ * One sentence made out of the words on the card, by the on-device model.
+ *
+ * Pass the words that are actually on it — anything the user struck out must
+ * not be sent. Rejects when this Mac has no Apple Intelligence, and when the
+ * model wrote something that was not a sentence built from these words; both
+ * are ordinary outcomes, and the card is finished without one.
+ */
+export async function cloudSentence(words: string[]): Promise<string> {
+  return invoke("cloud_sentence", { words });
+}
+
+/**
+ * The automatic speaker pass finished on a note.
+ *
+ * `speakers` is how many voices were labelled, and `0` — meaning one voice, or
+ * no models yet, or nothing usable — is the ordinary answer rather than an
+ * error. Only fires for recordings brought in as files, and only while the
+ * Find speakers setting is on.
+ */
+export function watchSpeakersFound(
+  run: (found: { id: string; speakers: number }) => void,
+): Promise<() => void> {
+  return listen<{ id: string; speakers: number }>("speakers-found", (e) =>
+    run(e.payload),
+  );
 }
 
 /** One attached input device. */
@@ -755,6 +787,25 @@ export async function setMicrophone(name: string | null): Promise<Settings> {
  */
 export async function setShortcut(chord: string): Promise<Settings> {
   return invoke("set_shortcut", { chord });
+}
+
+/**
+ * Hold the chord down, or press it twice.
+ *
+ * `true` is push-to-talk, which is what the app has always done. `false` makes
+ * the chord a switch: press and release to start, again to stop.
+ */
+export async function setHoldToTalk(enabled: boolean): Promise<Settings> {
+  return invoke("set_hold_to_talk", { enabled });
+}
+
+/**
+ * Whether a dictation gives you your clipboard back.
+ *
+ * `false` leaves the transcript on it instead of restoring what was there.
+ */
+export async function setRestoreClipboard(enabled: boolean): Promise<Settings> {
+  return invoke("set_restore_clipboard", { enabled });
 }
 
 // -- asking the library ------------------------------------------------------

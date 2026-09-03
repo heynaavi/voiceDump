@@ -87,11 +87,6 @@ pub fn model_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Whether both models are already on disk.
-pub fn ready(app: &tauri::AppHandle) -> bool {
-    model_dir(app).is_ok_and(|dir| ASSETS.iter().all(|a| dir.join(a.file).exists()))
-}
-
 /// Fetch whatever is missing. Does nothing when both are already there.
 pub fn fetch(app: &tauri::AppHandle) -> Result<(), String> {
     let dir = model_dir(app)?;

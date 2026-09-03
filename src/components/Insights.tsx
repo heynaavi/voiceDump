@@ -16,6 +16,7 @@ import {
 import { EASE, prefersReducedMotion } from "../lib/motion";
 import { bestType, renderReel } from "../lib/reel";
 import { renderWordCloud } from "../lib/share";
+import { cloudSentence } from "../lib/api";
 import { CLUSTERS, PixelCluster } from "./PixelCluster";
 
 /**
@@ -595,7 +596,23 @@ function WordCloud({
   period: string;
 }) {
   const [hidden, setHidden] = useState<Set<string>>(loadHidden);
-  const [busy, setBusy] = useState<"png" | "reel" | null>(null);
+  const [busy, setBusy] = useState<"png" | "reel" | "writing" | null>(null);
+  /**
+   * The sentence the last render ended on, so it can be shown afterwards.
+   *
+   * Kept for display only — deliberately *not* used to skip the next ask. An
+   * earlier version returned this whenever the words matched, which meant a
+   * second video of the same card never reached the model at all and always
+   * ended on the same line. Asking every time is the point; the model is
+   * cheap, local, and takes a second.
+   *
+   * Keyed by the words it came from so a struck-out word invalidates it rather
+   * than leaving a sentence on screen that mentions a word no longer on the
+   * card. `null` for "asked, and there wasn't one".
+   */
+  const [line, setLine] = useState<{ key: string; text: string | null } | null>(
+    null,
+  );
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -635,12 +652,42 @@ function WordCloud({
     i < 2 ? "text-[30px]" : i < 4 ? "text-[25px]" : i < 7 ? "text-[20px]"
       : i < 11 ? "text-[17px]" : i < 17 ? "text-[15px]" : "text-[13px]";
 
-  const card = () => ({
+  const card = (sentence?: string) => ({
     words: shown.map((w) => ({ word: w.word, count: w.count })),
     notes,
     totalWords,
     period,
+    sentence,
   });
+
+  /** The words the card would be built from right now, as one string. */
+  const key = shown.map((w) => w.word).join("\u0000");
+
+  /**
+   * Ask the model to make a sentence — every time, not once per set of words.
+   *
+   * The words go over in a different order on each call, so the same card can
+   * end on a different sentence each time you make a video. See `shuffled` in
+   * `src-tauri/src/brief.rs` for why order is what varies rather than the model
+   * simply being asked twice.
+   *
+   * Never throws and never surfaces an error. Every way this can fail — no
+   * Apple Intelligence on this Mac, the safety model still installing, a reply
+   * that was not a sentence made of these words — leaves a reel that is
+   * complete without it, and an error message about a flourish nobody asked
+   * for would be noise in front of the thing they did ask for.
+   */
+  const writeLine = async (): Promise<string | undefined> => {
+    setBusy("writing");
+    try {
+      const text = await cloudSentence(shown.map((w) => w.word));
+      setLine({ key, text });
+      return text;
+    } catch {
+      setLine({ key, text: null });
+      return undefined;
+    }
+  };
 
   const share = async () => {
     setError(null);
@@ -652,6 +699,8 @@ function WordCloud({
     if (!target) return;
     setBusy("png");
     try {
+      // No sentence on the still: the PNG is the cloud, and stays it. See
+      // `FULL` in lib/share.
       await writeBinaryFile(target, await renderWordCloud(card()));
     } catch (err) {
       setError(String(err));
@@ -673,10 +722,15 @@ function WordCloud({
       filters: [{ name: ext.toUpperCase() + " video", extensions: [ext] }],
     });
     if (!target) return;
+    // Written before the recorder starts, because the recording runs in real
+    // time: asking the model half way through would either stall the timeline
+    // or land after the frames that needed it.
+    const sentence = await writeLine();
+
     setBusy("reel");
     setProgress(0);
     try {
-      const reel = await renderReel(card(), setProgress);
+      const reel = await renderReel(card(sentence), setProgress);
       await writeBinaryFile(target, reel.bytes);
       if (reel.extension !== "mp4") {
         // Better to say so than to let it fail at the upload screen.
@@ -734,9 +788,11 @@ function WordCloud({
               }
               className="micro border border-hairline px-3 py-1.5 text-ink transition-colors hover:border-sage-dim disabled:opacity-40"
             >
-              {busy === "reel"
-                ? `RECORDING ${Math.round(progress * 100)}%`
-                : "SAVE AS VIDEO"}
+              {busy === "writing"
+                ? "WRITING THE ENDING…"
+                : busy === "reel"
+                  ? `RECORDING ${Math.round(progress * 100)}%`
+                  : "SAVE AS VIDEO"}
             </button>
             <span className="micro text-faint">1080 × 1920 · PORTRAIT</span>
             {hidden.size > 0 && (
@@ -766,6 +822,16 @@ function WordCloud({
           {note && (
             <p className="mono-data mt-2 text-[10px] uppercase tracking-[0.12em] text-amber">
               {note}
+            </p>
+          )}
+          {/* What the video ended on. Shown after the fact rather than as a
+              preview, because it is written on the way into a render and
+              asking for one unprompted would spend a model call on somebody
+              who was only reading their words. */}
+          {line?.key === key && line.text && (
+            <p className="mt-2 text-[13px] leading-snug text-grey">
+              <span className="eyebrow mr-2 text-faint">ENDED ON</span>
+              {line.text}
             </p>
           )}
         </>
@@ -828,11 +894,24 @@ export function Insights() {
 
   // The panels arrive in reading order once the numbers are in.
   //
-  // Keyed on `data` rather than on mount: the figures are computed on every
-  // open, so animating at mount would run the entrance against the loading
-  // state and the panels would already be sitting there when it finished.
+  // Keyed on whether the numbers have *arrived*, not on the object holding
+  // them — the same distinction `Settings` draws, for the same reason and after
+  // the same bug. Every read hands back a fresh object, so depending on `data`
+  // itself replays the whole entrance whenever one shows up, stagger and all,
+  // which reads as the pane loading twice.
+  //
+  // Where it actually bit: React's StrictMode deliberately runs mount effects
+  // twice in development, so the fetch above happens twice, `setData` is called
+  // with two different objects, and the panels animated in one after the other.
+  // A development-only symptom of a real bug — anything that ever re-reads the
+  // summary would have done the same in the shipped app.
+  //
+  // Not keyed on mount either: the figures are computed on every open, so
+  // animating at mount would run the entrance against the loading state and
+  // the panels would already be sitting there when it finished.
+  const arrived = data !== null;
   useEffect(() => {
-    if (!data || !sheet.current) return;
+    if (!arrived || !sheet.current) return;
     if (prefersReducedMotion()) return;
     const rows = sheet.current.querySelectorAll("[data-row]");
     const tl = gsap.timeline();
@@ -854,7 +933,7 @@ export function Insights() {
       // Leave the panels visible if the view is torn down mid-run.
       gsap.set(rows, { clearProps: "opacity,transform" });
     };
-  }, [data]);
+  }, [arrived]);
 
   if (error) {
     return (

@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,7 +29,31 @@ pub struct DictationState {
     recording: AtomicBool,
     /// The running ffmpeg capture, if any.
     capture: Mutex<Option<Capture>>,
+    /// Which dictation this is, counted from launch.
+    ///
+    /// Only [`LATCHED_LIMIT`]'s watchdog reads it, and it exists because
+    /// "is a recording running?" is not the question that thread needs
+    /// answered — "is *my* recording still running?" is. Without it, a switch
+    /// left on for half an hour would stop whatever dictation happened to be
+    /// under way when its timer finally came round, which is a worse bug than
+    /// the one being fixed.
+    session: AtomicU64,
 }
+
+/// How long a switched-on dictation runs before it stops itself.
+///
+/// Holding the chord needs no such thing: the recording ends when your finger
+/// does, and walking away ends it too. A switch has no equivalent — the press
+/// that starts it and the press that ends it are separate events, and nothing
+/// guarantees the second one ever happens. Left overnight that is several
+/// gigabytes of WAV and then an attempt to transcribe all of it.
+///
+/// Thirty minutes is chosen to be far past any real dictation rather than
+/// close to one. The pill is on screen the whole time, so this is a backstop
+/// for a forgotten keypress, not a limit anyone should ever meet — and when it
+/// does fire the recording is finished properly, so the words up to that point
+/// are transcribed and saved rather than thrown away.
+pub const LATCHED_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 /// The native overlay helper — a separate accessory process that renders the
 /// dictation pill.
@@ -545,11 +569,18 @@ const RESTORE_AFTER: Duration = Duration::from_millis(600);
 ///
 /// The transcript itself is not lost by that: the tray's "Copy Last Transcript"
 /// puts it back on the clipboard whenever you want it.
-fn paste(text: &str) -> Result<(), String> {
+///
+/// `restore` is [`crate::settings::Settings::restore_clipboard`]. False leaves
+/// the transcript sitting on the clipboard, for people whose next move after a
+/// dictation is to paste it somewhere else as well.
+fn paste(text: &str, restore: bool) -> Result<(), String> {
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
-    let previous = crate::clipboard::read();
+    // Not read at all when it is not going back: reading the clipboard is how
+    // an app finds out what is on it, and doing that for no reason is not a
+    // thing this should be doing behind someone who switched the feature off.
+    let previous = restore.then(crate::clipboard::read).flatten();
     crate::clipboard::write(text)?;
 
     let src = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
@@ -952,7 +983,27 @@ fn start(app: &tauri::AppHandle) {
     match start_capture(app, &dir) {
         Ok(cap) => {
             *state.capture.lock().unwrap() = Some(cap);
+            // Numbered before it is announced, so the watchdog below can tell
+            // this recording from the next one.
+            let session = state.session.fetch_add(1, Ordering::SeqCst) + 1;
             state.recording.store(true, Ordering::SeqCst);
+
+            // Only a switch gets a deadline. See `LATCHED_LIMIT`.
+            if !crate::shortcut::is_hold_to_talk() {
+                let watchdog = app.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(LATCHED_LIMIT);
+                    let state = watchdog.state::<DictationState>();
+                    if state.session.load(Ordering::SeqCst) == session
+                        && state.recording.load(Ordering::SeqCst)
+                    {
+                        eprintln!(
+                            "[dictation] the switch was left on for {LATCHED_LIMIT:?} — stopping"
+                        );
+                        stop(&watchdog);
+                    }
+                });
+            }
             if let Some(c) = cues(app) {
                 crate::sound::play(&c.start);
             }
@@ -1235,7 +1286,7 @@ fn finish(app: &tauri::AppHandle, cap: Capture) -> Result<(), String> {
     // where it was aimed.
     let target = frontmost_app();
 
-    paste(&text)?;
+    paste(&text, crate::settings::restore_clipboard(app))?;
 
     let duration = result.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let id = crate::insert_transcript(
@@ -1321,13 +1372,36 @@ pub fn spawn(app: tauri::AppHandle) {
             vec![CGEventType::FlagsChanged],
             move |_, _, event| {
                 let down = crate::shortcut::is_held(event.get_flags().bits());
-                // Hold to talk: press starts, release stops. flagsChanged fires
-                // on both edges, so the previous state is tracked to avoid
-                // acting twice on key repeat.
-                if down && !was_down.swap(true, Ordering::SeqCst) {
-                    start(&handle);
-                } else if !down && was_down.swap(false, Ordering::SeqCst) {
-                    stop(&handle);
+                // flagsChanged fires on both edges of every modifier, so the
+                // previous state is tracked and only the transitions of *our*
+                // chord are acted on. Short-circuiting means exactly one of
+                // these two swaps runs, which is what keeps them honest.
+                let pressed = down && !was_down.swap(true, Ordering::SeqCst);
+                let released = !down && was_down.swap(false, Ordering::SeqCst);
+
+                if crate::shortcut::is_hold_to_talk() {
+                    // Hold to talk: press starts, release stops.
+                    if pressed {
+                        start(&handle);
+                    } else if released {
+                        stop(&handle);
+                    }
+                } else if pressed {
+                    // A switch: the press does both jobs and the release
+                    // between them means nothing. Which job it is comes from
+                    // the recording flag rather than from a second flag kept
+                    // here — `start` and `stop` already own that state, and a
+                    // copy of it on this thread would be the thing that drifts
+                    // the first time a recording ended any other way.
+                    if handle
+                        .state::<DictationState>()
+                        .recording
+                        .load(Ordering::SeqCst)
+                    {
+                        stop(&handle);
+                    } else {
+                        start(&handle);
+                    }
                 }
                 None
             },

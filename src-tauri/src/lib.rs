@@ -8,10 +8,8 @@ mod chat;
 mod clipboard;
 #[cfg(target_os = "macos")]
 mod dictation;
-// Putting names to the voices in one track. Exploratory: nothing calls it yet,
-// so the entry points have no callers — hence the allow, which comes off when a
-// diarizer is wired to it. See `docs/speaker-diarization.md`.
-#[allow(dead_code)]
+// Putting names to the voices in one track, behind the `find_speakers`
+// command. See `docs/speaker-diarization.md`.
 mod diarize;
 mod engine;
 mod export;
@@ -230,12 +228,44 @@ fn reveal_source(app: tauri::AppHandle, id: String) -> Result<(), String> {
 /// Meetings are refused outright. Their two sides were recorded separately, so
 /// who spoke is a fact already in the database; replacing it with a 70.9% guess
 /// would be a downgrade, and no threshold fixes that.
+/// One sentence made out of the words on somebody's card.
+///
+/// Asked for by the Insights panel just before it records the reel, and by
+/// nothing else. `words` is what is actually on the card — the user has already
+/// struck out anything they did not want on it, and this must never see a word
+/// they hid.
+///
+/// Blocking work on the blocking pool: this spawns the helper process and waits
+/// on a generation, which is a second or two.
+#[tauri::command]
+async fn cloud_sentence(app: tauri::AppHandle, words: Vec<String>) -> Result<String, String> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || brief::sentence(&handle, &words))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn find_speakers(app: tauri::AppHandle, id: String) -> Result<usize, String> {
+    // Blocking work off the async runtime: a download, then a decode.
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || label_speakers(&handle, &id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Put names to the voices in one recording, in place.
+///
+/// Blocking, and shared by the two ways this happens: the SPEAKERS button on a
+/// note, and the automatic pass [`spawn_speaker_job`] makes on a new one. They
+/// were one function that had grown a command wrapper, and splitting them here
+/// rather than duplicating the save is what keeps a hand-run and an automatic
+/// run from ever disagreeing about what a labelled note looks like.
+fn label_speakers(app: &tauri::AppHandle, id: &str) -> Result<usize, String> {
     let (source, audio, mut segments) = {
         let store = app.state::<Store>();
         let conn = store.0.lock().unwrap();
-        let t = store::get(&conn, &id).map_err(|e| e.to_string())?;
+        let t = store::get(&conn, id).map_err(|e| e.to_string())?;
         (t.meta.source.clone(), t.meta.source_path.clone(), t.segments.clone())
     };
 
@@ -246,14 +276,8 @@ async fn find_speakers(app: tauri::AppHandle, id: String) -> Result<usize, Strin
         return Err("that recording is no longer on disk".into());
     }
 
-    // Blocking work off the async runtime: a download, then a decode.
-    let handle = app.clone();
-    let turns = tauri::async_runtime::spawn_blocking(move || {
-        diarize::fetch(&handle)?;
-        diarize::run(&handle, &audio)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    diarize::fetch(app)?;
+    let turns = diarize::run(app, &audio)?;
 
     if !diarize::worth_labelling(&turns) {
         return Ok(0);
@@ -273,9 +297,59 @@ async fn find_speakers(app: tauri::AppHandle, id: String) -> Result<usize, Strin
 
     let store = app.state::<Store>();
     let conn = store.0.lock().unwrap();
-    store::set_conversation(&conn, &id, &text, &serde_json::json!(paragraphs), &segments)
+    store::set_conversation(&conn, id, &text, &serde_json::json!(paragraphs), &segments)
         .map_err(|e| e.to_string())?;
     Ok(diarize::speaking_order(&turns).len())
+}
+
+/// Which recordings are worth looking for speakers in without being asked.
+///
+/// Only files somebody brought in — a dropped recording, an import, anything
+/// saved through the window. That is the case this feature was built for: one
+/// microphone, several people in a room.
+///
+/// Everything else is excluded for a reason rather than out of caution. A
+/// `meeting` recorded its two sides separately and already knows who spoke;
+/// [`label_speakers`] refuses it outright. A `hotkey` note is somebody holding
+/// a key and talking, which is one voice by construction — and it is not a
+/// rare case to spend a minute of CPU on, it is 94% of a real library, so an
+/// automatic pass there would cost almost everything and learn almost nothing.
+/// `discord` and `slack` arrive from services that may carry their own idea of
+/// who was speaking, and guessing over that would be a downgrade.
+///
+/// The SPEAKERS button still exists for every one of these, because "usually
+/// pointless" is not "never wanted" — the difference is whether somebody asked.
+fn wants_speakers(source: &str) -> bool {
+    source == "file"
+}
+
+/// Look for speakers in a note that has just been saved, in the background.
+///
+/// Never blocks the save and never surfaces an error. The note is complete
+/// without labels, the models may not be downloaded yet, and a recording with
+/// one voice in it is the ordinary outcome rather than a failure — so this
+/// reports what it found and otherwise says nothing.
+fn spawn_speaker_job(app: &tauri::AppHandle, id: String) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let _ = app.emit("speakers-looking", serde_json::json!({ "id": id }));
+        let found = label_speakers(&app, &id);
+        match found {
+            // Zero is the answer for most recordings: one voice, nothing to
+            // label, and the note is left exactly as it was.
+            Ok(0) => {
+                let _ = app.emit("speakers-found", serde_json::json!({ "id": id, "speakers": 0 }));
+            }
+            Ok(n) => {
+                eprintln!("[speakers] {id}: labelled {n} voice(s)");
+                let _ = app.emit("speakers-found", serde_json::json!({ "id": id, "speakers": n }));
+            }
+            Err(why) => {
+                eprintln!("[speakers] {id}: {why}");
+                let _ = app.emit("speakers-found", serde_json::json!({ "id": id, "speakers": 0 }));
+            }
+        }
+    });
 }
 
 #[tauri::command]
@@ -775,6 +849,13 @@ pub fn insert_transcript(
     // almost always a better title than a filename or a dictation's first seven
     // words. Never blocks the save — on any failure the fallback title we just
     // stored simply stands.
+    // Voices, in the background, when the setting is on and the recording is
+    // the kind that can have more than one in it. Off by default, and the
+    // switch is what turns this on — see `settings::Settings::diarization`.
+    if settings::diarization(app) && wants_speakers(source) {
+        spawn_speaker_job(app, id.clone());
+    }
+
     if auto_title {
         // A meeting is the exception, and it names itself later. It briefs
         // itself as it saves, and that overview has read the whole call; naming
@@ -1516,6 +1597,10 @@ pub fn run() {
             // Point the tap at the stored chord before it is installed below,
             // so the first keypress after launch already uses it.
             shortcut::arm(&loaded.shortcut);
+            // And tell it whether that chord is held or switched, for the same
+            // reason: the very first press after launch should behave the way
+            // the settings pane says it will.
+            shortcut::arm_hold(loaded.hold_to_talk);
             app.manage(settings::SettingsState(Mutex::new(loaded)));
 
             // Launch the native dictation-overlay helper. The pill is drawn by a
@@ -1642,6 +1727,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         save_transcript,
         reveal_source,
         find_speakers,
+        cloud_sentence,
         update_transcript,
         set_transcript_peaks,
         archive_transcript_media,
@@ -1649,9 +1735,12 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
             export::export_pdf,
         open_accessibility_settings,
         settings::get_settings,
+        settings::set_diarization,
         settings::set_live_preview,
         settings::set_microphone,
         settings::set_shortcut,
+        settings::set_hold_to_talk,
+        settings::set_restore_clipboard,
         microphone::list_microphones,
         engine::start_transcription,
         engine::transcribe_peaks,
@@ -1701,6 +1790,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         save_transcript,
         reveal_source,
         find_speakers,
+        cloud_sentence,
         update_transcript,
         set_transcript_peaks,
         archive_transcript_media,
@@ -1708,9 +1798,12 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
             export::export_pdf,
         open_accessibility_settings,
         settings::get_settings,
+        settings::set_diarization,
         settings::set_live_preview,
         settings::set_microphone,
         settings::set_shortcut,
+        settings::set_hold_to_talk,
+        settings::set_restore_clipboard,
         microphone::list_microphones,
         engine::start_transcription,
         engine::transcribe_peaks,
@@ -1794,5 +1887,36 @@ mod tests {
             );
         }
         assert!(!should_brief("meeting", BRIEF_MIN_WORDS - 1));
+    }
+
+    /// A `#[tauri::command]` that is never named in `generate_handler!` is not a
+    /// compile error — it is a command the frontend can call and always be
+    /// refused by, which is how the "Find speakers" switch spent a release
+    /// snapping back to off. There are two lists and it is easy to add to one,
+    /// so this reads the source and insists every settings command is in both.
+    #[test]
+    fn every_settings_command_is_registered_in_both_builds() {
+        let settings = include_str!("settings.rs");
+        let me = include_str!("lib.rs");
+
+        let commands: Vec<&str> = settings
+            .split("#[tauri::command]")
+            .skip(1)
+            .filter_map(|after| after.split_once("pub fn "))
+            .filter_map(|(_, name)| name.split(['(', '<', ' ', '\n']).next())
+            .collect();
+
+        assert!(
+            commands.contains(&"set_diarization"),
+            "the scan found {commands:?}, which is not the settings command surface"
+        );
+        for name in commands {
+            assert_eq!(
+                me.matches(&format!("settings::{name},")).count(),
+                2,
+                "settings::{name} is not in both handler lists, so one build \
+                 rejects every call to it"
+            );
+        }
     }
 }
