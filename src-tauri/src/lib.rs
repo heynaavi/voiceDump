@@ -263,7 +263,7 @@ async fn find_speakers(app: tauri::AppHandle, id: String) -> Result<usize, Strin
 /// and a second decode of a whole recording held in memory, to do work that
 /// gains nothing by overlapping. The queue is the optimisation, not a
 /// limitation.
-static LABELLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static LABELLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Say where a note's labelling has got to.
 fn speaker_stage(app: &tauri::AppHandle, id: &str, stage: &str) {
@@ -281,11 +281,16 @@ fn speaker_stage(app: &tauri::AppHandle, id: &str, stage: &str) {
 /// rather than duplicating the save is what keeps a hand-run and an automatic
 /// run from ever disagreeing about what a labelled note looks like.
 fn label_speakers(app: &tauri::AppHandle, id: &str) -> Result<usize, String> {
-    let (source, audio, mut segments) = {
+    let (source, audio, origin, mut segments) = {
         let store = app.state::<Store>();
         let conn = store.0.lock().unwrap();
         let t = store::get(&conn, id).map_err(|e| e.to_string())?;
-        (t.meta.source.clone(), t.meta.source_path.clone(), t.segments.clone())
+        (
+            t.meta.source.clone(),
+            t.meta.source_path.clone(),
+            t.meta.origin_path.clone(),
+            t.segments.clone(),
+        )
     };
 
     if source == "meeting" {
@@ -295,34 +300,58 @@ fn label_speakers(app: &tauri::AppHandle, id: &str) -> Result<usize, String> {
         return Err("that recording is no longer on disk".into());
     }
 
-    // Queued behind any job already running — including its download, which is
-    // the whole point. `LABELLING` is held for the rest of this function.
-    if LABELLING.try_lock().is_err() {
-        speaker_stage(app, id, "queued");
-    }
-    let _turn = LABELLING.lock().unwrap_or_else(|e| e.into_inner());
+    // A pass may already be done. `diarize::start_early` starts one the moment a
+    // recording arrives, so for anything that came in through the app the
+    // listening has been happening alongside the transcription and the answer is
+    // waiting here — no queue, no second decode, and the note's first appearance
+    // already carries its labels.
+    //
+    // Looked for before `LABELLING` is touched, which is what keeps this from
+    // deadlocking: the early pass holds that lock while it runs, so a note that
+    // took it first and then waited for its own pass would wait for ever.
+    let turns = match diarize::take_early(&origin) {
+        Some(turns) => {
+            // Said out loud because it is otherwise invisible. The whole point
+            // of the early pass is that nothing appears on screen — no queue,
+            // no LISTENING… — so from the outside a note that was labelled
+            // ahead of time and one that waited its turn look identical, and
+            // the only way to know which happened is to be told.
+            eprintln!("[speakers] {id}: collected a pass that ran during transcription");
+            turns
+        }
+        None => {
+            // Queued behind any job already running — including its download,
+            // which is the whole point. `LABELLING` is held to the end of this
+            // arm, which is the last thing in it that needs it.
+            if LABELLING.try_lock().is_err() {
+                speaker_stage(app, id, "queued");
+            }
+            let _turn = LABELLING.lock().unwrap_or_else(|e| e.into_inner());
 
-    if !diarize::ready(app) {
-        speaker_stage(app, id, "downloading");
-        let handle = app.clone();
-        let note = id.to_string();
-        diarize::fetch_or_wait(app, &move |at| {
-            let _ = handle.emit(
-                "speakers-progress",
-                serde_json::json!({
-                    "id": note,
-                    "stage": if at.verifying { "verifying" } else { "downloading" },
-                    "received": at.received,
-                    "total": at.total,
-                    "index": at.index,
-                    "count": at.count,
-                }),
-            );
-        })?;
-    }
+            if !diarize::ready(app) {
+                speaker_stage(app, id, "downloading");
+                let handle = app.clone();
+                let note = id.to_string();
+                diarize::fetch_or_wait(app, &move |at| {
+                    let _ = handle.emit(
+                        "speakers-progress",
+                        serde_json::json!({
+                            "id": note,
+                            "stage": if at.verifying { "verifying" } else { "downloading" },
+                            "received": at.received,
+                            "total": at.total,
+                            "index": at.index,
+                            "count": at.count,
+                        }),
+                    );
+                })?;
+            }
 
-    speaker_stage(app, id, "listening");
-    let turns = diarize::run(app, &audio)?;
+            speaker_stage(app, id, "listening");
+            eprintln!("[speakers] {id}: listening now — no pass was waiting");
+            diarize::run(app, &audio)?
+        }
+    };
 
     // Marked before the outcome is known, and on every path out from here: the
     // point of the flag is "we looked", not "we found somebody". A one-voice
@@ -513,7 +542,7 @@ fn spawn_model_prefetch(app: &tauri::AppHandle) {
 /// — but an honest floor. Two people cannot take a turn each inside a few
 /// seconds, so "testing the mic, testing the mic" at 2.5s is a run whose answer
 /// is known before it starts.
-const LONG_ENOUGH_FOR_TWO: f64 = 15.0;
+pub(crate) const LONG_ENOUGH_FOR_TWO: f64 = 15.0;
 
 /// Which recordings are worth looking for speakers in without being asked.
 ///
@@ -753,6 +782,31 @@ fn rename_transcript(
 /// Returns the whole transcript rather than an acknowledgement: every paragraph
 /// and every segment changed, and the window would otherwise have to re-fetch
 /// what this function is already holding.
+/// Vet a name somebody typed above a paragraph.
+///
+/// Separate from the command so what is and is not allowed can be stated as a
+/// test rather than inferred from the window's behaviour. What is allowed is
+/// nearly everything: people have two, three and four-part names, and the only
+/// characters refused are the ones that would change what the transcript *means*
+/// when it is read back.
+fn check_speaker_name(to: &str) -> Result<String, String> {
+    let to = to.trim();
+    if to.is_empty() {
+        return Err("A speaker needs a name.".into());
+    }
+    // The transcript is written as "Name: what they said", and that is what the
+    // overview reads. A name carrying a colon or a newline would split a turn
+    // into two speakers the next time anything read it back. Spaces are fine —
+    // "Marcus Chen" is a name, not two of them.
+    if to.contains([':', '\n', '\r']) {
+        return Err("A name can't contain a colon or a line break.".into());
+    }
+    if to.chars().count() > 40 {
+        return Err("That name is too long to sit above a paragraph.".into());
+    }
+    Ok(to.to_string())
+}
+
 #[cfg(target_os = "macos")]
 #[tauri::command]
 fn rename_speaker(
@@ -761,25 +815,14 @@ fn rename_speaker(
     from: String,
     to: String,
 ) -> Result<store::Transcript, String> {
-    let to = to.trim();
-    if to.is_empty() {
-        return Err("A speaker needs a name.".into());
-    }
-    // The transcript is written as "Name: what they said", and that is what the
-    // overview reads. A name carrying a colon or a newline would split a turn
-    // into two speakers the next time anything read it back.
-    if to.contains([':', '\n', '\r']) {
-        return Err("A name can't contain a colon or a line break.".into());
-    }
-    if to.chars().count() > 40 {
-        return Err("That name is too long to sit above a paragraph.".into());
-    }
+    let to = check_speaker_name(&to)?;
+    let to = to.as_str();
 
     let conn = store.0.lock().unwrap();
     let existing = store::get(&conn, &id).map_err(|e| e.to_string())?;
     let (paragraphs, segments, text) =
         meeting::relabel(&existing.paragraphs, &existing.segments, &from, to)
-            .ok_or_else(|| format!("Nobody in this meeting is called \"{from}\" any more."))?;
+            .ok_or_else(|| format!("Nobody in this recording is called \"{from}\" any more."))?;
 
     store::set_conversation(&conn, &id, &text, &paragraphs, &segments)
         .map_err(|e| e.to_string())?;
@@ -798,10 +841,16 @@ fn rename_speaker(
     store::get(&conn, &id).map_err(|e| e.to_string())
 }
 
-/// The names spoken in a meeting, to offer when naming a speaker.
+/// The names spoken in a recording, to offer when naming a speaker.
+///
+/// Not just meetings, despite where this started: since the automatic speaker
+/// pass began labelling ordinary notes, a dictation or a dropped file can carry
+/// "Speaker 1" and "Speaker 2" too, and those are the labels most worth
+/// replacing — at least "Others" says something. The old name said `meeting` and
+/// was wrong about half its callers.
 ///
 /// Asked for only when somebody opens the rename control, never on save. Most
-/// meetings are never renamed, and a model call per meeting to answer a question
+/// notes are never renamed, and a model call per note to answer a question
 /// nobody asked is exactly the kind of cost the overview is deliberate about not
 /// paying either.
 ///
@@ -810,7 +859,7 @@ fn rename_speaker(
 /// the same thing to the window: type it yourself.
 #[cfg(target_os = "macos")]
 #[tauri::command]
-async fn names_in_meeting(app: tauri::AppHandle, id: String) -> Result<Vec<String>, String> {
+async fn names_in_transcript(app: tauri::AppHandle, id: String) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let (text, labels) = {
             let store = app.state::<Store>();
@@ -1974,7 +2023,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         models::models_fetch,
         rename_transcript,
         rename_speaker,
-        names_in_meeting,
+        names_in_transcript,
         delete_transcript,
         write_text_file,
         write_binary_file,
@@ -2037,7 +2086,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         models::models_fetch,
         rename_transcript,
         rename_speaker,
-        names_in_meeting,
+        names_in_transcript,
         delete_transcript,
         write_text_file,
         write_binary_file,
@@ -2167,6 +2216,105 @@ mod tests {
                 2,
                 "settings::{name} is not in both handler lists, so one build \
                  rejects every call to it"
+            );
+        }
+    }
+
+    /// People have more than one word in their name, and the window offers a
+    /// plain text field, so the first thing anyone types into it is a full one.
+    #[test]
+    fn a_full_name_with_spaces_is_a_name() {
+        for name in [
+            "Marcus Chen",
+            "Priya Raghavan Nair",
+            "Ana Sofía",
+            "Mary-Jane O'Neill",
+            "  Marcus Chen  ",
+        ] {
+            assert_eq!(
+                check_speaker_name(name).as_deref(),
+                Ok(name.trim()),
+                "{name:?} was refused"
+            );
+        }
+    }
+
+    /// The two that would change what the transcript means when it is read back
+    /// — a colon splits a turn into two speakers, a line break splits the
+    /// paragraph — plus the two that are simply not a name.
+    #[test]
+    fn a_name_that_would_break_the_transcript_is_refused() {
+        for name in ["Marcus: Chen", "Marcus\nChen", "Marcus\rChen", "", "   "] {
+            assert!(check_speaker_name(name).is_err(), "{name:?} was allowed");
+        }
+        assert!(check_speaker_name(&"a".repeat(41)).is_err());
+        assert!(check_speaker_name(&"a".repeat(40)).is_ok());
+    }
+
+    /// The same trap, one file closer to home. `settings.rs` was guarded above
+    /// because that is where it was first sprung, but nothing about it is
+    /// particular to settings: the commands declared in *this* file go into the
+    /// same two lists by hand, and renaming one — `names_in_meeting` to
+    /// `names_in_transcript`, say — means editing both or shipping a build where
+    /// the frontend calls a command that is not there.
+    ///
+    /// A command the lite build can answer belongs in both lists. One gated on
+    /// `assistant` belongs in the full list only — and `sidecar_status`, which
+    /// is written twice with opposite gates, counts as reachable from both.
+    #[test]
+    fn every_command_in_this_file_is_registered_in_the_builds_it_belongs_to() {
+        // Only the source above the tests: the marker being scanned for is
+        // itself written out below, and would otherwise be scanned as a command.
+        let me = include_str!("lib.rs");
+        let me = me.split_once("#[cfg(test)]").expect("this module").0;
+
+        // A command can be declared twice under opposite gates, so the builds it
+        // is reachable from are collected across every declaration before any of
+        // them is judged.
+        let mut in_lite: Vec<&str> = Vec::new();
+        let mut commands: Vec<&str> = Vec::new();
+
+        let pieces: Vec<&str> = me.split("#[tauri::command]").collect();
+        for (i, piece) in pieces.iter().enumerate().skip(1) {
+            // Attributes stack above the marker, so the builds a declaration
+            // belongs to are read from the lines immediately before it.
+            let gates: Vec<&str> = pieces[i - 1]
+                .lines()
+                .rev()
+                .take_while(|line| line.trim_start().starts_with("#["))
+                .collect();
+            let full_only = gates
+                .iter()
+                .any(|line| line.contains("feature = \"assistant\"") && !line.contains("not("));
+
+            let Some(name) = piece
+                .split_once("fn ")
+                .and_then(|(_, rest)| rest.split(['(', '<', ' ', '\n']).next())
+            else {
+                continue;
+            };
+            if !commands.contains(&name) {
+                commands.push(name);
+            }
+            if !full_only && !in_lite.contains(&name) {
+                in_lite.push(name);
+            }
+        }
+
+        assert!(
+            commands.len() > 20 && commands.contains(&"rename_speaker"),
+            "the scan found {commands:?}, which is not this file's command surface"
+        );
+
+        for name in &commands {
+            // Matched with the list indentation, so a mention of the name in
+            // prose or in a call cannot stand in for a registration.
+            let listed = me.matches(&format!("\n        {name},")).count();
+            let wanted = if in_lite.contains(name) { 2 } else { 1 };
+            assert_eq!(
+                listed, wanted,
+                "{name} is registered in {listed} of the handler lists, not \
+                 {wanted} — one build refuses every call to it"
             );
         }
     }

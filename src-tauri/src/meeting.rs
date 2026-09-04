@@ -2073,6 +2073,49 @@ mod tests {
         assert!(relabel(&paragraphs, &segments, "Priya", "Rupesh").is_none());
     }
 
+    /// The other kind of note that carries speakers, and the one this code was
+    /// not written for: a dictation or a dropped file that the automatic pass
+    /// diarized into "Speaker 1" / "Speaker 2". There is no tap here, so the
+    /// segments carry no `side` at all — every turn comes back as `others`,
+    /// which is why both labels read the same colour and correctly so. What
+    /// matters is that renaming works exactly as it does on a meeting: every
+    /// turn, every segment, and the flat text that copy, .txt, Markdown and the
+    /// overview all read.
+    #[test]
+    fn naming_a_speaker_works_the_same_on_a_diarized_dictation() {
+        let segments = json!([
+            { "speaker": "Speaker 1", "start": 0.0, "end": 1.0, "text": "so how did you start" },
+            { "speaker": "Speaker 2", "start": 2.0, "end": 3.0, "text": "by accident" },
+            { "speaker": "Speaker 2", "start": 3.0, "end": 4.0, "text": "somebody had to" },
+            { "speaker": "Speaker 1", "start": 5.0, "end": 6.0, "text": "and that was two years ago" },
+        ]);
+        let paragraphs = json!(turns(segments.as_array().unwrap()));
+
+        // No tap, so no side was ever recorded, and `turns` gives every
+        // paragraph the same one. Asserted rather than assumed: it is what
+        // makes both labels render alike, and a future change that starts
+        // guessing a side here would silently colour one speaker as "you".
+        for turn in paragraphs.as_array().unwrap() {
+            assert_eq!(turn["side"].as_str(), Some(SIDE_THEM));
+        }
+
+        let (paragraphs, segments, text) = relabel(&paragraphs, &segments, "Speaker 2", "Marcus")
+            .expect("Speaker 2 is in there");
+
+        assert_eq!(
+            text,
+            "Speaker 1: so how did you start\n\n\
+             Marcus: by accident somebody had to\n\n\
+             Speaker 1: and that was two years ago"
+        );
+        let turns = paragraphs.as_array().unwrap();
+        assert_eq!(turns[1]["speaker"].as_str(), Some("Marcus"));
+        assert_eq!(turns[0]["speaker"].as_str(), Some("Speaker 1"));
+        // Both raw segments, not just the first: a re-grouping reads these back.
+        assert_eq!(segments.as_array().unwrap()[1]["speaker"].as_str(), Some("Marcus"));
+        assert_eq!(segments.as_array().unwrap()[2]["speaker"].as_str(), Some("Marcus"));
+    }
+
     #[test]
     fn a_note_with_no_speakers_keeps_its_prose_unattributed() {
         // Every dictation, and every dropped file. Nothing here should ever be

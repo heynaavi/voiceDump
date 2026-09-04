@@ -2,7 +2,7 @@ import gsap from "gsap";
 
 import type { JobState } from "../lib/api";
 import { fileName } from "../lib/format";
-import { EASE, useGsap, useSmoothProgress } from "../lib/motion";
+import { BEAT, EASE, reveal, useGsap, useSmoothProgress } from "../lib/motion";
 import { CLUSTERS, PixelCluster } from "./PixelCluster";
 
 type Props = {
@@ -24,11 +24,7 @@ export function JobProgress({ job, onDismiss }: Props) {
   const filled = Math.round(display * SEGMENTS);
 
   const scope = useGsap(({ scope }) => {
-    gsap.fromTo(
-      scope.querySelectorAll("[data-line]"),
-      { opacity: 0, y: 8 },
-      { opacity: 1, y: 0, duration: 0.35, ease: EASE.snap, stagger: 0.05 },
-    );
+    reveal(scope.querySelectorAll("[data-line]"));
   }, [failed]);
 
   // Newly-filled segments snap on rather than fading.
@@ -40,8 +36,11 @@ export function JobProgress({ job, onDismiss }: Props) {
         scaleY: 1,
         opacity: 1,
         transformOrigin: "bottom",
-        duration: 0.22,
-        ease: EASE.step,
+        duration: BEAT.quick,
+        // A segment filling is a wipe, not a reveal — V3 §7.2 puts those on the
+        // decisive curve. It was a `steps(4)`, which belongs to the PRESS
+        // register (§9) and not to this one.
+        ease: EASE.snap,
         overwrite: true,
       },
     );

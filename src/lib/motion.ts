@@ -2,18 +2,116 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import gsap from "gsap";
 
 /**
- * Motion vocabulary for the QWEE skin.
+ * Motion vocabulary — QWEE Design System V3 §7, on the app surface.
  *
- * The design language is machine-set and disciplined, so easing is snappy and
- * often *stepped* rather than springy — things click into place like a readout
- * updating, not like a bubble settling. Nothing bounces.
+ * V3 replaced V1's motion chapter outright, and the app had been running on
+ * V1's: one curve (`power4.out`) for everything, a stepped ease left over from
+ * a register the app is not in, and nine entrances with nine different sets of
+ * numbers because each was tuned where it was written.
+ *
+ * Two parts of V3 govern what is here. §7.2 gives a curve per *gesture*, which
+ * is the part the app was missing — a panel arriving and a strike bar landing
+ * are not the same event and should not share an ease. §9 gives the tempo for
+ * this surface: **12–20 frames**, which is 0.20–0.33s. The 720 ms reveal in
+ * §7.3 is the website's; a tab that took 720 ms to change would be the lag this
+ * app has already been asked twice to get rid of.
+ *
+ * The stepped easing goes. V3 puts 2-frame snaps and no fades in the PRESS
+ * register (§9), and this surface is Field Notes: "in place, eased".
  */
 export const EASE = {
+  /** A panel, a section, a list arriving. §7.2 "scroll-in reveals". */
+  reveal: "expo.out",
+  /** Decisive arrivals: type, wipes, strike bars. */
   snap: "power4.out",
-  step: "steps(4)",
-  stepFine: "steps(6)",
-  drift: "none",
+  /** Layout reflow — unremarkable on purpose. */
+  reflow: "power2.inOut",
+  /** Leaving: a preview dissolving, a card folding. */
+  leave: "power2.in",
+  /** Depth pushes, group moves. */
+  push: "power3.inOut",
+  /** A word fading in where it stays. */
+  word: "power1.out",
+  /** Drift, breath — should not appear commanded. */
+  drift: "sine.inOut",
+  /** Something arriving under its own weight — the pill, a badge. */
+  arrive: "back.out(1.7)",
+  /** Clocks, counters, typing progress. Nothing to interpret. */
+  none: "none",
 } as const;
+
+/**
+ * The measured numbers, in one place — V3 §7.3 and §9.
+ *
+ * They were nine sets of numbers in nine files. Nobody chose the difference
+ * between a 0.34 s entrance and a 0.42 s one; they were written months apart.
+ */
+export const BEAT = {
+  /** 18 frames. Inside §9's 12–20 for this surface, and the app's own median. */
+  reveal: 0.3,
+  /** 12 frames. The floor, for something small resolving in place. */
+  quick: 0.2,
+  /**
+   * 20 frames — the top of §9's band for this surface, and the only gesture
+   * that earns it: the reading view resizing every paragraph at once while
+   * holding the reader's place. A reflow is the one thing that should be
+   * unremarkable rather than quick.
+   */
+  reflow: 0.33,
+  /** §7.3: 70 ms between siblings. */
+  stagger: 0.07,
+  /** §7.3: "cap 8" — a group's whole entrance is bounded, however long it is. */
+  siblings: 8,
+  /**
+   * How far a reveal rises.
+   *
+   * §7.3's figure is 18px, and that is a web number: a section coming up into a
+   * scrolling page. §1 is the rule that governs here — **nothing travels** —
+   * and at 13px body text an 18px rise is travel. Ten is a resolve.
+   */
+  rise: 10,
+} as const;
+
+/**
+ * The stagger for a group of siblings, bounded however many there are.
+ *
+ * Under the cap it is 70 ms each, which is the measured figure. Over it the
+ * whole group shares the time eight would have taken, so a list of twelve and a
+ * list of eight hundred both finish in the same half-second. That is what §7.3's
+ * "cap 8" has to mean for a group whose size is data rather than layout.
+ */
+export function spread(count: number): gsap.StaggerVars {
+  const whole = BEAT.stagger * BEAT.siblings;
+  return count > BEAT.siblings ? { amount: whole } : { each: BEAT.stagger };
+}
+
+/**
+ * The app's one entrance: a group resolving into place where it already is.
+ *
+ * Every panel, sheet and list in the app used to write this out by hand, and no
+ * two agreed — rises of 8, 10 and 14, durations from 0.28 to 0.42, staggers
+ * from 0.045 to 0.07, all on the curve V3 reserves for decisive arrivals. One
+ * function is the point: the gesture is a property of the design system, not of
+ * whichever file it happens in.
+ */
+export function reveal(
+  targets: gsap.TweenTarget,
+  vars: gsap.TweenVars = {},
+): gsap.core.Tween {
+  const count = gsap.utils.toArray(targets).length;
+  return gsap.fromTo(
+    targets,
+    { opacity: 0, y: BEAT.rise },
+    {
+      opacity: 1,
+      y: 0,
+      duration: BEAT.reveal,
+      ease: EASE.reveal,
+      stagger: spread(count),
+      ...vars,
+    },
+  );
+}
 
 export function prefersReducedMotion(): boolean {
   return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -157,7 +255,26 @@ export function useSmoothProgress(
 /**
  * Tick a number up like a mechanical counter. Used for word counts and the
  * progress percentage — mono, tabular, stepping rather than sliding.
+ *
+ * Two things here come straight from V3 §7. The curve is `none`: §7.2 gives
+ * that to "clocks, counters, typing progress", and a counter that decelerates
+ * is making a claim about the data rather than about the animation. And it
+ * steps no faster than [`COUNTER_STEP`] — §7.3, "counter steps ≥ 8 frames
+ * apart; under that a number reads as flicker, not as changed". It used to
+ * write a new number on every frame, which for a word count going to four
+ * digits is sixty unreadable numbers a second.
  */
+/**
+ * The shortest time a shown number is allowed to stand for.
+ *
+ * V3 §7.3: "counter steps ≥ 8 frames apart — under that a number reads as
+ * flicker, not as changed". Eight frames at 60 Hz, in seconds, because that is
+ * what the tween's own clock is in — and in real time rather than as a fraction
+ * of the tween, whose length varies from 0.3s to 1.1s with how far the number
+ * has to travel.
+ */
+const COUNTER_STEP = 8 / 60;
+
 export function useCountUp(
   ref: React.RefObject<HTMLElement | null>,
   value: number,
@@ -176,14 +293,23 @@ export function useCountUp(
     }
 
     const state = { n: prev.current };
+    let shown = -1;
     const tween = gsap.to(state, {
       n: value,
       duration: Math.min(1.1, 0.3 + Math.abs(value - prev.current) / 4000),
-      ease: EASE.snap,
+      ease: EASE.none,
       onUpdate: () => {
+        // Held back to the step rate, and by `progress` rather than a clock:
+        // GSAP's ticker is the only thing driving this, so counting its own
+        // frames is what "eight frames apart" actually means here.
+        const step = Math.floor(tween.time() / COUNTER_STEP);
+        if (step === shown) return;
+        shown = step;
         el.textContent = format(state.n);
       },
       onComplete: () => {
+        // The last number is the real one, whatever the step rate had reached.
+        el.textContent = format(value);
         prev.current = value;
       },
     });

@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import gsap from "gsap";
 
+import { BEAT, EASE } from "../lib/motion";
+
 type State = "idle" | "recording" | "transcribing";
 
 const BARS = 28;
@@ -52,16 +54,17 @@ export function DictationOverlay() {
     };
   }, []);
 
-  // Entrance. Scale from slightly small with a soft overshoot — the one place
-  // the motion language relaxes, because this is a system HUD appearing over
-  // another app rather than a panel snapping into a grid.
+  // Entrance. Scale from slightly small with a soft overshoot: V3 §7.2 gives
+  // `back.out(1.7–1.9)` to "something arriving under its own weight — the
+  // pill", and this is that pill. The one curve in the app that overshoots, and
+  // named in the system rather than an exception to it.
   useEffect(() => {
     const el = shellRef.current;
     if (!el || state === "idle") return;
     gsap.fromTo(
       el,
       { opacity: 0, y: 14, scale: 0.94 },
-      { opacity: 1, y: 0, scale: 1, duration: 0.34, ease: "back.out(1.6)" },
+      { opacity: 1, y: 0, scale: 1, duration: BEAT.reveal, ease: EASE.arrive },
     );
   }, [state]);
 

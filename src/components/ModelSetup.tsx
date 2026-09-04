@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import gsap from "gsap";
 import { listen } from "@tauri-apps/api/event";
 
 import { modelsFetch, type ModelProgress, type ModelStatus } from "../lib/api";
-import { EASE, useGsap } from "../lib/motion";
+import { reveal, useGsap } from "../lib/motion";
 import { CLUSTERS, PixelCluster } from "./PixelCluster";
 
 type Props = {
@@ -71,11 +70,7 @@ export function ModelSetup({ status, onReady }: Props) {
 
   const scope = useGsap(
     ({ scope }) => {
-      gsap.fromTo(
-        scope.querySelectorAll("[data-line]"),
-        { opacity: 0, y: 8 },
-        { opacity: 1, y: 0, duration: 0.38, ease: EASE.snap, stagger: 0.06 },
-      );
+      reveal(scope.querySelectorAll("[data-line]"));
     },
     [running, error !== null],
   );

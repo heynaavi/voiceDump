@@ -394,10 +394,16 @@
     -webkit-app-region: no-drag;
   }
 
-  /* §2 Eyebrow label: mono, uppercase, wide tracking. The machine readout. */
+  /* §2 Eyebrow label: mono, uppercase, wide tracking. The machine readout.
+
+     8.5px is what V3's type table gives this surface, and it is the same size
+     as `.micro` below on purpose — on the web the two are 11px and 10px and the
+     size does the separating, but at app scale half a pixel separates nothing.
+     The tracking is what tells them apart here: 0.15em reads as a heading for a
+     block, 0.1em as a tag on a thing. */
   .eyebrow {
     font-family: var(--font-mono);
-    font-size: 9px;
+    font-size: 8.5px;
     font-weight: 500;
     letter-spacing: 0.15em;
     text-transform: uppercase;

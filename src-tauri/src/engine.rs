@@ -1268,6 +1268,13 @@ pub fn transcribe_ingest(
 ) -> Result<Value, String> {
     use tauri::Emitter;
 
+    // Voices, in parallel with the words. Both questions are asked of the same
+    // audio and neither needs the other's answer, so the only reason this used
+    // to happen afterwards was the order it was written in. See
+    // `diarize::start_early` — it is silent, it does not download, and it stops
+    // on anything too short to hold a conversation.
+    crate::diarize::start_early(app, path);
+
     transcribe(app, path, |stage, progress| {
         let _ = app.emit(
             "ingest-progress",
@@ -1297,6 +1304,11 @@ pub fn start_transcription(app: tauri::AppHandle, path: String) -> String {
     let id = format!("{:x}", crate::now_ms());
     let job = id.clone();
     let src = path.clone();
+
+    // The dropped-file path, and the one this matters most on: a file brought in
+    // is whole from the first moment, and is the kind of recording that has more
+    // than one person in it. See `diarize::start_early`.
+    crate::diarize::start_early(&app, &path);
 
     std::thread::spawn(move || {
         let emit = |status: &str, stage: &str, progress: f64, error: Option<String>, result: Option<Value>| {

@@ -25,7 +25,7 @@ import {
   generateBrief,
   findSpeakers,
   watchSpeakerProgress,
-  namesInMeeting,
+  namesInTranscript,
   revealSource,
   setTranscriptPeaks,
   transcribeAgain,
@@ -37,7 +37,7 @@ import {
 } from "../lib/api";
 import { reconcileWords } from "../lib/diff";
 import { fileName, formatDuration, formatWhen } from "../lib/format";
-import { EASE, prefersReducedMotion } from "../lib/motion";
+import { BEAT, EASE, prefersReducedMotion } from "../lib/motion";
 import { placeWords, wordTimingsMarkdown } from "../lib/timings";
 import { AudioPlayer, type PlayerHandle } from "./AudioPlayer";
 import { CLUSTERS, PixelCluster } from "./PixelCluster";
@@ -48,7 +48,9 @@ type Props = {
   onDelete: (id: string) => void;
   onEdit: (id: string, paragraphs: Paragraph[]) => void;
   /** Name one side of a meeting. Rejects with a sentence worth showing. */
-  onRenameSpeaker: (id: string, from: string, to: string) => Promise<void>;
+  /** Answers with the rewritten transcript — see `commitSpeaker` for why the
+   *  caller needs it back rather than letting the note-level effect re-seed. */
+  onRenameSpeaker: (id: string, from: string, to: string) => Promise<Transcript>;
   /** The AI is currently generating this note's title. */
   naming?: boolean;
   /** Whether the speaker-labelling switch is on. Off is the default. */
@@ -702,7 +704,10 @@ export function TranscriptView({
       if (!el) return;
       const to = styleFor(i);
       if (!animate) gsap.set(el, to);
-      else gsap.to(el, { ...to, duration: 0.38, ease: EASE.snap });
+      // Reflow, on V3 §7.2's reflow curve — "unremarkable on purpose". Every
+      // line in the document changes size here; a decisive ease makes that read
+      // as the page snapping rather than as the reader's place being kept.
+      else gsap.to(el, { ...to, duration: BEAT.reflow, ease: EASE.reflow });
     };
 
     const fresh = styledFor.current !== transcript.id;
@@ -744,8 +749,8 @@ export function TranscriptView({
         const state = { t: 0 };
         gsap.to(state, {
           t: 1,
-          duration: 0.38,
-          ease: EASE.snap,
+          duration: BEAT.reflow,
+          ease: EASE.reflow,
           onUpdate: () => {
             container.scrollTop += anchor.getBoundingClientRect().top - holdAt;
           },
@@ -794,8 +799,8 @@ export function TranscriptView({
     const state = { t: 0 };
     gsap.to(state, {
       t: 1,
-      duration: 0.38,
-      ease: EASE.snap,
+      duration: BEAT.reflow,
+      ease: EASE.reflow,
       onUpdate: () => {
         if (!el) return;
         const want = startTop + (targetTop - startTop) * state.t;
@@ -944,7 +949,7 @@ export function TranscriptView({
 
     if (heardNames !== null || listening) return;
     setListening(true);
-    namesInMeeting(transcript.id)
+    namesInTranscript(transcript.id)
       .then(setHeardNames)
       // Apple Intelligence being off is the common case here, and it is not
       // worth a message: the field below still works, which is the whole point.
@@ -958,7 +963,20 @@ export function TranscriptView({
   };
 
   /** Commit a speaker's name. The backend rewrites every turn, so the answer
-   *  is a whole new transcript and the parent swaps it in. */
+   *  is a whole new transcript and the parent swaps it in.
+   *
+   *  The parent swapping it in is not enough on its own. The note-level effect
+   *  above is keyed on the note's *id*, not on the object, so a rewritten
+   *  transcript for the note already open re-seeds nothing — deliberately, so
+   *  an AI title landing mid-read doesn't yank the reader back to the top. The
+   *  cost was that a rename looked like it had failed: the labels only changed
+   *  once you left the note and came back, and a two-word name read as though
+   *  the space had been rejected.
+   *
+   *  So the two things a rename rewrites that are on screen are applied here by
+   *  hand. Nothing else is touched — the scroll position, the focused
+   *  paragraph and playback all survive naming somebody, which is the whole
+   *  reason that effect is keyed the way it is. */
   const commitSpeaker = async (from: string, picked?: string) => {
     const next = (picked ?? speakerDraft).trim();
     if (!next || next === from) {
@@ -966,7 +984,12 @@ export function TranscriptView({
       return;
     }
     try {
-      await onRenameSpeaker(transcript.id, from, next);
+      const updated = await onRenameSpeaker(transcript.id, from, next);
+      if (updated.paragraphs?.length) setParagraphs(updated.paragraphs);
+      // The overview names owners, and the rename carried the new name into
+      // them. Leaving this stale would credit an action item to a label that
+      // is no longer anywhere in the note.
+      setBrief(updated.brief);
       closeSpeaker();
     } catch (e) {
       // Kept open, with the reason under it: the name is still in the field,
@@ -1288,6 +1311,8 @@ export function TranscriptView({
                       );
                   }}
                   label={speakers ?? "SPEAKERS"}
+                  // The longest state: the download counting itself out.
+                  reserve="GETTING MODEL 100%"
                 />
               )}
               <RailButton
@@ -1394,11 +1419,15 @@ export function TranscriptView({
           >
             {paragraphs.map((p, pi) => (
               <div key={pi} className="relative">
-                {/* Who is talking. Only meetings carry this, and because
-                    consecutive turns from one speaker are already merged into
-                    one paragraph, every label here is a genuine change of
-                    voice — so there is never a run of identical labels to
-                    suppress. */}
+                {/* Who is talking. Meetings carry it because the two sides
+                    were recorded apart; since 1.2.0 anything the speaker pass
+                    has been over carries it too, as SPEAKER 1 and SPEAKER 2 —
+                    and those are the labels most worth replacing with a name,
+                    because they are the ones that mean nothing. The control is
+                    the same either way. Because consecutive turns from one
+                    speaker are already merged into one paragraph, every label
+                    here is a genuine change of voice — so there is never a run
+                    of identical labels to suppress. */}
                 {p.speaker &&
                   (namingSpeakerAt === pi ? (
                     <div className="mb-1.5">
@@ -1455,14 +1484,17 @@ export function TranscriptView({
                       )}
                     </div>
                   ) : (
-                    /* A button, because the tap hears the whole far side as one
-                       stream and calls it "Others" — true, and useless the
-                       moment you want to know who agreed to something. You know
-                       who was talking; this is the cheapest way to get that
-                       into the note. Renames every turn by this speaker. */
+                    /* A button, because neither machine can name anybody. The
+                       tap hears the whole far side as one stream and calls it
+                       "Others"; the speaker pass hears two voices and calls
+                       them SPEAKER 1 and SPEAKER 2. Both are true, and both are
+                       useless the moment you want to know who agreed to
+                       something. You know who was talking; this is the cheapest
+                       way to get that into the note. Renames every turn by this
+                       speaker. */
                     <button
                       onClick={() => openSpeaker(pi, p.speaker!)}
-                      title={`Rename ${p.speaker} throughout this meeting`}
+                      title={`Rename ${p.speaker} throughout this note`}
                       className={[
                         "micro no-drag mb-1.5 -ml-1 border border-transparent px-1 py-0.5 transition-colors hover:border-hairline hover:text-ink",
                         // By side, not by name. Meetings recorded before sides
@@ -1880,22 +1912,53 @@ function RailButton({
   label,
   onClick,
   danger,
+  reserve,
 }: {
   label: string;
   onClick: () => void;
   danger?: boolean;
+  /**
+   * The longest thing this button will ever say.
+   *
+   * Design system V3 §4: "a row with a changing label is `min-width` its
+   * longest label", under §1's "nothing moves its neighbours". SPEAKERS is the
+   * button that needed it — it counts a download out loud, so it goes SPEAKERS
+   * → QUEUED → GETTING MODEL 42% → LISTENING… → FOUND 2, growing and shrinking
+   * by half its width, and DELETE slid sideways under the pointer every time.
+   *
+   * Laid out as a hidden copy rather than a measured `ch` value, because the
+   * width of eighteen characters of JetBrains Mono at 8.5px with 0.1em tracking
+   * is not a number worth writing down and keeping true.
+   */
+  reserve?: string;
 }) {
   return (
     <button
       onClick={onClick}
+      // A label longer than the reserve — an error, which is a sentence — is
+      // the one case that cannot be laid out for. It is clipped rather than
+      // allowed to push its neighbours, and the whole of it is on the button.
+      title={reserve && label.length > reserve.length ? label : undefined}
       className={[
-        "micro border border-hairline px-2.5 py-1.5 transition-colors",
+        "micro relative border border-hairline px-2.5 py-1.5 transition-colors",
         danger
           ? "text-faint hover:border-amber hover:bg-amber hover:text-surface"
           : "text-grey hover:border-ink hover:bg-ink hover:text-surface",
       ].join(" ")}
     >
-      {label}
+      {reserve ? (
+        <>
+          {/* Invisible, unreadable, and what the button is as wide as. */}
+          <span aria-hidden className="invisible block">
+            {reserve}
+          </span>
+          <span className="absolute inset-0 flex items-center justify-center overflow-hidden whitespace-nowrap px-1">
+            {label}
+          </span>
+        </>
+      ) : (
+        label
+      )}
     </button>
   );
 }

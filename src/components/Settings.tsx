@@ -8,7 +8,7 @@ import {
   listMicrophones,
   openAudioCaptureSettings,
 } from "../lib/api";
-import { EASE, prefersReducedMotion } from "../lib/motion";
+import { prefersReducedMotion, reveal } from "../lib/motion";
 import {
   glyphs,
   held,
@@ -363,11 +363,7 @@ export function Settings({
     if (prefersReducedMotion()) return;
     const rows = sheet.current.querySelectorAll("[data-row]");
     const tl = gsap.timeline();
-    tl.fromTo(
-      rows,
-      { opacity: 0, y: 14 },
-      { opacity: 1, y: 0, duration: 0.42, ease: EASE.snap, stagger: 0.055 },
-    );
+    tl.add(reveal(rows));
     return () => {
       tl.kill();
       gsap.set(rows, { clearProps: "opacity,transform" });

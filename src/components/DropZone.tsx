@@ -2,7 +2,7 @@ import { useMemo, useRef } from "react";
 import gsap from "gsap";
 
 import type { MeetingCapability } from "../lib/api";
-import { EASE, useGsap } from "../lib/motion";
+import { BEAT, EASE, reveal, useGsap } from "../lib/motion";
 import { CLUSTERS, PixelCluster } from "./PixelCluster";
 import { Recorder } from "./Recorder";
 import { SwarmField } from "./SwarmField";
@@ -37,20 +37,16 @@ export function DropZone({
 
   const scope = useGsap(({ scope }) => {
     const tl = gsap.timeline();
-    tl.fromTo(
-      scope.querySelectorAll("[data-line]"),
-      { opacity: 0, y: 10 },
-      { opacity: 1, y: 0, duration: 0.4, ease: EASE.snap, stagger: 0.06 },
-    ).fromTo(
+    tl.add(reveal(scope.querySelectorAll("[data-line]"))).fromTo(
       scope.querySelectorAll("[data-tile]"),
       { opacity: 0, scaleY: 0.7 },
       {
         opacity: 1,
         scaleY: 1,
         transformOrigin: "top",
-        duration: 0.3,
-        ease: EASE.step,
-        stagger: 0.05,
+        duration: BEAT.reveal,
+        ease: EASE.reveal,
+        stagger: BEAT.stagger,
       },
       "-=0.15",
     );

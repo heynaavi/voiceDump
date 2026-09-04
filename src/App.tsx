@@ -626,16 +626,21 @@ export default function App() {
     [refreshHistory, query],
   );
 
-  /** Name one side of a meeting. The backend answers with the rewritten
+  /** Name one speaker in a note. The backend answers with the rewritten
    *  transcript — every turn, every segment, and the overview's action-item
    *  owners — so there is nothing to refetch. History is still refreshed: the
    *  full-text index covers the transcript, and searching for a name you have
-   *  just given somebody should find the meeting you gave it in. */
+   *  just given somebody should find the note you gave it in.
+   *
+   *  Handed back to the caller as well as stored here: the reading view keys
+   *  its reset on the note's id, so it cannot learn about this from `active`
+   *  changing and applies the rewrite itself. */
   const renameSpeaker = useCallback(
     async (id: string, from: string, to: string) => {
       const updated = await apiRenameSpeaker(id, from, to);
       setActive((prev) => (prev && prev.id === id ? updated : prev));
       refreshHistory(query);
+      return updated;
     },
     [refreshHistory, query],
   );

@@ -80,6 +80,9 @@ pub const ASSETS: [Asset; 2] = [
 /// `docs/speaker-diarization.md` for the tables.
 pub const THRESHOLD: f64 = 0.8;
 
+/// The sample rate both models want, and the one the helper's WAV is written at.
+const RATE: u32 = 16_000;
+
 /// Where the diarizer's models live: beside Whisper's, under the data
 /// directory, so replacing the .app never costs a re-download.
 pub fn model_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -304,7 +307,27 @@ impl Drop for Decoded {
 }
 
 fn decode_for_helper(audio: &Path) -> Result<Decoded, String> {
-    let samples = crate::engine::decode_mono_16k(audio)?;
+    write_wav(&crate::engine::decode_mono_16k(audio)?)
+}
+
+/// The same decode, stopping short of the file, so a caller can look at the
+/// length before paying for it.
+///
+/// `start_early` runs on every recording the app takes in, and most of them are
+/// six-second dictations it has nothing to say about. Deciding that from the
+/// samples costs a decode either way; writing a WAV of them first would be the
+/// only wasted part, so the split is here rather than a duration guessed from
+/// the file size.
+fn samples_for_helper(audio: &Path) -> Result<Vec<f32>, String> {
+    crate::engine::decode_mono_16k(audio)
+}
+
+/// How long a decoded buffer runs for, at the rate everything downstream uses.
+fn seconds(samples: &[f32]) -> f64 {
+    samples.len() as f64 / RATE as f64
+}
+
+fn write_wav(samples: &[f32]) -> Result<Decoded, String> {
     if samples.is_empty() {
         return Err("that recording decoded to no audio".into());
     }
@@ -319,7 +342,7 @@ fn decode_for_helper(audio: &Path) -> Result<Decoded, String> {
 
     let spec = hound::WavSpec {
         channels: 1,
-        sample_rate: 16_000,
+        sample_rate: RATE,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
@@ -389,6 +412,16 @@ fn helper(app: &tauri::AppHandle) -> Option<PathBuf> {
 /// on it at once. Putting this on the Neural Engine keeps a diarization from
 /// slowing a transcription that somebody is waiting for.
 pub fn run(app: &tauri::AppHandle, audio: &str) -> Result<Vec<Turn>, String> {
+    // Whatever the recording is, the helper gets a WAV. See `Decoded`.
+    run_decoded(app, &decode_for_helper(Path::new(audio))?)
+}
+
+/// The same pass, on audio already converted.
+///
+/// Split out for [`start_early`], which decodes first so it can look at the
+/// length and stop; without the split it would have to decode twice or run on
+/// recordings it has already decided against.
+fn run_decoded(app: &tauri::AppHandle, decoded: &Decoded) -> Result<Vec<Turn>, String> {
     let helper = helper(app).ok_or("the speaker helper is missing from this build")?;
     let dir = model_dir(app)?;
     let segmentation = dir.join(ASSETS[0].file);
@@ -397,8 +430,6 @@ pub fn run(app: &tauri::AppHandle, audio: &str) -> Result<Vec<Turn>, String> {
         return Err("the speaker models have not been downloaded".into());
     }
 
-    // Whatever the recording is, the helper gets a WAV. See `Decoded`.
-    let decoded = decode_for_helper(Path::new(audio))?;
     let audio = decoded.path.to_string_lossy().into_owned();
 
     let out = Command::new(&helper)
@@ -421,6 +452,129 @@ pub fn run(app: &tauri::AppHandle, audio: &str) -> Result<Vec<Turn>, String> {
         return Err(format!("the speaker helper failed: {last}"));
     }
     Ok(parse_turns(&String::from_utf8_lossy(&out.stdout)))
+}
+
+// -- ahead of time ----------------------------------------------------------
+
+/// Passes started when a recording arrived, before anything asked for one.
+///
+/// Diarization reads voice timbre and never the words, so it needs the audio
+/// and nothing else — none of the transcript, none of the timings, no note to
+/// attach to. It was still being run last, after Whisper had finished and the
+/// note had been saved, which meant a ten-minute interview transcribed for
+/// three minutes and then sat there being listened to for another two, with the
+/// note already on screen and unlabelled.
+///
+/// The two passes are also on different silicon. Whisper has Metal; the helper
+/// is run on CoreML precisely so it lands on the Neural Engine instead (see
+/// [`run`]) — which was a rule about not slowing a transcription down, and is
+/// the reason the two can simply be run at once.
+///
+/// Keyed by the path the audio arrived on, which is what
+/// [`crate::insert_transcript`] stores as `origin_path` — so the note that
+/// appears a minute later can find the work already done for it. The archived
+/// copy it plays from is a different file with a different name, and is made
+/// after all of this.
+static AHEAD: std::sync::Mutex<Vec<Ahead>> = std::sync::Mutex::new(Vec::new());
+
+/// How many finished passes to hold on to.
+///
+/// One would do for the ordinary case — a recording arrives, a note follows.
+/// Four covers a Slack burst, a folder of files dropped at once, and the case
+/// where a pass finished for a recording that never became a note at all
+/// (nothing said, or the ingest failed), whose entry nothing will ever collect.
+/// Turns are a few hundred bytes each, so the cap is about tidiness rather
+/// than memory.
+const AHEAD_KEEP: usize = 4;
+
+/// One recording being listened to, and where its answer will arrive.
+struct Ahead {
+    audio: String,
+    job: std::thread::JoinHandle<Result<Vec<Turn>, String>>,
+}
+
+/// Start listening for voices in a recording that has just arrived.
+///
+/// Returns immediately. Silent about everything: there is no note yet, so there
+/// is nothing on screen this could report to, and a failure here costs nothing
+/// — `label_speakers` will simply do the work itself, the way it always did.
+///
+/// Deliberately does not download. The models come at launch
+/// (`spawn_model_prefetch`), and a 40 MB fetch begun by a recording nobody has
+/// asked a question about is the behaviour 1.2.1 removed.
+pub fn start_early(app: &tauri::AppHandle, audio: &str) {
+    if !crate::settings::diarization(app) || !ready(app) {
+        return;
+    }
+
+    let mut ahead = AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+    if !claim(&mut ahead, audio) {
+        return;
+    }
+
+    let handle = app.clone();
+    let path = audio.to_string();
+    let job = std::thread::spawn(move || {
+        let samples = samples_for_helper(Path::new(&path))?;
+        // The same floor `wants_speakers` applies, checked here as well so the
+        // common case — a six-second dictation — costs a decode and stops.
+        if seconds(&samples) < crate::LONG_ENOUGH_FOR_TWO {
+            return Err("too short to hold a conversation".into());
+        }
+        let decoded = write_wav(&samples)?;
+        drop(samples);
+
+        // Behind the same one-at-a-time queue every other pass takes: two ONNX
+        // sessions gain nothing by overlapping, and the sweep over old notes is
+        // very likely running while this is.
+        let _turn = crate::LABELLING.lock().unwrap_or_else(|e| e.into_inner());
+        run_decoded(&handle, &decoded)
+    });
+    ahead.push(Ahead { audio: audio.to_string(), job });
+}
+
+/// Make room for one more pass, and say whether it is worth starting.
+///
+/// Answers no when this recording is already being listened to. That is not a
+/// nicety: the app can be asked to transcribe the same file twice — a retry, a
+/// file dropped on top of itself — and two passes over one recording would be
+/// the second ONNX session this module exists to avoid, for an identical answer.
+///
+/// The oldest entry goes when the list is full, on the reasoning that it is the
+/// one whose note has most likely already been saved and collected. Dropping an
+/// `Ahead` only detaches its thread; the pass finishes and its answer is thrown
+/// away, which costs a little heat and nothing else.
+fn claim(ahead: &mut Vec<Ahead>, audio: &str) -> bool {
+    if ahead.iter().any(|at| at.audio == audio) {
+        return false;
+    }
+    while ahead.len() >= AHEAD_KEEP {
+        ahead.remove(0);
+    }
+    true
+}
+
+/// Collect a pass started for this recording, waiting for it if it is still going.
+///
+/// Waiting rather than giving up is the point: by the time this is called the
+/// transcription is finished, so a pass still running is one that is nearly
+/// done, and starting a second one would mean decoding and listening to the
+/// whole recording again for an answer that is minutes old.
+///
+/// Only success is handed on. An error here is not reported anywhere — it
+/// belongs to work nobody asked for — so the caller is left to run the pass
+/// itself and say what went wrong with a note to say it about.
+pub fn take_early(audio: &str) -> Option<Vec<Turn>> {
+    let entry = {
+        let mut ahead = AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+        let at = ahead.iter().position(|at| at.audio == audio)?;
+        ahead.remove(at)
+    };
+
+    // Joined outside the lock. It can block for as long as the pass takes, and
+    // holding the registry while it did would stall every other recording's
+    // lookup behind this one.
+    entry.job.join().ok()?.ok()
 }
 
 /// One stretch of audio that one voice owns.
@@ -682,6 +836,79 @@ mod tests {
         let channels = u16::from_le_bytes(bytes[22..24].try_into().unwrap());
         let rate = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
         assert_eq!((channels, rate), (1, 16_000), "both models want 16 kHz mono");
+    }
+
+    /// A pass started for one recording is not handed to another.
+    ///
+    /// The key is the path the audio arrived on, and it has to be: the note
+    /// that collects this was saved minutes later and plays from an archived
+    /// copy under a different name. Getting this wrong would not fail loudly —
+    /// it would put one recording's speakers on another one's words.
+    #[test]
+    fn an_early_pass_is_collected_by_the_recording_it_was_started_for() {
+        let mut ahead = vec![
+            waiting("/tmp/one.wav", vec![turn(0.0, 4.0, 0), turn(4.0, 9.0, 1)]),
+            waiting("/tmp/two.wav", vec![turn(0.0, 3.0, 7)]),
+        ];
+
+        let at = ahead.iter().position(|at| at.audio == "/tmp/two.wav").unwrap();
+        let collected = ahead.remove(at).job.join().unwrap().unwrap();
+        assert_eq!(collected, vec![turn(0.0, 3.0, 7)]);
+        assert_eq!(ahead.len(), 1, "the other recording's pass is left alone");
+        assert_eq!(ahead[0].audio, "/tmp/one.wav");
+    }
+
+    /// Nothing was started for this recording, so the caller does the work.
+    ///
+    /// The ordinary answer for a note recorded before 1.2.2, for one the sweep
+    /// picked up, and for anything the setting was off for at the time.
+    #[test]
+    fn a_recording_nobody_listened_ahead_for_is_not_found() {
+        assert!(take_early("/tmp/never-seen.wav").is_none());
+    }
+
+    /// One pass per recording, however many times it is offered.
+    #[test]
+    fn the_same_recording_is_not_listened_to_twice_at_once() {
+        let mut ahead = vec![waiting("/tmp/one.wav", Vec::new())];
+        assert!(!claim(&mut ahead, "/tmp/one.wav"));
+        assert!(claim(&mut ahead, "/tmp/other.wav"));
+    }
+
+    /// The registry is bounded, so a pass nothing ever collects cannot pile up.
+    ///
+    /// It happens: a recording with nothing said in it never becomes a note, so
+    /// nothing ever asks for its speakers.
+    #[test]
+    fn uncollected_passes_do_not_pile_up() {
+        let mut ahead: Vec<Ahead> = Vec::new();
+        for i in 0..AHEAD_KEEP + 3 {
+            let path = format!("/tmp/{i}.wav");
+            assert!(claim(&mut ahead, &path));
+            ahead.push(waiting(&path, Vec::new()));
+        }
+        assert_eq!(ahead.len(), AHEAD_KEEP);
+        assert_eq!(
+            ahead[0].audio,
+            format!("/tmp/{}.wav", AHEAD_KEEP + 2 - (AHEAD_KEEP - 1)),
+            "the oldest goes first",
+        );
+    }
+
+    /// An `Ahead` whose pass is already finished.
+    fn waiting(audio: &str, turns: Vec<Turn>) -> Ahead {
+        Ahead {
+            audio: audio.to_string(),
+            job: std::thread::spawn(move || Ok(turns)),
+        }
+    }
+
+    /// The floor the early pass stops at, read off the samples rather than the
+    /// note — there is no note yet.
+    #[test]
+    fn a_length_is_read_off_the_samples() {
+        assert_eq!(seconds(&vec![0.0; RATE as usize * 20]), 20.0);
+        assert!(seconds(&vec![0.0; RATE as usize * 6]) < crate::LONG_ENOUGH_FOR_TWO);
     }
 
     use super::*;

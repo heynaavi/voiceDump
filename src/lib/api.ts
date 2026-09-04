@@ -451,14 +451,18 @@ export async function renameSpeaker(
 }
 
 /**
- * Names spoken in a meeting, to offer when labelling a speaker.
+ * Names spoken in a recording, to offer when labelling a speaker.
  *
- * Empty is a normal answer — plenty of calls go by without anyone saying a
+ * Any recording, not just a meeting: the automatic speaker pass labels
+ * dictations and dropped files too, and "Speaker 1" is the label most worth
+ * replacing.
+ *
+ * Empty is a normal answer — plenty of recordings go by without anyone saying a
  * name — and so is a rejection, when Apple Intelligence is off. Both mean the
  * same thing on screen: type it yourself.
  */
-export async function namesInMeeting(id: string): Promise<string[]> {
-  return invoke("names_in_meeting", { id });
+export async function namesInTranscript(id: string): Promise<string[]> {
+  return invoke("names_in_transcript", { id });
 }
 
 export async function deleteTranscript(id: string): Promise<void> {

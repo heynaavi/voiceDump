@@ -2898,6 +2898,37 @@ for line in sys.stdin:
         }
     }
 
+    /// The other kind of note that carries speakers: a dictation or a dropped
+    /// file the automatic pass diarized into "Speaker 1" / "Speaker 2". Nothing
+    /// about the labels is special to it, but a model reading a transcript whose
+    /// every paragraph opens with the word "Speaker" reaches for it — and one
+    /// that reads "Speaker 1" back as a person would offer, as a name to click,
+    /// the very label the user opened the control to be rid of.
+    #[test]
+    fn a_diarized_recording_offers_the_names_and_not_the_labels() {
+        let labels = vec!["Speaker 1".to_string(), "Speaker 2".to_string()];
+        let found = people_with(
+            &mut Canned(r#"{"names": ["Speaker 1", "Marcus", "Speaker", "Priya"]}"#.into()),
+            "Speaker 1: so Marcus, how did you start\n\nSpeaker 2: Priya was leading it",
+            &labels,
+        )
+        .unwrap();
+        assert_eq!(found, vec!["Marcus", "Priya"]);
+    }
+
+    /// A label the note does not carry, so the exact-match filter above cannot
+    /// catch it — and it must still never be offered.
+    #[test]
+    fn an_invented_speaker_number_is_not_a_name() {
+        let found = people_with(
+            &mut Canned(r#"{"names": ["Speaker 3", "Speaker1"]}"#.into()),
+            "Speaker 1: hello",
+            &["Speaker 1".into()],
+        )
+        .unwrap();
+        assert!(found.is_empty(), "offered {found:?}");
+    }
+
     #[test]
     fn a_reply_that_is_not_a_list_of_names_is_refused() {
         assert!(people_with(

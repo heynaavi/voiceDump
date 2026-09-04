@@ -13,7 +13,7 @@ import {
   type Themes,
   type WordCount,
 } from "../lib/api";
-import { EASE, prefersReducedMotion } from "../lib/motion";
+import { prefersReducedMotion, reveal } from "../lib/motion";
 import { bestType, renderReel } from "../lib/reel";
 import { renderWordCloud } from "../lib/share";
 import { cloudSentence } from "../lib/api";
@@ -428,11 +428,7 @@ function Trend({ windows }: { windows: Data["progress"] }) {
   useEffect(() => {
     const el = body.current;
     if (!el || prefersReducedMotion()) return;
-    const tween = gsap.fromTo(
-      el.querySelectorAll("[data-move]"),
-      { opacity: 0, y: 10 },
-      { opacity: 1, y: 0, duration: 0.34, ease: EASE.snap, stagger: 0.05 },
-    );
+    const tween = reveal(el.querySelectorAll("[data-move]"));
     return () => {
       tween.kill();
     };
@@ -915,19 +911,11 @@ export function Insights() {
     if (prefersReducedMotion()) return;
     const rows = sheet.current.querySelectorAll("[data-row]");
     const tl = gsap.timeline();
-    tl.fromTo(
-      rows,
-      { opacity: 0, y: 14 },
-      {
-        opacity: 1,
-        y: 0,
-        duration: 0.42,
-        ease: EASE.snap,
-        // Fast enough that the last panel isn't still arriving after the eye
-        // has reached it — the whole sequence is under half a second of stagger.
-        stagger: 0.055,
-      },
-    );
+    // Bounded by `spread`, which is where "the whole sequence is under half a
+    // second" now lives: V3 §7.3 caps a group's stagger at what eight siblings
+    // would take, so the last panel cannot still be arriving after the eye has
+    // reached it however many panels there are.
+    tl.add(reveal(rows));
     return () => {
       tl.kill();
       // Leave the panels visible if the view is torn down mid-run.

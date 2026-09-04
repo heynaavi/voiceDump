@@ -5,7 +5,7 @@ import gsap from "gsap";
 
 import type { BriefCapability, MeetingCapability, Settings as Stored } from "../lib/api";
 import { briefCapability } from "../lib/api";
-import { EASE, prefersReducedMotion, useGsap } from "../lib/motion";
+import { BEAT, EASE, prefersReducedMotion, reveal, useGsap } from "../lib/motion";
 import { DEFAULT_CHORD, glyphs } from "../lib/shortcut";
 import { CLUSTERS, PixelCluster } from "./PixelCluster";
 
@@ -258,11 +258,7 @@ export function Onboarding({ settings, meeting, chapters, onDone }: Props) {
     ({ scope }) => {
       if (prefersReducedMotion()) return;
       const tl = gsap.timeline();
-      tl.fromTo(
-        scope.querySelectorAll("[data-rise]"),
-        { opacity: 0, y: 14 },
-        { opacity: 1, y: 0, duration: 0.42, ease: EASE.snap, stagger: 0.07 },
-      );
+      tl.add(reveal(scope.querySelectorAll("[data-rise]")));
       const marchers = scope.querySelectorAll("[data-march]");
       if (marchers.length) {
         tl.fromTo(
@@ -271,7 +267,10 @@ export function Onboarding({ settings, meeting, chapters, onDone }: Props) {
           {
             opacity: 1,
             scale: 1,
-            duration: 0.3,
+            duration: BEAT.reveal,
+            // Kept on the decisive curve on purpose. The squares are the one
+            // thing on screen that is not text, and V3 §7.2 puts an arrival
+            // like this — a mark landing — apart from a paragraph resolving.
             ease: EASE.snap,
             stagger: 0.045,
           },
