@@ -739,6 +739,86 @@ fn likeliest(odds: &[f32], allowed: &[&'static str]) -> Option<&'static str> {
         .max_by(|a, b| odds_of(odds, a).total_cmp(&odds_of(odds, b)))
 }
 
+/// How much speech is enough to name the language it is in.
+///
+/// Four seconds. Twelve was tried and named the same languages with the same
+/// confidence on every recording, so the extra audio bought nothing — the cost
+/// of asking is the encoder pass itself, not the length of what it reads.
+const ENOUGH_TO_NAME: f64 = 4.0;
+
+/// How unlikely a language may be and still be chosen over the one listed first.
+///
+/// A ratio, not a level. The model is emphatic when it knows — 0.972 for Hindi
+/// against 0.018 for English — and merely ahead when it does not: 0.512 against
+/// 0.326 on a sentence that turned out to be English. A ratio separates those
+/// two; a level does not, and an absolute floor of 0.5 tried first let a
+/// six-to-one favourite lose to a long shot because neither reached it. This
+/// floor only refuses to choose between two languages both thought improbable.
+const NAMED_LANGUAGE_ODDS: f32 = 0.15;
+
+/// The language a recording is actually in, when more than one is declared.
+///
+/// **Why this has to be asked.** Told the audio is English, Whisper does not
+/// give up on speech that is not — it translates it, fluently and with every
+/// appearance of confidence. A whole dictation in Hindi came back as "I think we
+/// should stop till tomorrow": nothing garbled, nothing missing, nothing to
+/// suggest the words had ever been in another language. The pass below that
+/// re-examines speech which produced *no words* can never fire on that, because
+/// the words are all there. They are simply not the ones that were said.
+///
+/// **It is not free, and cannot be made free.** `whisper_lang_auto_detect` runs
+/// the encoder before it answers, so naming the language is a second encoder
+/// pass however it is asked. Decoding on `auto` instead — letting whisper.cpp
+/// name it during the decode — was built and measured as the cheaper route and
+/// is not: it costs the same second pass, changed a word in 46 English
+/// recordings, returned an entire short dictation empty, and picked languages
+/// nobody had declared. This asks plainly and keeps the transcripts intact.
+///
+/// **Only people who declare a second language pay.** For them it buys the
+/// feature working at all: today their Hindi comes back as English prose.
+///
+/// **Biased towards the language listed first.** Another has to be twice as
+/// likely before it wins, because being wrong here changes the script of a whole
+/// dictation, and most people who add a second language still mostly speak the
+/// first.
+fn spoken_language(
+    st: &mut whisper_rs::WhisperState,
+    samples: &[f32],
+    spans: &[(f64, f64)],
+    allowed: &[&'static str],
+) -> &'static str {
+    let first = allowed.first().copied().unwrap_or("en");
+    let Some(&(start, _)) = spans.first() else {
+        return first;
+    };
+    let from = (start * SAMPLE_RATE as f64) as usize;
+    let to = (((start + ENOUGH_TO_NAME) * SAMPLE_RATE as f64) as usize).min(samples.len());
+    if to <= from {
+        return first;
+    }
+    let Some(odds) = language_odds(st, &samples[from..to]) else {
+        return first;
+    };
+    // A threshold nobody can see is a threshold nobody can tune. Set
+    // `VOICEDUMPS_LANG_ODDS` to watch what the model actually thought.
+    if std::env::var("VOICEDUMPS_LANG_ODDS").is_ok() {
+        let seen: Vec<String> = allowed.iter().map(|l| format!("{l}={:.3}", odds_of(&odds, l))).collect();
+        eprintln!("[lang] {}", seen.join("  "));
+    }
+    let Some(best) = likeliest(&odds, allowed) else {
+        return first;
+    };
+    if best == first {
+        return first;
+    }
+    let (p_best, p_first) = (odds_of(&odds, best), odds_of(&odds, first));
+    if p_best >= NAMED_LANGUAGE_ODDS && p_best >= 2.0 * p_first {
+        best
+    } else {
+        first
+    }
+}
+
 /// Pad either side of a decoded word when deciding what speech it accounts for.
 const UNHEARD_PAD: f64 = 0.3;
 /// The longest a single word can reasonably take. Whisper's word times stretch
@@ -975,13 +1055,15 @@ fn decode_with(
         Detected::Speech(spans) => spans,
         _ => &[],
     };
-    // The first declared language, without asking the model. Detecting it cost a
-    // whole extra encoder pass on every recording — replayed over 46 real ones
-    // with English and Hindi declared, 60% more time to change nothing, because
-    // they were all English. The first language is the one the Mac lists first,
-    // or the one moved to the top in Settings; anything said in another is
-    // found below, by the speech it left without words.
-    let language = lessons.languages.first().copied().unwrap_or("en");
+    // Which language this actually is. Nothing at all when one is declared; a
+    // second encoder pass when more are, which is what naming it costs however
+    // it is asked — see `spoken_language`, and why the unheard-speech pass
+    // below cannot answer this question.
+    let language = if lessons.languages.len() > 1 {
+        spoken_language(st, samples, spans, &lessons.languages)
+    } else {
+        lessons.languages.first().copied().unwrap_or("en")
+    };
     let mut params = decoding();
     condition(&mut params, language);
     st.full(params, samples)
