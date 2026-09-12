@@ -69,6 +69,48 @@ const SPECS: [Spec; 2] = [
     },
 ];
 
+/// The voice-activity model: Silero v5.1.2, converted to ggml by the whisper.cpp
+/// project and published beside its VAD support.
+///
+/// Not a Whisper size, and not from Whisper's repository, so it is described
+/// here in full rather than squeezed into [`Spec`]. 885 KB, pinned exactly like
+/// the weights: ggml aborts on a malformed header here too.
+pub const VAD: Fetch = Fetch {
+    name: crate::engine::VAD_FILE,
+    label: "speech detection",
+    url: std::borrow::Cow::Borrowed(
+        "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin",
+    ),
+    sha256: "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf",
+    bytes: 885_098,
+};
+
+/// Everything [`download`] needs to know about one file.
+///
+/// A view rather than a replacement for [`Spec`]: the Whisper weights are keyed
+/// by size everywhere else in the app, and the one file that is not a size
+/// should not make all of that less direct.
+pub struct Fetch {
+    pub name: &'static str,
+    /// What the file is called in a sentence — "the medium model".
+    pub label: &'static str,
+    pub url: std::borrow::Cow<'static, str>,
+    pub sha256: &'static str,
+    pub bytes: u64,
+}
+
+impl Spec {
+    fn fetch(&self) -> Fetch {
+        Fetch {
+            name: self.name,
+            label: self.size.label(),
+            url: format!("{BASE}/{}", self.name).into(),
+            sha256: self.sha256,
+            bytes: self.bytes,
+        }
+    }
+}
+
 fn spec(size: ModelSize) -> &'static Spec {
     SPECS
         .iter()
@@ -194,6 +236,33 @@ pub async fn models_fetch(app: tauri::AppHandle) -> Result<(), String> {
     result
 }
 
+/// A voice-activity download in flight — its own guard, not [`FETCHING`], so the
+/// first-run screen can never be told "a download is already running" because
+/// an 885 KB file happened to be arriving at the same moment.
+static FETCHING_VAD: AtomicBool = AtomicBool::new(false);
+
+/// Get the voice-activity model if it is not here, quietly, in the background.
+///
+/// Not part of the first-run screen, on purpose. Somebody updating already has
+/// the Whisper weights and should never see a download screen again for a file
+/// under a megabyte; somebody installing fresh gets it alongside the weights
+/// without a second progress bar. Either way transcription does not wait for
+/// it — without the model it simply runs as it always has, on every sample.
+pub fn spawn_vad_prefetch(app: &tauri::AppHandle) {
+    if crate::engine::vad_path(app).is_some() || FETCHING_VAD.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let result = store_dir(&app).and_then(|dir| download(&dir, &VAD, &|_, _| {}));
+        match result {
+            Ok(()) => eprintln!("[models] {} ready", VAD.name),
+            Err(why) => eprintln!("[models] speech detection not fetched: {why}"),
+        }
+        FETCHING_VAD.store(false, Ordering::SeqCst);
+    });
+}
+
 fn fetch_all(app: &tauri::AppHandle) -> Result<(), String> {
     let dir = store_dir(app)?;
     let wanted: Vec<&Spec> = required()
@@ -218,7 +287,7 @@ fn fetch_all(app: &tauri::AppHandle) -> Result<(), String> {
             );
         };
         report(0, false);
-        download(&dir, s, &report)?;
+        download(&dir, &s.fetch(), &report)?;
         eprintln!("[models] {} ready", s.name);
     }
     Ok(())
@@ -231,12 +300,12 @@ fn fetch_all(app: &tauri::AppHandle) -> Result<(), String> {
 /// name without `.part` is a model that has been proven whole.
 fn download(
     dir: &std::path::Path,
-    s: &Spec,
+    s: &Fetch,
     report: &dyn Fn(u64, bool),
 ) -> Result<(), String> {
     let part = dir.join(format!("{}.part", s.name));
     let done = dir.join(s.name);
-    let url = format!("{BASE}/{}", s.name);
+    let url: &str = &s.url;
 
     // A leftover part from a previous run that grew past the published size is
     // not resumable — it is wrong. Start it again rather than appending to it.
@@ -256,7 +325,7 @@ fn download(
             "--output",
         ])
         .arg(&part)
-        .arg(&url)
+        .arg(url)
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not start the download: {e}"))?;
@@ -275,9 +344,9 @@ fn download(
                     }
                     let why = why.trim();
                     return Err(if why.is_empty() {
-                        format!("Could not download the {} model.", s.size.label())
+                        format!("Could not download the {} model.", s.label)
                     } else {
-                        format!("Could not download the {} model: {why}", s.size.label())
+                        format!("Could not download the {} model: {why}", s.label)
                     });
                 }
                 break;
@@ -303,7 +372,7 @@ fn download(
 /// means the next launch finds something model-shaped and feeds it to ggml —
 /// which does not return an error for a malformed header, it calls `abort()`.
 /// Removing it turns a permanent crash into "download it again".
-fn verify(part: &std::path::Path, s: &Spec) -> Result<(), String> {
+fn verify(part: &std::path::Path, s: &Fetch) -> Result<(), String> {
     // Cheap check first: a short file cannot be the right one, and saying so
     // costs nothing next to hashing half a gigabyte to reach the same verdict.
     let got = std::fs::metadata(part)
@@ -313,7 +382,7 @@ fn verify(part: &std::path::Path, s: &Spec) -> Result<(), String> {
         let _ = std::fs::remove_file(part);
         return Err(format!(
             "The {} model downloaded incompletely ({got} of {} bytes). Try again.",
-            s.size.label(),
+            s.label,
             s.bytes
         ));
     }
@@ -324,7 +393,7 @@ fn verify(part: &std::path::Path, s: &Spec) -> Result<(), String> {
             let _ = std::fs::remove_file(part);
             Err(format!(
                 "The {} model does not match its published checksum, so it was discarded.",
-                s.size.label()
+                s.label
             ))
         }
         // Can't hash it: keeping an unverified 539 MB file and loading it into
@@ -405,6 +474,16 @@ mod tests {
         }
     }
 
+    /// The VAD model is pinned like the weights, and named the way the engine
+    /// looks for it — a mismatch would download a file nothing ever opens.
+    #[test]
+    fn the_speech_detector_is_pinned_and_findable() {
+        assert_eq!(VAD.name, crate::engine::VAD_FILE);
+        assert_eq!(VAD.sha256.len(), 64);
+        assert!(VAD.sha256.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()));
+        assert!(VAD.url.ends_with(VAD.name));
+    }
+
     #[test]
     fn digest_reads_shasums_output() {
         let dir = std::env::temp_dir().join("voicedumps-digest-test");
@@ -451,7 +530,7 @@ mod tests {
         // interrupted first run takes, and it is the one worth proving.
         std::fs::write(&part, vec![0u8; 0]).unwrap();
         let seen = std::sync::Mutex::new(Vec::new());
-        download(&dir, s, &|received, verified| {
+        download(&dir, &s.fetch(), &|received, verified| {
             seen.lock().unwrap().push((received, verified))
         })
         .expect("download");
@@ -471,7 +550,7 @@ mod tests {
         bytes[0] ^= 0xff;
         std::fs::write(&part, &bytes).unwrap();
         // Same length, wrong contents: only the digest can catch this.
-        let err = verify(&part, s).expect_err("a corrupt file must be refused");
+        let err = verify(&part, &s.fetch()).expect_err("a corrupt file must be refused");
         assert!(err.contains("checksum"), "unexpected error: {err}");
         assert!(!part.exists(), "a refused file must not be left on disk");
 

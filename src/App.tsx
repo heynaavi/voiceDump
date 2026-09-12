@@ -29,6 +29,8 @@ import {
   saveTranscript,
   setDiarization,
   setHoldToTalk,
+  setLanguages,
+  setLearnCorrections,
   setLivePreview,
   setMicrophone,
   setRestoreClipboard,
@@ -386,6 +388,22 @@ export default function App() {
     setSettings((s) => (s ? { ...s, restore_clipboard: enabled } : s));
     setRestoreClipboard(enabled).then(setSettings).catch(() => {
       setSettings((s) => (s ? { ...s, restore_clipboard: !enabled } : s));
+    });
+  }, []);
+
+  // Optimistic like the microphone: the list on screen changes at once, and a
+  // refusal puts back whatever the backend actually holds rather than guessing.
+  const applyLanguages = useCallback((codes: string[]) => {
+    setSettings((s) => (s ? { ...s, languages: codes } : s));
+    setLanguages(codes)
+      .then(setSettings)
+      .catch(() => getSettings().then(setSettings).catch(() => {}));
+  }, []);
+
+  const applyLearnCorrections = useCallback((enabled: boolean) => {
+    setSettings((s) => (s ? { ...s, learn_corrections: enabled } : s));
+    setLearnCorrections(enabled).then(setSettings).catch(() => {
+      setSettings((s) => (s ? { ...s, learn_corrections: !enabled } : s));
     });
   }, []);
 
@@ -786,6 +804,8 @@ export default function App() {
             onHoldToTalk={applyHoldToTalk}
             onRestoreClipboard={applyRestoreClipboard}
             onMicrophone={applyMicrophone}
+            onLanguages={applyLanguages}
+            onLearnCorrections={applyLearnCorrections}
             onShortcut={applyShortcut}
             meeting={meeting}
             onReplayTutorial={() => {

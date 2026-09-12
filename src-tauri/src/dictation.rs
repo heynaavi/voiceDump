@@ -767,7 +767,7 @@ fn spawn_preview(app: &tauri::AppHandle, cap: &Capture) {
 
             let Some(s) = session.as_mut() else { continue };
             let mut changed = false;
-            if let Some(piece) = s.step(&audio, cancel.clone()) {
+            if let Some(piece) = s.step(&audio, cancel.clone(), &crate::engine::preview_languages(&app)) {
                 said.push(Said { words: piece, refined: false });
                 // Hand the same audio to `medium`. The fast words are already
                 // on screen; this only decides what they turn into.
@@ -864,7 +864,7 @@ fn spawn_refine(
                 continue;
             };
             let Some(r) = refiner.as_mut() else { continue };
-            if let Some(words) = r.step(&audio, cancel.clone()) {
+            if let Some(words) = r.step(&audio, cancel.clone(), &crate::engine::preview_languages(&app)) {
                 // A closed channel means the preview is already shutting down.
                 if done.send((i, words)).is_err() {
                     break;
@@ -1286,7 +1286,36 @@ fn finish(app: &tauri::AppHandle, cap: Capture) -> Result<(), String> {
     // where it was aimed.
     let target = frontmost_app();
 
+    // The field, as it was before the words went in — see `readback`. Taken now
+    // for the same reason as the app name: after the paste is too late to know
+    // what was already there.
+    let watching = crate::settings::learn_corrections(app)
+        .then(crate::readback::before_paste)
+        .flatten();
+
     paste(&text, crate::settings::restore_clipboard(app))?;
+
+    if let Some(before) = watching {
+        // What the model made of each sentence, carried into the watch so a
+        // correction records how sure it was about the words it got wrong.
+        // Confidence is kept per sentence, not per word — see `engine::collect`.
+        let sure: Vec<(String, f32)> = result
+            .get("segments")
+            .and_then(|v| v.as_array())
+            .map(|segments| {
+                segments
+                    .iter()
+                    .filter_map(|s| {
+                        Some((
+                            s.get("text")?.as_str()?.to_string(),
+                            s.get("confidence")?.as_f64()? as f32,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::readback::watch(app.clone(), before, text.clone(), target.clone(), sure);
+    }
 
     let duration = result.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let id = crate::insert_transcript(

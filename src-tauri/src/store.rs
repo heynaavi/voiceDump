@@ -169,6 +169,10 @@ pub fn open(dir: &PathBuf) -> rusqlite::Result<Connection> {
     )
     .ok();
 
+    // Words taught by correction — see `vocabulary`. Two small tables, created
+    // on open like the cache above.
+    crate::vocabulary::ensure(&conn).ok();
+
     // After the `ALTER TABLE`s, not before them. This is an external-content
     // index: its triggers read `new.brief`, and on a database being created for
     // the first time that column does not exist until the statements above have

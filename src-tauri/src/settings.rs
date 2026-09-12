@@ -108,6 +108,32 @@ pub struct Settings {
     /// either way; this makes it the default for people who reach for it every
     /// time.
     pub restore_clipboard: bool,
+
+    /// The languages dictation listens for, as Whisper's two-letter codes.
+    ///
+    /// **Defaults to this Mac's own preferred languages** — the list in System
+    /// Settings, reduced to the ones the model knows. On an English-only Mac
+    /// that is `["en"]`, which is exactly what the app did before this existed:
+    /// whisper.cpp's default, never overridden. So nobody's dictation changes
+    /// because this setting arrived; it changes when their Mac already says they
+    /// speak something else, or when they add a language here.
+    ///
+    /// One language means the model never guesses, and that matters more than it
+    /// sounds. Handed ten seconds of room noise with detection on, it guessed
+    /// Norwegian and wrote "Thanks for watching!". **Order matters** with several:
+    /// the first is what every recording is decoded in, and speech it leaves
+    /// without words is heard again in whichever of the others it sounds like.
+    /// Nothing outside the list can ever be chosen.
+    pub languages: Vec<String>,
+
+    /// Learn a word's spelling when it is corrected.
+    ///
+    /// **On by default.** In a note here, and — through the Accessibility
+    /// permission the dictation key already holds — in the app the words were
+    /// pasted into, where people actually fix them. Only the corrected word and
+    /// what it replaced are kept, on this Mac. See [`crate::readback`] for what
+    /// is read and what is refused.
+    pub learn_corrections: bool,
 }
 
 impl Default for Settings {
@@ -119,6 +145,8 @@ impl Default for Settings {
             diarization: true,
             hold_to_talk: true,
             restore_clipboard: true,
+            languages: system_languages(),
+            learn_corrections: true,
         }
     }
 }
@@ -179,6 +207,145 @@ pub fn diarization(app: &tauri::AppHandle) -> bool {
 ///
 /// Same contract as [`live_preview`]: read from the dictation path, so a
 /// poisoned lock gives back the default rather than taking the paste down.
+/// This Mac's preferred languages, as the Whisper codes the model knows.
+pub fn system_languages() -> Vec<String> {
+    whisper_codes(&preferred_languages())
+}
+
+#[cfg(target_os = "macos")]
+fn preferred_languages() -> Vec<String> {
+    use core_foundation::array::CFArray;
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    extern "C" {
+        fn CFLocaleCopyPreferredLanguages() -> core_foundation::array::CFArrayRef;
+    }
+    let raw = unsafe { CFLocaleCopyPreferredLanguages() };
+    if raw.is_null() {
+        return Vec::new();
+    }
+    let list: CFArray<CFString> = unsafe { CFArray::wrap_under_create_rule(raw) };
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn preferred_languages() -> Vec<String> {
+    Vec::new()
+}
+
+/// Reduce language tags — `en-IN`, `zh-Hans-CN`, `nb` — to codes Whisper knows.
+///
+/// The primary subtag is the language; region and script are not something the
+/// model distinguishes. A few old or regional codes differ from Whisper's own
+/// and are mapped. Order is kept, because the first is the one the Mac prefers,
+/// and duplicates go. Nothing the model knows means English, which is what it
+/// has always been.
+pub fn whisper_codes(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags {
+        let primary = tag.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+        let code = match primary.as_str() {
+            "nb" => "no",
+            "iw" => "he",
+            "in" => "id",
+            "ji" => "yi",
+            "fil" => "tl",
+            other => other,
+        }
+        .to_string();
+        if whisper_rs::get_lang_id(&code).is_some() && !out.contains(&code) {
+            out.push(code);
+        }
+    }
+    if out.is_empty() {
+        out.push("en".to_string());
+    }
+    out
+}
+
+pub fn languages(app: &tauri::AppHandle) -> Vec<String> {
+    app.try_state::<SettingsState>()
+        .and_then(|s| s.0.lock().ok().map(|g| g.languages.clone()))
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| vec!["en".to_string()])
+}
+
+pub fn learn_corrections(app: &tauri::AppHandle) -> bool {
+    app.try_state::<SettingsState>()
+        .and_then(|s| s.0.lock().ok().map(|g| g.learn_corrections))
+        .unwrap_or_else(|| Settings::default().learn_corrections)
+}
+
+/// What Settings can offer, and what this Mac's own list comes to.
+#[derive(Serialize)]
+pub struct LanguageChoices {
+    pub all: Vec<LanguageChoice>,
+    pub system: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct LanguageChoice {
+    pub code: String,
+    pub name: String,
+}
+
+#[tauri::command]
+pub fn list_languages() -> LanguageChoices {
+    let mut all: Vec<LanguageChoice> = (0..=whisper_rs::get_lang_max_id())
+        .filter_map(|id| {
+            Some(LanguageChoice {
+                code: whisper_rs::get_lang_str(id)?.to_string(),
+                name: whisper_rs::get_lang_str_full(id)?.to_string(),
+            })
+        })
+        .collect();
+    all.sort_by(|a, b| a.name.cmp(&b.name));
+    LanguageChoices { all, system: system_languages() }
+}
+
+#[tauri::command]
+pub fn set_languages(
+    app: tauri::AppHandle,
+    state: tauri::State<SettingsState>,
+    codes: Vec<String>,
+) -> Result<Settings, String> {
+    let mut chosen: Vec<String> = Vec::new();
+    for code in codes {
+        let code = code.trim().to_ascii_lowercase();
+        if whisper_rs::get_lang_id(&code).is_none() {
+            return Err(format!("\"{code}\" is not a language the speech model knows."));
+        }
+        if !chosen.contains(&code) {
+            chosen.push(code);
+        }
+    }
+    if chosen.is_empty() {
+        return Err("Dictation needs at least one language.".into());
+    }
+    let updated = {
+        let mut guard = state.0.lock().unwrap();
+        guard.languages = chosen;
+        guard.clone()
+    };
+    persist(&app, &updated)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+pub fn set_learn_corrections(
+    app: tauri::AppHandle,
+    state: tauri::State<SettingsState>,
+    enabled: bool,
+) -> Result<Settings, String> {
+    let updated = {
+        let mut guard = state.0.lock().unwrap();
+        guard.learn_corrections = enabled;
+        guard.clone()
+    };
+    persist(&app, &updated)?;
+    Ok(updated)
+}
+
 pub fn restore_clipboard(app: &tauri::AppHandle) -> bool {
     app.try_state::<SettingsState>()
         .and_then(|s| s.0.lock().ok().map(|g| g.restore_clipboard))
@@ -341,6 +508,41 @@ mod tests {
     #[test]
     fn the_lite_build_ships_the_preview_off() {
         assert!(!Settings::default().live_preview);
+    }
+
+    fn tags(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The Mac this was built on lists only `en-IN`, and must end up exactly
+    /// where the app always was.
+    #[test]
+    fn an_english_mac_listens_for_english_alone() {
+        assert_eq!(whisper_codes(&tags(&["en-IN"])), tags(&["en"]));
+    }
+
+    #[test]
+    fn regions_and_scripts_are_not_languages() {
+        assert_eq!(
+            whisper_codes(&tags(&["hi-IN", "en-GB", "zh-Hans-CN", "en-US"])),
+            tags(&["hi", "en", "zh"])
+        );
+    }
+
+    #[test]
+    fn old_and_regional_codes_map_to_the_models_own() {
+        assert_eq!(whisper_codes(&tags(&["nb-NO", "iw"])), tags(&["no", "he"]));
+    }
+
+    #[test]
+    fn nothing_the_model_knows_falls_back_to_english() {
+        assert_eq!(whisper_codes(&tags(&["xx-ZZ"])), tags(&["en"]));
+        assert_eq!(whisper_codes(&[]), tags(&["en"]));
+    }
+
+    #[test]
+    fn corrections_are_learned_unless_switched_off() {
+        assert!(Settings::default().learn_corrections);
     }
 
     #[test]

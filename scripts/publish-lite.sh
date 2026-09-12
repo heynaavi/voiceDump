@@ -43,6 +43,7 @@ PRIVATE=(
   "src-tauri/src/sidecar.rs"
   "src-tauri/tauri.qwee.conf.json"  # the private build's identifier and name
   "cross-repo-graph.json"           # spans all three repos — see above
+  "graphify-out/"                   # the same graph rebuilt, plus its cache
   "docs/chat-harness.md"            # internal design notes, quotes a real library
   ".claude/"                        # worktrees, local settings, agent scratch
 

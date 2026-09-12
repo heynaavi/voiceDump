@@ -2,9 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import gsap from "gsap";
 
 import type { MeetingCapability, Mic, Settings as Stored } from "../lib/api";
+import type { LanguageChoices, Term } from "../lib/api";
 import type { BriefCapability } from "../lib/api";
 import {
   briefCapability,
+  addVocabulary,
+  listLanguages,
+  listVocabulary,
+  removeVocabulary,
   listMicrophones,
   openAudioCaptureSettings,
 } from "../lib/api";
@@ -26,6 +31,8 @@ type Props = {
   onDiarization: (enabled: boolean) => void;
   onHoldToTalk: (enabled: boolean) => void;
   onRestoreClipboard: (enabled: boolean) => void;
+  onLanguages: (codes: string[]) => void;
+  onLearnCorrections: (enabled: boolean) => void;
   onMicrophone: (name: string | null) => void;
   onShortcut: (chord: string) => Promise<void>;
   /** Null until the backend has been asked whether this Mac can record calls. */
@@ -315,6 +322,218 @@ function Microphones({
   );
 }
 
+/** A language's English name the way a sentence would print it. */
+function spoken(name: string): string {
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+/**
+ * Which languages dictation listens for.
+ *
+ * The chosen ones as a list, like the microphones above; the other ninety-odd
+ * behind a select rather than as rows, because a list that long is a thing to
+ * search, not to read.
+ */
+function Languages({
+  chosen,
+  onChoose,
+}: {
+  chosen: string[];
+  onChoose: (codes: string[]) => void;
+}) {
+  const [known, setKnown] = useState<LanguageChoices | null>(null);
+
+  useEffect(() => {
+    listLanguages()
+      .then(setKnown)
+      .catch(() => setKnown(null));
+  }, []);
+
+  const name = (code: string) =>
+    spoken(known?.all.find((l) => l.code === code)?.name ?? code);
+  const rest = (known?.all ?? []).filter((l) => !chosen.includes(l.code));
+  const fromMac =
+    known !== null &&
+    known.system.length === chosen.length &&
+    known.system.every((c) => chosen.includes(c));
+
+  return (
+    <div>
+      <p className="max-w-[52ch] px-4 pt-3.5 text-[12px] leading-relaxed text-grey">
+        {chosen.length === 1
+          ? `Everything you say is written as ${name(chosen[0])}, and the model never guesses — which is also what keeps a pause from coming back as a sentence in some other language. Add another if you speak it.`
+          : `Everything is heard in ${name(chosen[0])} first. Speech that leaves without words is heard again in whichever of the others it sounds like, and nothing outside the list is ever chosen. Put the language you speak most at the top. Switching language in the middle of one sentence is still beyond the model.`}
+      </p>
+      <ul className="py-1.5">
+        {chosen.map((code) => (
+          <li
+            key={code}
+            className="flex items-center justify-between gap-3 px-4 py-2"
+          >
+            <span className="flex min-w-0 items-center gap-2.5">
+              <span className="h-[7px] w-[7px] shrink-0 border border-ink bg-ink" />
+              <span className="truncate text-[13px] text-ink">{name(code)}</span>
+              <span className="micro text-faint">{code}</span>
+            </span>
+            {/* Invisible rather than absent where they do not apply: the row
+                keeps its width and nothing beside it moves. */}
+            <span className="flex shrink-0 items-center gap-1">
+              <button
+                onClick={() => onChoose([code, ...chosen.filter((c) => c !== code)])}
+                disabled={chosen[0] === code}
+                className="micro border border-transparent px-1.5 py-0.5 text-faint transition-colors hover:border-hairline hover:text-ink disabled:invisible"
+              >
+                MAKE FIRST
+              </button>
+              <button
+                onClick={() => onChoose(chosen.filter((c) => c !== code))}
+                disabled={chosen.length === 1}
+                className="micro border border-transparent px-1.5 py-0.5 text-faint transition-colors hover:border-hairline hover:text-ink disabled:invisible"
+              >
+                REMOVE
+              </button>
+            </span>
+          </li>
+        ))}
+      </ul>
+      <div className="flex flex-wrap items-center gap-2 border-t border-hairline px-4 py-3">
+        <select
+          value=""
+          onChange={(e) => {
+            if (e.target.value) onChoose([...chosen, e.target.value]);
+          }}
+          disabled={known === null}
+          aria-label="Add a language"
+          className="micro no-drag border border-hairline bg-transparent px-2 py-1.5 text-grey outline-none transition-colors hover:border-sage-dim disabled:opacity-50"
+        >
+          <option value="">ADD A LANGUAGE</option>
+          {rest.map((l) => (
+            <option key={l.code} value={l.code}>
+              {spoken(l.name)}
+            </option>
+          ))}
+        </select>
+        {known !== null && !fromMac && known.system.length > 0 && (
+          <button
+            onClick={() => onChoose(known.system)}
+            className="micro border border-hairline px-2.5 py-1.5 text-grey transition-colors hover:border-ink hover:bg-ink hover:text-surface"
+          >
+            USE THIS MAC'S LANGUAGES
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Where a word was learned, said the way the row prints it. */
+function taughtBy(t: Term): string {
+  const times = t.count > 1 ? ` ×${t.count}` : "";
+  if (t.source === "added") return "YOU ADDED";
+  if (t.source === "edited") return `FIXED IN A NOTE${times}`;
+  return `FIXED IN ${(t.app ?? "ANOTHER APP").toUpperCase()}${times}`;
+}
+
+/**
+ * The words VoiceDumps has been taught to spell.
+ *
+ * Its own list rather than part of the settings object: it grows on its own,
+ * every time a correction is noticed, and the pane asks for it fresh on open
+ * instead of carrying a copy that is out of date the moment you dictate.
+ */
+function Vocabulary({
+  learning,
+  onLearning,
+}: {
+  learning: boolean;
+  onLearning: (enabled: boolean) => void;
+}) {
+  const [terms, setTerms] = useState<Term[] | null>(null);
+  const [draft, setDraft] = useState("");
+  const [problem, setProblem] = useState<string | null>(null);
+
+  useEffect(() => {
+    listVocabulary()
+      .then(setTerms)
+      .catch(() => setTerms([]));
+  }, []);
+
+  const add = () => {
+    const word = draft.trim();
+    if (!word) return;
+    addVocabulary(word)
+      .then((next) => {
+        setTerms(next);
+        setDraft("");
+        setProblem(null);
+      })
+      // Kept in the field, with the reason under it: fixing it is one keystroke.
+      .catch((e) => setProblem(String(e).replace(/^Error:\s*/, "")));
+  };
+
+  return (
+    <div>
+      <Row
+        label="Learn from your corrections"
+        note="When you fix a word VoiceDumps wrote — in a note here, or in the app you dictated into — it remembers the spelling and uses it next time. It looks back at what it pasted a few seconds later. Only the corrected word and what it replaced are kept, and only on this Mac."
+        control={<Switch on={learning} onClick={() => onLearning(!learning)} />}
+      />
+      <div className="flex items-center gap-2 border-t border-hairline px-4 py-3">
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") add();
+          }}
+          placeholder="A NAME, A PRODUCT, A WORD IT GETS WRONG"
+          aria-label="Add a word"
+          className="micro no-drag selectable min-w-0 flex-1 border border-hairline bg-transparent px-2 py-1.5 text-ink outline-none placeholder:text-faint focus:border-sage-dim"
+        />
+        <button
+          onClick={add}
+          disabled={!draft.trim()}
+          className="micro border border-hairline px-2.5 py-1.5 text-grey transition-colors hover:border-ink hover:bg-ink hover:text-surface disabled:opacity-50"
+        >
+          ADD
+        </button>
+      </div>
+      {problem && <p className="micro px-4 pb-3 text-amber">{problem}</p>}
+      {terms !== null && terms.length === 0 ? (
+        <p className="micro border-t border-hairline px-4 py-3.5 text-faint">
+          NO WORDS YET
+        </p>
+      ) : (
+        <ul className="border-t border-hairline py-1.5">
+          {(terms ?? []).map((t) => (
+            <li
+              key={t.term}
+              className="flex items-center justify-between gap-3 px-4 py-2"
+            >
+              <span className="min-w-0">
+                <span className="block truncate text-[13px] text-ink">{t.term}</span>
+                <span className="micro mt-0.5 block truncate text-faint">
+                  {taughtBy(t)}
+                  {t.replaces && t.heard ? ` // WAS \u201C${t.heard}\u201D` : ""}
+                </span>
+              </span>
+              <button
+                onClick={() =>
+                  removeVocabulary(t.term)
+                    .then(setTerms)
+                    .catch(() => {})
+                }
+                className="micro shrink-0 border border-transparent px-1.5 py-0.5 text-faint transition-colors hover:border-hairline hover:text-ink"
+              >
+                REMOVE
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export function Settings({
   settings,
   onLivePreview,
@@ -322,6 +541,8 @@ export function Settings({
   onHoldToTalk,
   onRestoreClipboard,
   onMicrophone,
+  onLanguages,
+  onLearnCorrections,
   onShortcut,
   meeting,
   onReplayTutorial,
@@ -456,6 +677,24 @@ export function Settings({
           aside={settings.microphone ? "PINNED" : "FOLLOWING SYSTEM"}
         >
           <Microphones chosen={settings.microphone} onChoose={onMicrophone} />
+        </Group>
+
+        <Group
+          title="LANGUAGES"
+          aside={
+            settings.languages.length === 1
+              ? "NEVER GUESSES"
+              : `${settings.languages.length}, PER SENTENCE`
+          }
+        >
+          <Languages chosen={settings.languages} onChoose={onLanguages} />
+        </Group>
+
+        <Group title="VOCABULARY" aside={settings.learn_corrections ? "LEARNING" : "NOT LEARNING"}>
+          <Vocabulary
+            learning={settings.learn_corrections}
+            onLearning={onLearnCorrections}
+          />
         </Group>
 
         {/* No switch here on purpose: a meeting is recorded by asking for it,

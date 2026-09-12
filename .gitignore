@@ -59,6 +59,18 @@ brain-helper/voicedumps-brain
 *.sqlite
 *.sqlite3
 
+# Knowledge-graph build output — regenerate it rather than keep it.
+#
+# Fifty-odd files naming the private modules thousands of times over: the Slack
+# and Discord integrations, the knowledge store, the sidecar. It is the same
+# kind of artifact as cross-repo-graph.json, which scripts/publish-lite.sh calls
+# the single worst thing in this tree to publish — except that one is tracked on
+# purpose and filtered by name, while this was only ever untracked, which is one
+# `git add -A` away from being neither.
+#
+# No trailing slash, for the same reason as node_modules above.
+graphify-out
+
 # Speaker diarizer: a prebuilt binary and the ONNX runtime it loads, fetched by
 #   node scripts/fetch-diarizer.mjs
 # Downloaded rather than compiled — sherpa-onnx is a large C++ project and

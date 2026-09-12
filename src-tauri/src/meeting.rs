@@ -678,7 +678,7 @@ fn spawn_meeting_preview(app: tauri::AppHandle, stop: Arc<AtomicBool>) {
                 continue;
             };
 
-            let heard = preview.step(&chunk, stop.clone());
+            let heard = preview.step(&chunk, stop.clone(), &crate::engine::preview_languages(&app));
             let audio = std::mem::take(&mut chunk);
 
             let Some(words) = heard else { continue };
@@ -778,7 +778,7 @@ fn spawn_refine(
                 }
             }
             let Some(r) = refiner.as_mut() else { continue };
-            if let Some(words) = r.step(&audio, stop.clone()) {
+            if let Some(words) = r.step(&audio, stop.clone(), &crate::engine::preview_languages(&app)) {
                 if !words.is_empty() {
                     let _ = done.send((index, words));
                 }

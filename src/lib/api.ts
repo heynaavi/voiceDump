@@ -713,6 +713,17 @@ export type Settings = {
   hold_to_talk: boolean;
   /** Put back whatever the transcript displaced on the clipboard. */
   restore_clipboard: boolean;
+  /**
+   * Whisper language codes dictation listens for, e.g. `["en", "hi"]`.
+   * One means the model never guesses; several means each stretch of speech
+   * is heard in whichever of these it sounds like, and nothing else.
+   */
+  languages: string[];
+  /**
+   * Remember a word when it is corrected — in a note here, or in the app the
+   * dictation was pasted into. On by default.
+   */
+  learn_corrections: boolean;
 };
 
 export async function getSettings(): Promise<Settings> {
@@ -833,6 +844,75 @@ export async function setHoldToTalk(enabled: boolean): Promise<Settings> {
  */
 export async function setRestoreClipboard(enabled: boolean): Promise<Settings> {
   return invoke("set_restore_clipboard", { enabled });
+}
+
+/** What can be chosen, and what this Mac's own language list comes to. */
+export type LanguageChoices = {
+  /** Every language the model knows, by code, with its English name. */
+  all: { code: string; name: string }[];
+  /** The Mac's preferred languages the model knows — the default, and the reset. */
+  system: string[];
+};
+
+export async function listLanguages(): Promise<LanguageChoices> {
+  return invoke("list_languages");
+}
+
+/**
+ * Choose the languages dictation listens for.
+ *
+ * Rejects with a sentence for an empty list or a code the model does not know.
+ */
+export async function setLanguages(codes: string[]): Promise<Settings> {
+  return invoke("set_languages", { codes });
+}
+
+/** A word VoiceDumps has been taught to spell. */
+export type Term = {
+  term: string;
+  /** What it wrote instead, when this was learned from a correction. */
+  heard: string | null;
+  /** Typed in here, fixed in a note, or fixed wherever the words were pasted. */
+  source: "added" | "edited" | "corrected";
+  /** The app a correction was made in, when it was made outside VoiceDumps. */
+  app: string | null;
+  /** How many times it has been taught. */
+  count: number;
+  /** Whether `heard` is now rewritten as `term` after every transcription. */
+  replaces: boolean;
+  /** How alike the two spellings are, 0…1. One is the same letters rewritten. */
+  likeness: number;
+  /** Whether the two are the same sounds — how a name is caught when respelt. */
+  sounds_alike: boolean;
+  /**
+   * How sure the model was about the speech it misheard, 0…1.
+   *
+   * Null where nobody asked — a word typed in by hand, a fix made to a note
+   * rather than to a fresh dictation, anything learned before this was
+   * recorded. Null is not zero and must never be shown as a number.
+   */
+  confidence: number | null;
+  /** Whether this word is written into transcriptions as they stand today. */
+  applied: boolean;
+  /** Whether it is also recognised when the model spells it a new way. */
+  by_sound: boolean;
+};
+
+export async function listVocabulary(): Promise<Term[]> {
+  return invoke("list_vocabulary");
+}
+
+/** Rejects with a sentence for a term that is empty or too long to be a word. */
+export async function addVocabulary(term: string): Promise<Term[]> {
+  return invoke("add_vocabulary", { term });
+}
+
+export async function removeVocabulary(term: string): Promise<Term[]> {
+  return invoke("remove_vocabulary", { term });
+}
+
+export async function setLearnCorrections(enabled: boolean): Promise<Settings> {
+  return invoke("set_learn_corrections", { enabled });
 }
 
 // -- asking the library ------------------------------------------------------

@@ -8,6 +8,9 @@ mod chat;
 mod clipboard;
 #[cfg(target_os = "macos")]
 mod dictation;
+#[cfg(target_os = "macos")]
+mod readback;
+mod vocabulary;
 // Putting names to the voices in one track, behind the `find_speakers`
 // command. See `docs/speaker-diarization.md`.
 mod diarize;
@@ -598,13 +601,27 @@ fn spawn_speaker_job(app: &tauri::AppHandle, id: String) {
 
 #[tauri::command]
 fn update_transcript(
+    app: tauri::AppHandle,
     store: tauri::State<Store>,
     id: String,
     text: String,
     paragraphs: serde_json::Value,
 ) -> Result<(), String> {
     let conn = store.0.lock().unwrap();
-    store::update_text(&conn, &id, &text, &paragraphs).map_err(|e| e.to_string())
+    // Read before the write: the text being replaced is the half of a correction
+    // that exists nowhere else once this returns.
+    let before = store::get(&conn, &id).ok().map(|t| t.text);
+    store::update_text(&conn, &id, &text, &paragraphs).map_err(|e| e.to_string())?;
+
+    // An edit in a note is a correction like any other — see `vocabulary`.
+    // Best-effort: the edit is saved, and a lesson missed costs nothing.
+    if settings::learn_corrections(&app) {
+        if let Some(before) = before {
+            let fixes = vocabulary::fixes_between(&before, &text);
+            vocabulary::learn(&conn, &fixes, vocabulary::Source::Edited, None, now_ms());
+        }
+    }
+    Ok(())
 }
 
 /// Pull an older transcript's audio into the media library.
@@ -1870,6 +1887,9 @@ pub fn run() {
             // Speaker models, quietly, before anything needs them. Reads the
             // setting that was just managed, so it goes after that line.
             spawn_model_prefetch(app.handle());
+            // The speech detector: under a megabyte, fetched quietly, and never a
+            // reason to wait — see `models::spawn_vad_prefetch`.
+            models::spawn_vad_prefetch(app.handle());
             spawn_speaker_backfill(app.handle());
 
             // Launch the native dictation-overlay helper. The pill is drawn by a
@@ -2010,6 +2030,12 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         settings::set_shortcut,
         settings::set_hold_to_talk,
         settings::set_restore_clipboard,
+        settings::set_languages,
+        settings::list_languages,
+        settings::set_learn_corrections,
+        vocabulary::list_vocabulary,
+        vocabulary::add_vocabulary,
+        vocabulary::remove_vocabulary,
         microphone::list_microphones,
         engine::start_transcription,
         engine::transcribe_peaks,
@@ -2073,6 +2099,12 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         settings::set_shortcut,
         settings::set_hold_to_talk,
         settings::set_restore_clipboard,
+        settings::set_languages,
+        settings::list_languages,
+        settings::set_learn_corrections,
+        vocabulary::list_vocabulary,
+        vocabulary::add_vocabulary,
+        vocabulary::remove_vocabulary,
         microphone::list_microphones,
         engine::start_transcription,
         engine::transcribe_peaks,
@@ -2144,8 +2176,6 @@ mod tests {
         assert!(!wants_speakers("file", LONG_ENOUGH_FOR_TWO - 0.1));
         assert!(wants_speakers("file", LONG_ENOUGH_FOR_TWO));
     }
-
-    use super::*;
 
     /// The two floors answer different questions and must not be conflated. A
     /// title says what a note is; a summary saves you reading it. There is a

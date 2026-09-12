@@ -6,10 +6,12 @@ import {
   analyticsAssistant,
   analyticsSummary,
   analyticsThemes,
+  listVocabulary,
   writeBinaryFile,
   type AssistantInsights,
   type Count,
   type Insights as Data,
+  type Term,
   type Themes,
   type WordCount,
 } from "../lib/api";
@@ -82,6 +84,131 @@ function Panel({
       </div>
       {children}
     </section>
+  );
+}
+
+/** How many lessons the panel shows before it has to be asked for the rest. */
+const MOST_SHOWN = 5;
+
+/** Where a word was learned. */
+function learnedWhere(t: Term): string {
+  if (t.source === "added") return "YOU TYPED IT";
+  if (t.source === "edited") return "FIXED IN A NOTE";
+  return `FIXED IN ${(t.app ?? "ANOTHER APP").toUpperCase()}`;
+}
+
+/**
+ * What VoiceDumps has learned from being corrected.
+ *
+ * Two numbers, because they answer different questions. MATCH is how alike the
+ * two spellings are — near one is the same word written differently, low is a
+ * word swapped for another. SURE is how confident the model was about the
+ * speech it got wrong, which is the thing you can only know by having heard the
+ * audio.
+ *
+ * **A number nobody took is shown as nothing, never as zero.** Confidence is
+ * only recorded for a fix made to a dictation as it was pasted; a word typed in
+ * by hand, a fix made inside a note, and everything learned before this was
+ * recorded all have no such number, and an empty cell says so. Rounding an
+ * absent measurement down to 0% would read as "the model was certain it was
+ * wrong", which is a claim about the audio that was never made.
+ *
+ * Whether a word is in force is asked of the transcriber rather than guessed
+ * from the count: a respelling applies the first time it is seen, a changed
+ * word waits for a second, and the two look identical in a row of numbers.
+ */
+function Learned() {
+  const [terms, setTerms] = useState<Term[] | null>(null);
+  const [all, setAll] = useState(false);
+
+  useEffect(() => {
+    listVocabulary()
+      .then(setTerms)
+      .catch(() => setTerms([]));
+  }, []);
+
+  if (terms === null) {
+    return (
+      <Panel title="WHAT IT HAS LEARNED">
+        <p className="micro text-faint">READING WHAT YOU HAVE TAUGHT IT…</p>
+      </Panel>
+    );
+  }
+
+  // Newest first, because `list` orders by when each was last taught: the five
+  // at the top are the five most recent lessons, which is what you came to see
+  // after correcting something. The rest are a click away rather than a scroll.
+  const shown = all ? terms : terms.slice(0, MOST_SHOWN);
+
+  return (
+    <Panel
+      title="WHAT IT HAS LEARNED"
+      aside={terms.length ? `${terms.length} WORD${terms.length === 1 ? "" : "S"}` : undefined}
+    >
+      {terms.length === 0 ? (
+        <p className="micro text-faint">
+          NOTHING YET // FIX A WORD WHERE YOU DICTATED IT AND IT WILL APPEAR HERE
+        </p>
+      ) : (
+        <ul>
+          {shown.map((t) => (
+            <li
+              key={t.term}
+              className="border-t border-hairline pt-2.5 first:border-t-0 first:pt-0 [&+li]:mt-2.5"
+            >
+              <div className="flex items-baseline justify-between gap-3">
+                <span className="min-w-0 truncate text-[13px] text-ink">
+                  {t.heard ? (
+                    <>
+                      <span className="text-faint line-through">{t.heard}</span>
+                      <span className="mx-1.5 text-faint">→</span>
+                    </>
+                  ) : null}
+                  {t.term}
+                </span>
+                <span className="micro shrink-0 text-faint">
+                  {learnedWhere(t)}
+                  {t.count > 1 ? ` ×${t.count}` : ""}
+                </span>
+              </div>
+
+              <div className="mt-1 flex flex-wrap items-baseline gap-x-4 gap-y-1">
+                {t.heard && (
+                  <span className="micro text-grey">
+                    MATCH{" "}
+                    <span className="mono-data text-ink">
+                      {Math.round(t.likeness * 100)}%
+                    </span>
+                  </span>
+                )}
+                {/* Absent, not zero — see the note above this component. */}
+                {t.confidence !== null && (
+                  <span className="micro text-grey">
+                    MODEL WAS{" "}
+                    <span className="mono-data text-ink">
+                      {Math.round(t.confidence * 100)}%
+                    </span>{" "}
+                    SURE
+                  </span>
+                )}
+                {t.by_sound && <span className="micro text-grey">CAUGHT BY SOUND</span>}
+                <span className={`micro ${t.applied ? "text-sage-dim" : "text-faint"}`}>
+                  {t.applied ? "IN USE" : "ONE MORE FIX AND IT APPLIES"}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      {terms.length > MOST_SHOWN && (
+        <button
+          onClick={() => setAll((open) => !open)}
+          className="micro mt-3 border border-hairline px-2.5 py-1.5 text-grey transition-colors hover:border-ink hover:bg-ink hover:text-surface"
+        >
+          {all ? "SHOW FEWER" : `SEE ALL ${terms.length}`}
+        </button>
+      )}
+    </Panel>
   );
 }
 
@@ -1027,6 +1154,10 @@ export function Insights() {
           <Panel title="HOW YOU SPEAK">
             <Speech v={v} />
           </Panel>
+        </div>
+
+        <div data-row className="grid gap-3">
+          <Learned />
         </div>
 
         <div data-row className="grid gap-3 md:grid-cols-2">
