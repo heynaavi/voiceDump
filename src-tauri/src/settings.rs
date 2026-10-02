@@ -134,6 +134,14 @@ pub struct Settings {
     /// what it replaced are kept, on this Mac. See [`crate::readback`] for what
     /// is read and what is refused.
     pub learn_corrections: bool,
+
+    /// What the meeting card remembers: the switch, the per-app count of
+    /// ignored offers, the apps it has stopped asking about, and any snooze.
+    /// See [`crate::prompts`] for the rules.
+    ///
+    /// Here rather than in the webview for the same reason as everything else
+    /// in this file: the detector that reads it runs with no window open.
+    pub meeting_prompts: crate::prompts::Prompts,
 }
 
 impl Default for Settings {
@@ -147,6 +155,7 @@ impl Default for Settings {
             restore_clipboard: true,
             languages: system_languages(),
             learn_corrections: true,
+            meeting_prompts: crate::prompts::Prompts::default(),
         }
     }
 }
@@ -173,6 +182,62 @@ fn persist(app: &tauri::AppHandle, s: &Settings) -> Result<(), String> {
     let path = file(app).ok_or("no settings directory")?;
     let json = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
     std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+/// Change settings from somewhere other than the window, and tell the window.
+///
+/// Every other setter is a command the window called, and it reconciles from
+/// the value the command returns. The meeting card's memory changes from the
+/// floating card and the menu bar, where no window asked — so the window would
+/// keep showing a snooze that ended or an app list missing the one just added,
+/// until it happened to read settings again. `settings-changed` closes that.
+pub fn update(
+    app: &tauri::AppHandle,
+    change: impl FnOnce(&mut Settings),
+) -> Result<Settings, String> {
+    let state = app
+        .try_state::<SettingsState>()
+        .ok_or("settings are not loaded yet")?;
+    let updated = {
+        let mut guard = state.0.lock().map_err(|_| "settings lock poisoned")?;
+        change(&mut guard);
+        guard.clone()
+    };
+    persist(app, &updated)?;
+    let _ = tauri::Emitter::emit(app, "settings-changed", &updated);
+    Ok(updated)
+}
+
+/// The whole current copy.
+pub fn snapshot(app: &tauri::AppHandle) -> Settings {
+    app.try_state::<SettingsState>()
+        .and_then(|s| s.0.lock().ok().map(|g| g.clone()))
+        .unwrap_or_default()
+}
+
+/// The meeting card's memory, read without holding the lock.
+pub fn meeting_prompts(app: &tauri::AppHandle) -> crate::prompts::Prompts {
+    app.try_state::<SettingsState>()
+        .and_then(|s| s.0.lock().ok().map(|g| g.meeting_prompts.clone()))
+        .unwrap_or_default()
+}
+
+/// The switch in Settings › Meetings.
+///
+/// Turns the card off for every app. Recording by hand is untouched — this is
+/// whether to *ask*, which is why it can be a preference at all: a meeting is
+/// still only ever recorded because someone asked for it.
+#[tauri::command]
+pub fn set_meeting_prompts(app: tauri::AppHandle, enabled: bool) -> Result<Settings, String> {
+    let updated = update(&app, |s| s.meeting_prompts.enabled = enabled)?;
+    crate::background::refresh_tray(&app);
+    Ok(updated)
+}
+
+/// Ask about an app again — the × beside it in Settings › Meetings.
+#[tauri::command]
+pub fn unmute_meeting_app(app: tauri::AppHandle, bundle: String) -> Result<Settings, String> {
+    update(&app, |s| s.meeting_prompts.unmute(&bundle))
 }
 
 /// Whether the live preview is on right now.

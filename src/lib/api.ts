@@ -724,10 +724,43 @@ export type Settings = {
    * dictation was pasted into. On by default.
    */
   learn_corrections: boolean;
+  /** What the meeting card remembers. See `src-tauri/src/prompts.rs`. */
+  meeting_prompts: MeetingPrompts;
+};
+
+/** An app the meeting card has stopped asking about. */
+export type MutedApp = { bundle: string; name: string };
+
+export type MeetingPrompts = {
+  /** Off means no card for any app. Recording by hand still works. */
+  enabled: boolean;
+  /** Ignored offers in a row, by bundle identifier. */
+  ignored: Record<string, number>;
+  /** Apps ignored three times in a row. */
+  muted: MutedApp[];
+  /** When the current snooze began and ends, ms since 1970. 0 when not snoozed. */
+  snoozed_from: number;
+  snoozed_until: number;
 };
 
 export async function getSettings(): Promise<Settings> {
   return invoke("get_settings");
+}
+
+export async function setMeetingPrompts(enabled: boolean): Promise<Settings> {
+  return invoke("set_meeting_prompts", { enabled });
+}
+
+export async function unmuteMeetingApp(bundle: string): Promise<Settings> {
+  return invoke("unmute_meeting_app", { bundle });
+}
+
+/**
+ * Settings changed somewhere the window did not ask — the floating meeting
+ * card, the menu bar, or a snooze running out on its own.
+ */
+export function watchSettings(on: (s: Settings) => void) {
+  return listen<Settings>("settings-changed", (e) => on(e.payload));
 }
 
 export async function setLivePreview(enabled: boolean): Promise<Settings> {

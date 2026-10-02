@@ -197,6 +197,56 @@ on hard audio — thick accents, crosstalk, bad microphones — and it will form
 your text for you. If that is your workload, run `medium` and take 5× realtime
 instead of 13×.
 
+### Against an open model that is better than ours
+
+Microsoft publishes
+[VibeVoice-ASR](https://github.com/microsoft/VibeVoice) — MIT-licensed,
+multilingual, transcribing up to 60 minutes in a single pass and returning
+speakers and timestamps along with the words. It ships an edge build,
+[VibeASR.cpp](https://github.com/microsoft/VibeASR.cpp), that quantises the model
+to 1.58 GB and runs it on a CPU with no GPU at all. Microsoft reports it ahead of
+Whisper on multilingual and multi-speaker transcription, and there is no reason to
+doubt them: as a *transcriber* it is very likely the better model.
+
+It still loses the job this app does, and the reason is worth stating plainly.
+
+We built it, ran it, and measured it against ourselves on 45 real dictations from
+a working library — every one a case where a name or product word had previously
+come out wrong, 48 such cases in total. Scored on one question: did the word the
+speaker was actually reaching for come out?
+
+| | Got the word right |
+| --- | --- |
+| VibeASR-BitNet, as it comes | 15/48 — 31% |
+| VibeASR-BitNet, given the words as hotwords | 30/48 — 63% |
+| **VoiceDumps** | **35/48 — 73%** |
+
+And on the same ten files, run one after the other with nothing else on the
+machine:
+
+| | Time to transcribe, relative to audio length |
+| --- | --- |
+| **VoiceDumps** (`medium`, Metal) | **0.12×** |
+| VibeASR-BitNet (CPU, model load excluded) | 0.35× |
+
+Three times faster, on under half the download — 729 MB against 1.58 GB.
+
+**Why a better model loses.** Nothing here is a claim about transcription
+quality. The gap is that VoiceDumps has heard you before. It learns the spellings
+you correct and applies them to what the decoder hands back, so a name it has
+been taught once stops coming back six different ways. A model that has never met
+you cannot do that, however good it is — and when we gave it the same words as
+hotwords it closed most of the gap, which is the point rather than a caveat. The
+advantage is the learning, not the weights.
+
+**Where this comparison stops being true.** This measures one voice saying names
+it had got wrong before — it is not a word-error-rate benchmark, and we did not
+run one. On general transcription, and especially on languages and crosstalk, the
+7B model is the stronger tool. It also does speakers and timestamps in the same
+pass, where we need a second model for that. And its CPU-only design is a
+deliberate, sensible trade that we do not make: on a machine with no Metal — an
+Intel Mac, most PCs — the speed numbers above would not look the way they do.
+
 ## Inside
 
 <table>

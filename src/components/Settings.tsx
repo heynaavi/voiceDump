@@ -35,6 +35,8 @@ type Props = {
   onLearnCorrections: (enabled: boolean) => void;
   onMicrophone: (name: string | null) => void;
   onShortcut: (chord: string) => Promise<void>;
+  onMeetingPrompts: (enabled: boolean) => void;
+  onUnmuteMeetingApp: (bundle: string) => void;
   /** Null until the backend has been asked whether this Mac can record calls. */
   meeting: MeetingCapability | null;
   onReplayTutorial: () => void;
@@ -544,10 +546,24 @@ export function Settings({
   onLanguages,
   onLearnCorrections,
   onShortcut,
+  onMeetingPrompts,
+  onUnmuteMeetingApp,
   meeting,
   onReplayTutorial,
 }: Props) {
   const sheet = useRef<HTMLDivElement>(null);
+
+  // The meeting card's memory, and whether a snooze is running right now. A
+  // snooze that ends while this pane is open is reported by `settings-changed`
+  // from the app, which re-renders this; nothing here has to count down.
+  const prompts = settings?.meeting_prompts ?? null;
+  const snoozedUntil =
+    prompts && prompts.snoozed_until > Date.now()
+      ? new Date(prompts.snoozed_until).toLocaleTimeString([], {
+          hour: "numeric",
+          minute: "2-digit",
+        })
+      : null;
 
   // Asked live, and asked again while the pane is open. Someone who opens this
   // *because* overviews aren't appearing will often go and switch Apple
@@ -697,19 +713,64 @@ export function Settings({
           />
         </Group>
 
-        {/* No switch here on purpose: a meeting is recorded by asking for it,
-            never by a preference left on. What this group is for is telling
-            someone where the permission lives once macOS has stopped asking. */}
+        {/* Still no switch that records: a meeting is recorded by asking for
+            it, never by a preference left on. The one switch here decides
+            whether the card *asks*, which is a different question — and the
+            list beneath it is what the card has learned not to ask about. */}
         <Group
           title="MEETINGS"
           aside={
             meeting === null
               ? undefined
-              : meeting.available
-                ? "READY"
-                : "UNAVAILABLE"
+              : !meeting.available
+                ? "UNAVAILABLE"
+                : !prompts?.enabled
+                  ? "NOT ASKING"
+                  : snoozedUntil
+                    ? `SNOOZED · ${snoozedUntil}`
+                    : "READY"
           }
         >
+          <Row
+            label="Offer to take notes"
+            note="When an app starts using your microphone, a card offers to record the call. With this off, no card appears. You can still start a recording from the window."
+            control={
+              <Switch
+                on={prompts ? prompts.enabled : null}
+                onClick={() => onMeetingPrompts(!prompts?.enabled)}
+              />
+            }
+          />
+          <div className="border-t border-hairline" />
+          <Row
+            label="Not asking about"
+            note="Apps you closed or ignored three times in a row. Remove one and the card offers again the next time it uses the microphone."
+            control={
+              prompts && prompts.muted.length > 0 ? (
+                <div className="flex max-w-[220px] flex-wrap justify-end gap-1.5">
+                  {prompts.muted.map((m) => (
+                    <span
+                      key={m.bundle}
+                      className="flex items-center gap-2 border border-hairline py-1 pl-2.5 pr-1 text-[12px] text-ink"
+                    >
+                      {m.name}
+                      <button
+                        onClick={() => onUnmuteMeetingApp(m.bundle)}
+                        aria-label={`Ask about ${m.name} again`}
+                        title={`Ask about ${m.name} again`}
+                        className="px-1 text-faint transition-colors hover:text-ink"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <span className="micro text-faint">NONE YET</span>
+              )
+            }
+          />
+          <div className="border-t border-hairline" />
           <Row
             label="Recording a call"
             note="Both sides are captured separately — your microphone, and whatever this Mac is playing — then transcribed and interleaved. Nobody is added to the call and no meeting service is contacted."

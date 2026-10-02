@@ -10,7 +10,7 @@
 //! reading and history UI, and hiding it from the Dock and from Cmd-Tab would
 //! make that half of the product hard to get back to.
 
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Window};
 use tauri_plugin_autostart::ManagerExt;
@@ -71,9 +71,25 @@ fn copy_last(app: &AppHandle) {
     }
 }
 
-pub fn install_tray(app: &AppHandle) -> tauri::Result<()> {
-    let autostart = app.autolaunch();
-    let launching = autostart.is_enabled().unwrap_or(false);
+/// "4:42 PM", in this Mac's local time.
+fn clock(ms: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|t| t.format("%-I:%M %p").to_string())
+        .unwrap_or_default()
+}
+
+/// The menu, as it should look right now.
+///
+/// Built from the stored state every time rather than patched item by item,
+/// because the meeting section changes shape — a submenu while prompts are on,
+/// a status line and a way back while they are snoozed, nothing at all while
+/// they are switched off — and three shapes are easier to get right whole.
+fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let launching = app.autolaunch().is_enabled().unwrap_or(false);
+    let prompts = crate::settings::meeting_prompts(app);
 
     let open = MenuItem::with_id(app, "open", "Open VoiceDumps", true, None::<&str>)?;
     // Sits with Open rather than in its own group: both are things you came to
@@ -88,17 +104,108 @@ pub fn install_tray(app: &AppHandle) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let quit = MenuItem::with_id(app, "quit", "Quit VoiceDumps", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &open,
-            &copy,
-            &PredefinedMenuItem::separator(app)?,
-            &login,
-            &PredefinedMenuItem::separator(app)?,
-            &quit,
-        ],
-    )?;
+
+    let menu = Menu::with_items(app, &[&open, &copy, &PredefinedMenuItem::separator(app)?])?;
+
+    // The meeting card, from the menu bar. Snoozing here is for the times you
+    // know a noisy hour is coming and would rather not wait for a card to
+    // appear in order to silence it; resuming here is the only way back from a
+    // snooze before it ends.
+    if prompts.enabled {
+        if prompts.is_snoozed(crate::now_ms()) {
+            let until = MenuItem::with_id(
+                app,
+                "snoozed-until",
+                format!("Prompts snoozed until {}", clock(prompts.snoozed_until)),
+                false,
+                None::<&str>,
+            )?;
+            let resume =
+                MenuItem::with_id(app, "resume-prompts", "Resume Meeting Prompts", true, None::<&str>)?;
+            menu.append(&until)?;
+            menu.append(&resume)?;
+        } else {
+            let lengths: Vec<MenuItem<tauri::Wry>> = crate::prompts::SNOOZE_CHOICES
+                .iter()
+                .map(|&m| {
+                    let words = if m == 60 { "For 1 Hour".to_string() } else { format!("For {m} Minutes") };
+                    MenuItem::with_id(app, format!("snooze-{m}"), words, true, None::<&str>)
+                })
+                .collect::<tauri::Result<_>>()?;
+            let refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+                lengths.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<tauri::Wry>).collect();
+            let snooze = Submenu::with_items(app, "Snooze Meeting Prompts", true, &refs)?;
+            menu.append(&snooze)?;
+        }
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+    }
+
+    menu.append(&login)?;
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&quit)?;
+    Ok(menu)
+}
+
+/// Rebuild the menu after the meeting card's state changed somewhere else —
+/// the floating card, the settings switch, or a snooze running out.
+pub fn refresh_tray(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id("main") else { return };
+    match build_menu(app) {
+        Ok(menu) => {
+            let _ = tray.set_menu(Some(menu));
+        }
+        Err(e) => eprintln!("[tray] could not rebuild the menu: {e}"),
+    }
+}
+
+/// Put the menu back the way it was when a snooze runs out on its own.
+///
+/// Nothing else would: no event fires when a timestamp passes, and a menu still
+/// saying "snoozed until 4:42" at five o'clock is a menu that has stopped
+/// telling the truth. A sleeping thread per snooze, which is cheap, and every
+/// one of them only re-reads the stored state, so one woken by a snooze that
+/// was later changed or resumed simply finds nothing to change.
+fn refresh_when_snooze_ends(app: &AppHandle) {
+    let until = crate::settings::meeting_prompts(app).snoozed_until;
+    let wait = until - crate::now_ms();
+    if wait <= 0 {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // A beat past the end, so the re-read lands on the far side of it.
+        std::thread::sleep(std::time::Duration::from_millis(wait as u64 + 500));
+        refresh_tray(&app);
+        // The window shows the snooze too, in Settings › Meetings.
+        let _ = tauri::Emitter::emit(&app, "settings-changed", crate::settings::snapshot(&app));
+    });
+}
+
+/// Snooze the meeting card for every app — from the card or from the menu.
+pub fn snooze_prompts(app: &AppHandle, minutes: u32) -> Result<crate::prompts::Prompts, String> {
+    let updated = crate::settings::update(app, |s| s.meeting_prompts.snooze(minutes, crate::now_ms()))?;
+    refresh_tray(app);
+    refresh_when_snooze_ends(app);
+    Ok(updated.meeting_prompts)
+}
+
+/// A different length for the snooze that is already running.
+pub fn retime_snooze(app: &AppHandle, minutes: u32) -> Result<(), String> {
+    crate::settings::update(app, |s| s.meeting_prompts.retime(minutes, crate::now_ms()))?;
+    refresh_tray(app);
+    refresh_when_snooze_ends(app);
+    Ok(())
+}
+
+/// End the snooze now.
+pub fn resume_prompts(app: &AppHandle) -> Result<(), String> {
+    crate::settings::update(app, |s| s.meeting_prompts.resume())?;
+    refresh_tray(app);
+    Ok(())
+}
+
+pub fn install_tray(app: &AppHandle) -> tauri::Result<()> {
+    let menu = build_menu(app)?;
 
     TrayIconBuilder::with_id("main")
         .icon(tauri::image::Image::from_bytes(TRAY_ICON)?)
@@ -117,7 +224,18 @@ pub fn install_tray(app: &AppHandle) -> tauri::Result<()> {
                 let _ = if now { auto.disable() } else { auto.enable() };
             }
             "quit" => app.exit(0),
-            _ => {}
+            "resume-prompts" => {
+                if let Err(e) = resume_prompts(app) {
+                    eprintln!("[tray] could not resume meeting prompts: {e}");
+                }
+            }
+            id => {
+                if let Some(minutes) = id.strip_prefix("snooze-").and_then(|m| m.parse().ok()) {
+                    if let Err(e) = snooze_prompts(app, minutes) {
+                        eprintln!("[tray] could not snooze meeting prompts: {e}");
+                    }
+                }
+            }
         })
         .on_tray_icon_event(|tray, event| {
             // Left click reopens; the menu is on right click. Matches how
@@ -133,5 +251,7 @@ pub fn install_tray(app: &AppHandle) -> tauri::Result<()> {
         })
         .build(app)?;
 
+    // A snooze set before the last quit may still be running.
+    refresh_when_snooze_ends(app);
     Ok(())
 }

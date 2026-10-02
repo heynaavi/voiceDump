@@ -1155,6 +1155,7 @@ mod hud {
                     // answer to "shall I take notes" should not cost a Cmd-Tab
                     // away from the meeting it is about.
                     "take-notes" => {
+                        *super::offered_now().lock().unwrap() = None;
                         if let Err(e) = super::meeting_start(app.clone()) {
                             let _ = tauri::Emitter::emit(&app, "meeting-failed", e);
                             send("hide");
@@ -1166,14 +1167,69 @@ mod hud {
                         // that reads the card would wedge every later press.
                         std::thread::spawn(move || super::finish_and_report(handle));
                     }
-                    // Refused, or simply left to time out. Either way the
-                    // offer is over, and the window's copy of it has to go too
-                    // or it sits there after the floating one has left.
-                    "dismiss" => {
-                        send("hide");
+                    // Closed with the ×, or left to run out. Both count
+                    // against the app the card was about: either way somebody
+                    // looked at "take notes?" and did not want to. And either
+                    // way the window's copy of the offer has to go too, or it
+                    // sits there after the floating one has left.
+                    "close" | "dismiss" => {
+                        super::offer_ignored(&app);
                         let _ = tauri::Emitter::emit(&app, "meeting-offer-closed", ());
                     }
-                    _ => {}
+                    // "Not now" for every app. Not an answer about this one,
+                    // so nothing is counted against it.
+                    "snooze" => {
+                        *super::offered_now().lock().unwrap() = None;
+                        let _ = tauri::Emitter::emit(&app, "meeting-offer-closed", ());
+                        match crate::background::snooze_prompts(&app, crate::prompts::SNOOZE_MINUTES) {
+                            Ok(p) => send(&format!(
+                                "snoozed {} {}",
+                                crate::prompts::SNOOZE_MINUTES,
+                                p.snoozed_from / 1000
+                            )),
+                            Err(e) => {
+                                eprintln!("[meeting] could not snooze: {e}");
+                                send("hide");
+                            }
+                        }
+                    }
+                    "undo-snooze" => {
+                        send("hide");
+                        if let Err(e) = crate::background::resume_prompts(&app) {
+                            eprintln!("[meeting] could not undo the snooze: {e}");
+                        }
+                    }
+                    // The undo on the "stopped asking" card: one ignore short of
+                    // the limit, so the next ignore stops it again.
+                    "undo-stop" => {
+                        send("hide");
+                        let current = super::offered_now().lock().unwrap().take();
+                        if let Some((bundle, _)) = current {
+                            if let Err(e) = crate::settings::update(&app, |s| {
+                                s.meeting_prompts.undo_stop(&bundle)
+                            }) {
+                                eprintln!("[meeting] could not undo: {e}");
+                            }
+                        }
+                    }
+                    // The × on a card that was only reporting something — the
+                    // snooze, or the stop. Nothing to decide, so nothing to
+                    // count.
+                    "close-card" => {
+                        *super::offered_now().lock().unwrap() = None;
+                        send("hide");
+                    }
+                    other => {
+                        // `snooze <minutes>`: a different length, chosen on the
+                        // card. The card has already redrawn itself.
+                        if let Some(minutes) =
+                            other.strip_prefix("snooze ").and_then(|m| m.trim().parse().ok())
+                        {
+                            if let Err(e) = crate::background::retime_snooze(&app, minutes) {
+                                eprintln!("[meeting] could not change the snooze: {e}");
+                            }
+                        }
+                    }
                 }
             }
             let _ = child.wait();
@@ -1227,6 +1283,47 @@ static ON_THE_MIC: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>>
 
 fn on_the_mic() -> &'static Mutex<std::collections::HashSet<String>> {
     ON_THE_MIC.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// The app the card is currently about, while it is on screen.
+///
+/// The card's answers come back as bare words — `close`, `dismiss`, `snooze` —
+/// with no app attached, because the helper drawing it should not have to know
+/// what a bundle identifier is. This is how an answer finds the app it counts
+/// against. Cleared when the card's question is settled, so a stray late word
+/// can never be charged to the wrong app.
+static OFFERED_NOW: std::sync::OnceLock<Mutex<Option<(String, String)>>> =
+    std::sync::OnceLock::new();
+
+fn offered_now() -> &'static Mutex<Option<(String, String)>> {
+    OFFERED_NOW.get_or_init(|| Mutex::new(None))
+}
+
+/// The card was closed or left to run out: charge it to the app it was about.
+///
+/// Returns what to show next — the "stopped asking" card if that was the third
+/// in a row, or nothing.
+fn offer_ignored(app: &tauri::AppHandle) {
+    let Some((bundle, name)) = offered_now().lock().unwrap().clone() else {
+        hud::send("hide");
+        return;
+    };
+    let mut outcome = crate::prompts::Ignored::Counted(0);
+    let saved = crate::settings::update(app, |s| outcome = s.meeting_prompts.ignored(&bundle, &name));
+    if let Err(e) = saved {
+        eprintln!("[meeting] could not remember that the offer was ignored: {e}");
+    }
+    match outcome {
+        // Never silent. An app that stops getting the card with no word said
+        // looks exactly like a feature that broke, so the last ignore gets one
+        // card of its own, with an undo on it. `OFFERED_NOW` is kept until that
+        // card is settled, because the undo needs to know which app it is for.
+        crate::prompts::Ignored::Stopped => hud::send(&format!("stopped {name}")),
+        crate::prompts::Ignored::Counted(_) => {
+            *offered_now().lock().unwrap() = None;
+            hud::send("hide");
+        }
+    }
 }
 
 /// Apps whose use of the microphone is never a meeting.
@@ -1358,10 +1455,20 @@ pub fn spawn_detector(app: tauri::AppHandle) {
                     // Already recording? Then the answer to "shall I take
                     // notes" is visibly yes, and asking again is noise.
                     let recording = app.state::<MeetingState>().0.lock().unwrap().is_some();
-                    if recording || !offered.insert(event.bundle.clone()) {
+                    if recording || offered.contains(&event.bundle) {
                         continue;
                     }
-                    hud::send(&format!("detected {}", event.name));
+                    // Switched off, snoozed, or an app the card has stopped
+                    // asking about: say nothing, here or in the window.
+                    let ask = match crate::settings::meeting_prompts(&app)
+                        .decide(&event.bundle, crate::now_ms())
+                    {
+                        crate::prompts::Decision::Offer { ask } => ask,
+                        _ => continue,
+                    };
+                    offered.insert(event.bundle.clone());
+                    *offered_now().lock().unwrap() = Some((event.bundle.clone(), event.name.clone()));
+                    hud::send(&format!("detected {ask} {}", event.name));
                     let _ = app.emit(
                         "meeting-detected",
                         Detected {
@@ -1436,6 +1543,20 @@ pub fn meeting_start(app: tauri::AppHandle) -> Result<(), String> {
     }
     if let Some(reason) = unavailable_because(&app) {
         return Err(reason);
+    }
+
+    // Taking notes on a call in an app is proof the app holds calls, so the
+    // count of ignored offers for it starts again — whether the recording was
+    // started from the floating card, the window, or the menu. Every app on
+    // the microphone, not just the one the card named: a call in Zoom with
+    // Claude's voice input also open is still a call in Zoom.
+    let holding: Vec<String> = on_the_mic().lock().unwrap().iter().cloned().collect();
+    if !holding.is_empty() {
+        let _ = crate::settings::update(&app, |s| {
+            for bundle in &holding {
+                s.meeting_prompts.taken(bundle);
+            }
+        });
     }
 
     let dir = app

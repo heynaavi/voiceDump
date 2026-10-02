@@ -36,6 +36,9 @@ mod route;
 mod meeting;
 mod microphone;
 mod models;
+// Whether the meeting card should appear, and what each answer to it teaches.
+// Pure rules over stored state; `meeting` and the tray act on them.
+mod prompts;
 mod settings;
 mod shortcut;
 mod sidecar;
@@ -2033,6 +2036,8 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         settings::set_languages,
         settings::list_languages,
         settings::set_learn_corrections,
+        settings::set_meeting_prompts,
+        settings::unmute_meeting_app,
         vocabulary::list_vocabulary,
         vocabulary::add_vocabulary,
         vocabulary::remove_vocabulary,
@@ -2102,6 +2107,8 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'stat
         settings::set_languages,
         settings::list_languages,
         settings::set_learn_corrections,
+        settings::set_meeting_prompts,
+        settings::unmute_meeting_app,
         vocabulary::list_vocabulary,
         vocabulary::add_vocabulary,
         vocabulary::remove_vocabulary,

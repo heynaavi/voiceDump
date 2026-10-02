@@ -50,6 +50,9 @@ import {
   type Origin,
   type Paragraph,
   type Settings as Stored,
+  setMeetingPrompts,
+  unmuteMeetingApp,
+  watchSettings,
   type Transcript,
   type TranscriptMeta,
 } from "./lib/api";
@@ -366,6 +369,33 @@ export default function App() {
     setLivePreview(enabled).then(setSettings).catch(() => {
       setSettings((s) => (s ? { ...s, live_preview: !enabled } : s));
     });
+  }, []);
+
+  // The meeting card changes settings from outside the window — a snooze, an
+  // app it stopped asking about — and the menu bar can too. Without this the
+  // Settings pane would keep showing whatever it read when the window opened.
+  useEffect(() => {
+    const off = watchSettings(setSettings);
+    return () => {
+      off.then((stop) => stop());
+    };
+  }, []);
+
+  const applyMeetingPrompts = useCallback((enabled: boolean) => {
+    setSettings((s) =>
+      s ? { ...s, meeting_prompts: { ...s.meeting_prompts, enabled } } : s,
+    );
+    setMeetingPrompts(enabled).then(setSettings).catch(() => {
+      setSettings((s) =>
+        s ? { ...s, meeting_prompts: { ...s.meeting_prompts, enabled: !enabled } } : s,
+      );
+    });
+  }, []);
+
+  const applyUnmuteMeetingApp = useCallback((bundle: string) => {
+    unmuteMeetingApp(bundle)
+      .then(setSettings)
+      .catch((e) => console.error("could not ask about the app again", e));
   }, []);
 
   const applyDiarization = useCallback((enabled: boolean) => {
@@ -807,6 +837,8 @@ export default function App() {
             onLanguages={applyLanguages}
             onLearnCorrections={applyLearnCorrections}
             onShortcut={applyShortcut}
+            onMeetingPrompts={applyMeetingPrompts}
+            onUnmuteMeetingApp={applyUnmuteMeetingApp}
             meeting={meeting}
             onReplayTutorial={() => {
               setPane(null);

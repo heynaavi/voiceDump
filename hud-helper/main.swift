@@ -26,7 +26,12 @@
 //
 // Protocol — one command per line on stdin:
 //
-//   detected <app name>     offer to take notes on a call that just started
+//   detected <ask> <app>    offer to take notes on a call that just started;
+//                           <ask> is which of the app's three asks this is
+//   snoozed <min> <since>   the card turns into "snoozed until…", <since> in
+//                           seconds since 1970 so the time can be redrawn
+//                           when a different length is chosen
+//   stopped <app name>      the card has stopped asking about this app
 //   recording               show the pill
 //   levels <you> <others>   two 0..1 meters, ten times a second
 //   elapsed <seconds>       the clock, owned by the app so it survives a redraw
@@ -40,7 +45,14 @@
 //
 // …and one word per line back on stdout, when the user presses something:
 //
-//   take-notes / dismiss / stop
+//   take-notes              start recording
+//   close                   the × on an offer: not this one
+//   dismiss                 an offer left to run out — counts like close
+//   snooze                  quiet for every app, default length
+//   snooze <minutes>        a different length for the snooze just started
+//   undo-snooze / undo-stop the undo on either report card
+//   close-card              a report card closed or run out: nothing to count
+//   stop                    end the meeting
 
 import Cocoa
 import QuartzCore
@@ -173,50 +185,204 @@ private class HitTestingView: NSView {
 
 // MARK: - The offer
 
+/// What the top-right card is saying.
+///
+/// One card in three moods rather than three cards, because they replace one
+/// another in the same place: pressing Snooze on an offer turns it into the
+/// snooze, and ignoring an app for the third time turns it into the notice that
+/// the card has stopped asking. A second panel stacked under the first would
+/// make one decision look like two notifications.
+private enum OfferMode {
+    /// "Take notes?" — `ask` is which of the three this is for the app.
+    case ask(Int)
+    /// Snoozed for every app, from `from` for `minutes`.
+    case snoozed(minutes: Int, from: Date)
+    /// The card has stopped asking about `appName`.
+    case stopped
+}
+
+/// The asks an app gets before the card gives up on it. Mirrors
+/// `prompts::ASKS` in the app; the app sends which ask this is, so this is only
+/// how many squares to draw.
+private let asksPerApp = 3
+private let snoozeChoices = [15, 30, 45, 60]
+
+private let untilFormatter: DateFormatter = {
+    // The Mac's own clock style: "4:42 PM" or "16:42", whichever it is set to.
+    let f = DateFormatter()
+    f.dateStyle = .none
+    f.timeStyle = .short
+    return f
+}()
+
 private final class OfferView: HitTestingView {
     var appName = "Another app"
+    var mode: OfferMode = .ask(1)
     /// 0 → just appeared, 1 → leaving. Drawn as the line crossing the bottom.
     var progress: CGFloat = 0
+    /// What a press means. Set by the HUD, which decides what is answered here
+    /// and what goes back to the app.
+    var act: ((String) -> Void)?
 
     private let padding: CGFloat = 10
     private let buttonHeight: CGFloat = 24
+    private let left: CGFloat = 15
+    private let right: CGFloat = 13
 
     private func buttonWidth(_ text: String) -> CGFloat {
         textWidth(text, microFont) + padding * 2
+    }
+
+    /// Whether the next hit appended is the one under the pointer. Hits are
+    /// rebuilt in the same order on every draw, so "the next index" is stable.
+    private var nextIsHovered: Bool { hovered == hits.count }
+
+    private func button(_ text: String, filled: Bool, rightEdge: CGFloat, word: String) -> CGFloat {
+        let width = buttonWidth(text)
+        let rect = NSRect(x: rightEdge - width, y: 12, width: width, height: buttonHeight)
+        let hot = nextIsHovered
+        let path = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
+        if filled {
+            (hot ? cSage : cSageDim).setFill()
+            path.fill()
+        } else {
+            (hot ? cSage : cSageDim.withAlphaComponent(0.7)).setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        }
+        label(
+            text, microFont, filled ? NSColor(calibratedWhite: 0.06, alpha: 1) : cSage,
+            at: NSPoint(x: rect.minX + padding, y: rect.midY - microFont.capHeight))
+        hits.append(Hit(rect: rect, action: { [weak self] in self?.act?(word) }))
+        return rect.minX
+    }
+
+    /// The × in the top-right corner. Its word depends on what the card is:
+    /// on an offer it is an answer ("not this one"), on the other two it only
+    /// puts the card away.
+    private func closeButton(word: String) -> CGFloat {
+        let rect = NSRect(x: bounds.width - right - 18, y: bounds.height - 29, width: 18, height: 18)
+        let hot = nextIsHovered
+        if hot {
+            NSColor(calibratedWhite: 1, alpha: 0.08).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill()
+        }
+        let cross = NSBezierPath()
+        let inset: CGFloat = 5
+        cross.move(to: NSPoint(x: rect.minX + inset, y: rect.minY + inset))
+        cross.line(to: NSPoint(x: rect.maxX - inset, y: rect.maxY - inset))
+        cross.move(to: NSPoint(x: rect.minX + inset, y: rect.maxY - inset))
+        cross.line(to: NSPoint(x: rect.maxX - inset, y: rect.minY + inset))
+        cross.lineWidth = 1.3
+        cross.lineCapStyle = .round
+        (hot ? cInk : cFaint).setStroke()
+        cross.stroke()
+        hits.append(Hit(rect: rect, action: { [weak self] in self?.act?(word) }))
+        return rect.minX
     }
 
     override func draw(_ dirtyRect: NSRect) {
         hits.removeAll()
         scrim(radius: 13)
 
-        let left: CGFloat = 15
-        // One button, not two. The card already dismisses itself — a decline
-        // button next to a countdown asks people to make a decision the card is
-        // about to make for them, and doing nothing was always the way out.
-        let takeWidth = buttonWidth("TAKE NOTES")
-        let buttonX = bounds.width - 15 - takeWidth
-        // The sentence gets everything to the left of the button and not a
-        // pixel more; before this it simply ran underneath it.
-        let textLimit = buttonX - left - 14
+        let top = bounds.height
+        drawBrand(at: NSPoint(x: left, y: top - 26), cell: 3, gap: 1.5, colour: cSage)
 
-        drawBrand(at: NSPoint(x: left, y: bounds.height - 26), cell: 3, gap: 1.5, colour: cSage)
-        label(
-            "MEETING DETECTED", microFont, cSage,
-            at: NSPoint(x: left + 20, y: bounds.height - 25))
-        label(
-            truncate("\(appName) is using your microphone", bodyFont, to: textLimit),
-            bodyFont, cInk, at: NSPoint(x: left, y: bounds.height - 47))
+        switch mode {
+        case .ask(let ask):
+            let last = ask >= asksPerApp
+            let closeX = closeButton(word: "close")
 
-        let rect = NSRect(
-            x: buttonX, y: bounds.height / 2 - buttonHeight / 2 - 3,
-            width: takeWidth, height: buttonHeight)
-        let isHovered = hovered == 0
-        (isHovered ? cSage : cSageDim).setFill()
-        NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
-        label(
-            "TAKE NOTES", microFont, NSColor(calibratedWhite: 0.06, alpha: 1),
-            at: NSPoint(x: rect.minX + padding, y: rect.midY - microFont.capHeight))
-        hits.append(Hit(rect: rect, action: { send("take-notes") }))
+            // How many asks are left for this app, as squares rather than a
+            // fraction — the same squares-not-circles rule as the brand mark.
+            // Amber on the last, the one ask that changes what happens next.
+            let size: CGFloat = 5, gap: CGFloat = 3
+            let squaresWidth = CGFloat(asksPerApp) * size + CGFloat(asksPerApp - 1) * gap
+            var x = closeX - 8 - squaresWidth
+            for n in 1...asksPerApp {
+                let square = NSRect(x: x, y: top - 22.5, width: size, height: size)
+                if n <= ask {
+                    (last ? cAmber : cSageDim).setFill()
+                    square.fill()
+                } else {
+                    cSageDim.withAlphaComponent(0.7).setStroke()
+                    let outline = NSBezierPath(rect: square.insetBy(dx: 0.5, dy: 0.5))
+                    outline.lineWidth = 1
+                    outline.stroke()
+                }
+                x += size + gap
+            }
+            label("MEETING DETECTED", microFont, cSage, at: NSPoint(x: left + 20, y: top - 25))
+
+            // The whole width of the card for the sentence. With two buttons
+            // beside it, most app names were cut short — and the app name is
+            // the thing that tells you whether this is a call at all.
+            label(
+                truncate("\(appName) is using your microphone", bodyFont, to: bounds.width - left - right),
+                bodyFont, cInk, at: NSPoint(x: left, y: top - 48))
+
+            let takeX = button("TAKE NOTES", filled: true, rightEdge: bounds.width - right, word: "take-notes")
+            let snoozeX = button("SNOOZE", filled: false, rightEdge: takeX - 6, word: "snooze")
+
+            let hint = last
+                ? "LAST ASK FOR \(appName.uppercased())"
+                : "\(ask) OF \(asksPerApp) · THEN IT STOPS ASKING"
+            label(
+                truncate(hint, microFont, to: snoozeX - left - 10), microFont,
+                last ? cAmber : cFaint,
+                at: NSPoint(x: left, y: 12 + buttonHeight / 2 - microFont.capHeight))
+
+        case .snoozed(let minutes, let from):
+            _ = closeButton(word: "close-card")
+            label("SNOOZED · \(minutes) MIN", microFont, cSage, at: NSPoint(x: left + 20, y: top - 25))
+            let until = untilFormatter.string(from: from.addingTimeInterval(TimeInterval(minutes * 60)))
+            label(
+                "No meeting prompts until \(until)", bodyFont, cInk,
+                at: NSPoint(x: left, y: top - 48))
+
+            let undoX = button("UNDO", filled: false, rightEdge: bounds.width - right, word: "undo-snooze")
+
+            // The lengths, chosen in place. Pressing one redraws this card at
+            // once and tells the app afterwards — waiting on a round trip to
+            // see your own click land is how a control starts to feel broken.
+            var x = left
+            for choice in snoozeChoices {
+                let chip = NSRect(x: x, y: 13, width: 26, height: 22)
+                guard chip.maxX < undoX - 30 else { break }
+                let chosen = choice == minutes
+                let hot = nextIsHovered
+                let path = NSBezierPath(roundedRect: chip, xRadius: 5, yRadius: 5)
+                if chosen {
+                    cSageDim.setFill()
+                    path.fill()
+                } else {
+                    (hot ? cSageDim : cSage.withAlphaComponent(0.25)).setStroke()
+                    path.lineWidth = 1
+                    path.stroke()
+                }
+                let text = "\(choice)"
+                label(
+                    text, microFont,
+                    chosen ? NSColor(calibratedWhite: 0.06, alpha: 1) : (hot ? cInk : cFaint),
+                    at: NSPoint(
+                        x: chip.midX - textWidth(text, microFont) / 2,
+                        y: chip.midY - microFont.capHeight))
+                hits.append(Hit(rect: chip, action: { [weak self] in self?.act?("snooze \(choice)") }))
+                x = chip.maxX + 4
+            }
+            label("MIN", microFont, cFaint, at: NSPoint(x: x + 2, y: 24 - microFont.capHeight))
+
+        case .stopped:
+            _ = closeButton(word: "close-card")
+            label("STOPPED ASKING", microFont, cSage, at: NSPoint(x: left + 20, y: top - 25))
+            label(
+                truncate("No more prompts when \(appName) uses the mic", bodyFont, to: bounds.width - left - right),
+                bodyFont, cInk, at: NSPoint(x: left, y: top - 48))
+            let undoX = button("UNDO", filled: true, rightEdge: bounds.width - right, word: "undo-stop")
+            label(
+                truncate("SETTINGS › MEETINGS TO CHANGE", microFont, to: undoX - left - 10), microFont, cFaint,
+                at: NSPoint(x: left, y: 12 + buttonHeight / 2 - microFont.capHeight))
+        }
 
         // A card that vanishes with no warning feels like a glitch; one that
         // visibly spends its time reads as a decision you were offered.
@@ -829,7 +995,7 @@ private func makePanel(size: NSSize, radius: CGFloat, content: NSView) -> NSPane
     // obvious way to write that is to set this once, here, and forget it. That
     // was the bug: every panel is ordered onto the screen at launch and simply
     // faded to nothing, and an `NSPanel` at alpha 0 is still there as far as
-    // hit-testing is concerned. Three invisible rectangles — 360×74, 52×92 and
+    // hit-testing is concerned. Three invisible rectangles — 360×100, 52×92 and
     // 380×240 — sat stacked at the bottom-left corner from the moment the app
     // started, swallowing every click that landed in them. No meeting, no
     // window, nothing on screen, and a dead patch of desktop.
@@ -861,7 +1027,9 @@ private final class HUD {
     /// short enough that ignoring it is a real answer rather than a chore.
     private let offerLifetime: TimeInterval = 6
 
-    private let offerSize = NSSize(width: 360, height: 74)
+    /// Taller than it was (74), so the sentence keeps the card's whole width
+    /// with two buttons beneath it rather than being squeezed beside them.
+    private let offerSize = NSSize(width: 360, height: 100)
     private let pillSize = NSSize(width: 52, height: 92)
     private let transcriptSize = NSSize(width: 380, height: 240)
 
@@ -869,6 +1037,7 @@ private final class HUD {
         offerPanel = makePanel(size: offerSize, radius: 13, content: offer)
         pillPanel = makePanel(size: pillSize, radius: pillSize.width / 2, content: pill)
         transcriptPanel = makePanel(size: transcriptSize, radius: 14, content: transcript)
+        offer.act = { [weak self] word in self?.answer(word) }
 
         // The transcript follows the pointer, not a click: hovering something
         // to see more of it is the gesture this borrows, and asking for a click
@@ -1008,18 +1177,39 @@ private final class HUD {
 
     // MARK: Commands
 
-    func showOffer(_ appName: String) {
-        offer.appName = appName
+    /// Put the card up in one of its moods, sliding in fresh each time.
+    ///
+    /// Sliding in again rather than redrawing in place when the mood changes is
+    /// deliberate: Snooze turning into "Snoozed until…" is a reply, and a reply
+    /// that arrives in the same frame as the question reads as the question
+    /// changing its mind.
+    func showCard(_ mode: OfferMode, app: String?) {
+        if let app { offer.appName = app }
+        offer.mode = mode
+        // The hovered index belongs to the layout it was measured on. Each mood
+        // lays its buttons out differently, so carrying it over lit up whatever
+        // happened to share the old index — pressing Snooze left the pointer on
+        // nothing and the 15 chip looking hovered. It is measured again the
+        // moment the pointer moves.
+        offer.hovered = nil
         offer.progress = 0
         offer.needsDisplay = true
         slideIn(offerPanel, to: offerFrame(offscreen: false), from: offerFrame(offscreen: true))
 
         offerShownAt = Date()
         offerTimer?.invalidate()
-        offerTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) {
+        let tick = 1.0 / 30
+        offerTimer = Timer.scheduledTimer(withTimeInterval: tick, repeats: true) {
             [weak self] timer in
             guard let self, let shown = self.offerShownAt else {
                 timer.invalidate()
+                return
+            }
+            // Held while the pointer is over the card. It has buttons and
+            // lengths to choose between now, and a card that leaves while
+            // somebody is aiming at it counts their reach as an ignore.
+            if self.offerPanel.frame.contains(NSEvent.mouseLocation) {
+                self.offerShownAt = shown.addingTimeInterval(tick)
                 return
             }
             let elapsed = Date().timeIntervalSince(shown)
@@ -1028,9 +1218,36 @@ private final class HUD {
             if elapsed >= self.offerLifetime {
                 timer.invalidate()
                 self.hideOffer()
-                send("dismiss")
+                // Only an offer is a question. The other two were reports, and
+                // running out on them answers nothing.
+                if case .ask = self.offer.mode {
+                    send("dismiss")
+                } else {
+                    send("close-card")
+                }
             }
         }
+    }
+
+    /// A press on the card.
+    ///
+    /// Most go straight to the app, which owns what the card remembers. Two
+    /// are answered here first: the card puts itself away at once when closed,
+    /// and a snooze length redraws immediately, both because waiting on a round
+    /// trip to see your own click land is how a control starts to feel broken.
+    private func answer(_ word: String) {
+        switch word {
+        case "close", "close-card", "undo-snooze", "undo-stop":
+            hideOffer()
+        default:
+            if word.hasPrefix("snooze "), case .snoozed(_, let from) = offer.mode,
+                let minutes = Int(word.dropFirst("snooze ".count))
+            {
+                offer.mode = .snoozed(minutes: minutes, from: from)
+                offer.needsDisplay = true
+            }
+        }
+        send(word)
     }
 
     func hideOffer() {
@@ -1151,7 +1368,21 @@ Thread.detachNewThread {
         DispatchQueue.main.async {
             switch command {
             case "detected":
-                hud.showOffer(argument.isEmpty ? "Another app" : argument)
+                // `<ask> <app name>`
+                let parts = argument.split(separator: " ", maxSplits: 1).map(String.init)
+                let ask = Int(parts.first ?? "") ?? 1
+                let name = parts.count > 1 ? parts[1] : "Another app"
+                hud.showCard(.ask(ask), app: name)
+            case "snoozed":
+                // `<minutes> <started, seconds since 1970>`
+                let numbers = argument.split(separator: " ").compactMap { Double($0) }
+                if numbers.count == 2 {
+                    hud.showCard(
+                        .snoozed(minutes: Int(numbers[0]), from: Date(timeIntervalSince1970: numbers[1])),
+                        app: nil)
+                }
+            case "stopped":
+                hud.showCard(.stopped, app: argument.isEmpty ? nil : argument)
             case "recording":
                 hud.showRecorder()
             case "finishing":
