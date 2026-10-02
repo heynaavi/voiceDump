@@ -646,6 +646,16 @@ pub fn get(conn: &Connection, id: &str) -> rusqlite::Result<Transcript> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Re-date a note — for a dictation recovered after the run that recorded it,
+/// which belongs at the time it was spoken, not the time it was found.
+pub fn set_created_at(conn: &Connection, id: &str, created_ms: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE transcripts SET created_at = ?1 WHERE id = ?2",
+        rusqlite::params![created_ms, id],
+    )?;
+    Ok(())
+}
+
 pub fn insert(
     conn: &Connection,
     id: &str,

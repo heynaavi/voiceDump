@@ -966,6 +966,208 @@ pub fn spawn_sweep(app: tauri::AppHandle) {
     });
 }
 
+// -- recovering a dictation that never finished -----------------------------
+//
+// A dictation is saved in three steps: the capture is finalized on disk, it is
+// transcribed, and only then does it become a note and its scratch file go.
+// Anything that ends the app between the first step and the last — a crash, a
+// force-quit, a quit while a long dictation was still transcribing — left the
+// audio sitting in the scratch folder with nothing to say it was there, until
+// the sweep deleted it a day later. That is how a two-minute dictation was lost
+// on 2026-10-03: it was still transcribing on a machine short of memory, the
+// app was quit, the quit hung, and the app was force-quit.
+//
+// Everything still in the folder at launch is, by construction, one of those:
+// `finish` removes the capture once it is a note, and now also when there was
+// nothing in it. So at launch each one is transcribed again and saved, dated
+// when it was spoken rather than when it was found.
+
+/// Shorter than this is a tap of the key, not a dictation. Whisper invents words
+/// below about a second rather than admitting it heard nothing — the same floor
+/// the live preview uses — so these are left for the sweep rather than turned
+/// into a note of something nobody said.
+const RECOVERABLE_FROM: f64 = 1.0;
+
+/// When a scratch capture was started, from its name: `dictation-<ms>.wav`.
+fn recorded_at(path: &Path) -> Option<i64> {
+    path.file_stem()?
+        .to_str()?
+        .strip_prefix("dictation-")?
+        .parse()
+        .ok()
+}
+
+/// Captures left over from before `launched`, oldest first.
+///
+/// Snapshotted by start time rather than by "whatever is in the folder", because
+/// the key works from the moment the app opens: a dictation started while this
+/// is still running is somebody talking right now, and must not be picked up
+/// and transcribed out from under the recording.
+fn leftovers(dir: &Path, launched: i64) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(i64, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("wav"))
+        .filter_map(|p| recorded_at(&p).map(|ms| (ms, p)))
+        .filter(|(ms, _)| *ms < launched)
+        .collect();
+    found.sort();
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Make a WAV whose header was never finished readable again, returning how
+/// many seconds of audio it holds.
+///
+/// The capture writes its header once at the start and fixes the two length
+/// fields when the recording stops. A process that dies mid-recording leaves
+/// them saying "empty" over however many seconds of real audio follow — which
+/// a decoder believes, and so reads nothing. Only the lengths are rewritten,
+/// from the file's actual size; the audio itself is never touched, and a file
+/// whose header already agrees with its size is left exactly as it was.
+fn repair_header(path: &Path) -> std::io::Result<f64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let size = file.metadata()?.len();
+    let mut head = vec![0u8; 512.min(size as usize)];
+    file.read_exact(&mut head)?;
+    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "not a PCM WAV");
+    if head.len() < 12 || &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        return Err(bad());
+    }
+
+    // Walk the chunks to find the format and the data, rather than assuming
+    // the canonical 44-byte layout: a writer is allowed to put others between.
+    let (mut at, mut byte_rate, mut data) = (12usize, 0u32, None::<usize>);
+    while at + 8 <= head.len() {
+        let id = &head[at..at + 4];
+        let len = u32::from_le_bytes(head[at + 4..at + 8].try_into().unwrap()) as usize;
+        if id == b"fmt " && at + 20 <= head.len() {
+            byte_rate = u32::from_le_bytes(head[at + 16..at + 20].try_into().unwrap());
+        }
+        if id == b"data" {
+            data = Some(at);
+            break;
+        }
+        at += 8 + len + (len & 1);
+    }
+    let data = data.ok_or_else(bad)?;
+    if byte_rate == 0 {
+        return Err(bad());
+    }
+
+    let real = size - (data as u64 + 8);
+    let declared = u32::from_le_bytes(head[data + 4..data + 8].try_into().unwrap()) as u64;
+    if declared != real {
+        file.seek(SeekFrom::Start(4))?;
+        file.write_all(&((size - 8) as u32).to_le_bytes())?;
+        file.seek(SeekFrom::Start(data as u64 + 4))?;
+        file.write_all(&(real as u32).to_le_bytes())?;
+        file.sync_all()?;
+        eprintln!(
+            "[dictation] repaired an unfinished header: {} declared {declared} bytes, holds {real}",
+            path.display()
+        );
+    }
+    Ok(real as f64 / byte_rate as f64)
+}
+
+/// Transcribe and save one interrupted dictation.
+///
+/// Saved and not pasted. Pasting needs the field the words were meant for, and
+/// that moment is gone; dropping two minutes of text into whatever happens to
+/// have focus at launch would be the worst place to put it. The note is the
+/// whole of what can honestly be given back.
+fn recover(app: &tauri::AppHandle, path: &Path) -> Result<Option<String>, String> {
+    let seconds = repair_header(path).map_err(|e| format!("unreadable capture: {e}"))?;
+    if seconds < RECOVERABLE_FROM {
+        return Ok(None);
+    }
+
+    let result = crate::engine::transcribe_ingest(
+        app,
+        &path.to_string_lossy(),
+        "Recovering a dictation",
+        "hotkey",
+    )?;
+    let text = result
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        // The detector heard nobody: it was always going to be discarded.
+        let _ = std::fs::remove_file(path);
+        return Ok(None);
+    }
+
+    let duration = result.get("duration").and_then(|v| v.as_f64()).unwrap_or(seconds);
+    let id = crate::insert_transcript(
+        app,
+        &crate::dictation_title(&text),
+        &path.to_string_lossy(),
+        duration,
+        result.get("language").and_then(|v| v.as_str()),
+        &text,
+        result.get("paragraphs").cloned().unwrap_or(serde_json::Value::Null),
+        result.get("segments").cloned().unwrap_or(serde_json::Value::Null),
+        result.get("peaks").cloned().unwrap_or(serde_json::Value::Null),
+        "hotkey",
+        crate::engine::Run::from_result(&result),
+        true,
+    )?;
+
+    // Dated when it was spoken. A note found at launch and filed under "now"
+    // would sit at the top of today looking like something just said, and the
+    // dictation it actually is would be missing from the hour it belongs to.
+    if let Some(ms) = recorded_at(path) {
+        let store = app.state::<crate::store::Store>();
+        let conn = store.0.lock().unwrap();
+        let _ = crate::store::set_created_at(&conn, &id, ms);
+    }
+
+    let _ = std::fs::remove_file(path);
+    Ok(Some(id))
+}
+
+/// Give back any dictation an earlier run was interrupted before saving.
+///
+/// `launched` is when this run started, so a dictation begun since is never
+/// mistaken for a leftover. Waits a few seconds first: there is nothing urgent
+/// about a recording that has already waited since the last run, and the
+/// launch itself — the window, the model warming — should not compete with it.
+pub fn spawn_recovery(app: tauri::AppHandle, launched: i64) {
+    std::thread::spawn(move || {
+        let Ok(dir) = app.path().app_data_dir() else {
+            return;
+        };
+        let found = leftovers(&dir.join("dictation"), launched);
+        if found.is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        for path in found {
+            match recover(&app, &path) {
+                Ok(Some(id)) => {
+                    eprintln!("[dictation] recovered an unsaved dictation: {}", path.display());
+                    // The same event a finished dictation sends, so the window
+                    // opens it: the clearest way to say "this came back".
+                    let _ = app.emit("dictation-saved", id);
+                }
+                Ok(None) => {}
+                // Left where it is. The next launch tries again, and the sweep
+                // still clears it after a day, so a capture that can never be
+                // transcribed cannot be retried forever.
+                Err(e) => eprintln!("[dictation] could not recover {}: {e}", path.display()),
+            }
+        }
+    });
+}
+
 fn start(app: &tauri::AppHandle) {
     let state = app.state::<DictationState>();
     if state.recording.load(Ordering::SeqCst) {
@@ -1277,7 +1479,11 @@ fn finish(app: &tauri::AppHandle, cap: Capture) -> Result<(), String> {
         .to_string();
 
     if text.is_empty() {
-        // Nothing said. Don't paste an empty string over a selection.
+        // Nothing said. Don't paste an empty string over a selection — and
+        // don't leave the capture behind either. It used to stay in the scratch
+        // folder for the sweep's whole day, which made it indistinguishable
+        // from a dictation that was interrupted before it could be saved.
+        let _ = std::fs::remove_file(&path);
         return Err("no speech detected".into());
     }
 
@@ -1521,3 +1727,110 @@ mod refine_tests {
         assert_eq!(q.pop_front().map(|(i, _)| i), Some(0));
     }
 }
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vd-recovery-{name}-{}", crate::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A capture as the recorder writes one: 16 kHz mono 16-bit, finalized.
+    fn write_capture(path: &Path, seconds: f64) {
+        let mut w = hound::WavWriter::create(
+            path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for i in 0..(seconds * 16_000.0) as usize {
+            w.write_sample(((i % 64) as i16 - 32) * 100).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    /// The crash this exists for: the process dies mid-recording, the header
+    /// still says "no audio", and a decoder believes it.
+    #[test]
+    fn an_unfinished_header_is_repaired_to_the_audio_it_holds() {
+        let dir = scratch("header");
+        let path = dir.join("dictation-1790973656425.wav");
+        write_capture(&path, 2.5);
+
+        // Make it look like the recorder never got to finalize.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..8].copy_from_slice(&36u32.to_le_bytes());
+        bytes[40..44].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(hound::WavReader::open(&path).unwrap().duration(), 0, "set-up: reads as empty");
+
+        let seconds = repair_header(&path).expect("repairable");
+        assert!((seconds - 2.5).abs() < 0.01, "{seconds}s");
+        let reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.duration(), 40_000, "every sample is readable again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A header that already agrees with the file is never rewritten.
+    #[test]
+    fn a_finished_capture_is_left_exactly_as_it_was() {
+        let dir = scratch("intact");
+        let path = dir.join("dictation-1.wav");
+        write_capture(&path, 1.5);
+        let before = std::fs::read(&path).unwrap();
+        let seconds = repair_header(&path).unwrap();
+        assert!((seconds - 1.5).abs() < 0.01);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "bytes changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn something_that_is_not_a_wav_is_refused_not_rewritten() {
+        let dir = scratch("junk");
+        let path = dir.join("dictation-2.wav");
+        std::fs::write(&path, b"not audio at all, just text").unwrap();
+        assert!(repair_header(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"not audio at all, just text");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only an earlier run's captures. One started since launch is somebody
+    /// talking right now.
+    #[test]
+    fn a_dictation_started_since_launch_is_never_taken() {
+        let dir = scratch("snapshot");
+        for name in [
+            "dictation-1000.wav",
+            "dictation-3000.wav",
+            "dictation-2000.wav",
+            "dictation-9000.wav", // started after launch
+            "notes.txt",
+            "dictation-x.wav", // not one of ours
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let found: Vec<String> = leftovers(&dir, 5000)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(found, ["dictation-1000.wav", "dictation-2000.wav", "dictation-3000.wav"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_capture_is_dated_from_its_name() {
+        assert_eq!(
+            recorded_at(Path::new("/x/dictation-1790973656425.wav")),
+            Some(1_790_973_656_425)
+        );
+        assert_eq!(recorded_at(Path::new("/x/recording-1.wav")), None);
+    }
+}
+

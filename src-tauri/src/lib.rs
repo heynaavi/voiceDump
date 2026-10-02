@@ -1857,6 +1857,9 @@ pub fn run() {
 
     builder
         .setup(|app| {
+            // When this run began — so recovery can tell a dictation an
+            // earlier run left behind from one somebody starts right now.
+            let launched = now_ms();
             let dir = app.path().app_data_dir()?;
             let conn = store::open(&dir)?;
             // qwee's memory shares the transcript DB — one connection, one WAL.
@@ -1953,6 +1956,9 @@ pub fn run() {
                     dictation::spawn(handle.clone());
                     // Clear scratch captures abandoned by a previous run.
                     dictation::spawn_sweep(handle.clone());
+                    // …and before the day is out, give back the ones that were
+                    // interrupted before they could become notes.
+                    dictation::spawn_recovery(handle.clone(), launched);
                 }
             });
 
@@ -1996,13 +2002,62 @@ pub fn run() {
             //
             // Dropping the context here releases the residency sets while we
             // still control the order, and the assert passes.
+            //
+            // But not by waiting on it however long it takes — see `quit`.
             if matches!(
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
-                app.state::<engine::EngineState>().unload();
+                quit(app);
             }
         });
+}
+
+/// How long quitting may wait for the engine to give its models back.
+///
+/// A decode notices the abort flag at the end of the graph it is in, not at
+/// once: measured, a decode on `small` stopped 1.0 s after the flag went up
+/// (`quitting_stops_a_decode`), on a machine running hot and short of memory.
+/// `medium`'s encoder is about three times the work, so the wait has to cover
+/// one of its passes too, or a quit during a dictation would routinely miss the
+/// clean path and take the `_exit` one. The window is already hidden by then,
+/// so the wait is invisible; the bound is what matters, not the length.
+const QUIT_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Shut the engine down on the way out, and never hang doing it.
+///
+/// This runs inside the will-terminate notification, after macOS has committed
+/// to quitting: there is no way to cancel, so the one thing it must not do is
+/// block. It used to call `unload`, which waited on the model's lock — and a
+/// transcription holds that lock for as long as a model takes to load. Under
+/// memory pressure that is most of a minute, and for all of it the app was
+/// frozen in the middle of quitting, with the user left to force-quit it.
+///
+/// Now: put the window away so quitting looks like quitting, stop every decode
+/// at its next graph, and wait — briefly — for the models to be released. If
+/// that does not happen in time, the engine is mid-load or mid-detection and
+/// cannot be stopped, so the process ends without running C destructors.
+/// `_exit` is exactly that, and it is safe here: SQLite runs in WAL mode and
+/// every write has already committed, settings are written as they change, and
+/// the one thing that has not landed — a dictation still being transcribed —
+/// keeps its audio on disk for `dictation::spawn_recovery` to finish next time.
+///
+/// The alternative, a normal exit with a model still alive, is the GGML assert
+/// described above: a "quit unexpectedly" dialog on a quit the user asked for.
+fn quit(app: &tauri::AppHandle) {
+    engine::begin_quit();
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    if app.state::<engine::EngineState>().shutdown(QUIT_WAIT) {
+        return;
+    }
+    eprintln!("[quit] the engine was still busy after {QUIT_WAIT:?}; exiting without teardown");
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    // SAFETY: `_exit` ends the process immediately; nothing after it runs.
+    unsafe { _exit(0) }
 }
 
 /// The command surface. `generate_handler!` takes a fixed list, so the two

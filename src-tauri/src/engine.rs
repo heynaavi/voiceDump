@@ -259,6 +259,65 @@ impl EngineState {
         *self.vad.lock().unwrap() = None;
     }
 
+    /// Give the models back on the way out, without ever making quitting wait
+    /// on a transcription.
+    ///
+    /// This replaces calling [`EngineState::unload`] from the quit handler,
+    /// which waited on each lock for as long as it took. That was the 1.2.5
+    /// "not responding": a two-minute dictation was still transcribing — the
+    /// model loading under memory pressure holds `inner` for as long as the
+    /// load takes — when the app was told to quit, and the main thread sat in
+    /// `-[NSApplication terminate:]` waiting on that lock until the user
+    /// force-quit it 42 seconds later. Nothing could be shown in the meantime,
+    /// and the dictation, still unsaved, went with it.
+    ///
+    /// Two things now keep the wait short. [`begin_quit`] has already been
+    /// called, so a decode in progress stops at its next graph — whisper.cpp
+    /// checks the abort callback after every encoder and decoder pass. And the
+    /// wait is bounded: each lock is *tried*, over and over, until `within` is
+    /// up. Model loading and the speech detector cannot be interrupted, so a
+    /// quit that lands in one of those is the case the bound is for.
+    ///
+    /// Returns whether everything was released in time. When it was not, the
+    /// caller must not let the process exit normally — see `quit` in lib.rs.
+    pub fn shutdown(&self, within: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        let (mut inner, mut preview, mut vad) = (false, false, false);
+        loop {
+            // One at a time and never held together, exactly as `unload` does,
+            // so this cannot take part in a lock-order inversion with anything.
+            if !inner {
+                if let Ok(mut g) = self.inner.try_lock() {
+                    *g = None;
+                    inner = true;
+                }
+            }
+            if !preview {
+                if let Ok(mut g) = self.preview.try_lock() {
+                    *g = None;
+                    preview = true;
+                }
+            }
+            if !vad {
+                if let Ok(mut g) = self.vad.try_lock() {
+                    *g = None;
+                    vad = true;
+                }
+            }
+            // Clearing the slots is not enough on its own: a decode holds an
+            // `Arc` on its model through its state, so the weights stay alive
+            // until that decode has actually returned. `running` says when.
+            let decoding = self.running.load(Ordering::SeqCst) > 0;
+            if inner && preview && vad && !decoding {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    }
+
     pub fn loaded_size(&self) -> Option<ModelSize> {
         self.inner.lock().unwrap().as_ref().map(|l| l.size)
     }
@@ -1335,6 +1394,7 @@ impl Preview {
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_translate(false);
+        abortable(&mut params);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -1459,6 +1519,7 @@ impl Refine {
         }
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_translate(false);
+        abortable(&mut params);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -1891,6 +1952,40 @@ fn num_threads() -> usize {
 /// lines below is the difference between an hour-long meeting and a blank page,
 /// and a setting that important should be somewhere it can be pointed at and
 /// tested rather than buried in the middle of a long function.
+/// Set when the app is quitting. Every decode checks it between graphs.
+static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// The app is going away: stop every transcription at its next chance.
+///
+/// Anything stopped this way returns an error to whoever asked for it, which
+/// is correct — the result would have arrived in a process that no longer
+/// exists. A dictation stopped like this keeps its audio in the scratch folder,
+/// and `dictation::spawn_recovery` transcribes it on the next launch.
+pub fn begin_quit() {
+    QUITTING.store(true, Ordering::SeqCst);
+}
+
+/// whisper.cpp's abort hook: asked after every encoder and decoder graph.
+///
+/// The raw C callback rather than `set_abort_callback_safe`, which is broken in
+/// whisper-rs 0.16 — see the comment on `Preview::step`. This one takes no
+/// closure and no user data, so there is nothing to mistranslate: it reads one
+/// static and answers.
+unsafe extern "C" fn stop_if_quitting(_: *mut std::ffi::c_void) -> bool {
+    QUITTING.load(Ordering::Relaxed)
+}
+
+/// Make a set of decoding parameters abortable by [`begin_quit`].
+fn abortable(params: &mut FullParams) {
+    // SAFETY: the callback reads an atomic and nothing else; it never touches
+    // the context or the state, which is the only thing the whisper-rs safety
+    // note warns against.
+    unsafe {
+        params.set_abort_callback(Some(stop_if_quitting));
+        params.set_abort_callback_user_data(std::ptr::null_mut());
+    }
+}
+
 fn decoding() -> FullParams<'static, 'static> {
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_translate(false);
@@ -1939,6 +2034,8 @@ fn decoding() -> FullParams<'static, 'static> {
     // Belt and braces, for the day this runs on a state that has decoded
     // something before: nothing from a previous recording either.
     params.set_no_context(true);
+    // Stoppable from the quit handler, so quitting never waits on a decode.
+    abortable(&mut params);
 
     // Per-token times, which drive the word-by-word follow-along in the reading
     // view.
@@ -2131,6 +2228,91 @@ mod run_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Nothing loaded and nothing running: quitting waits for nothing.
+    #[test]
+    fn shutting_down_an_idle_engine_is_immediate() {
+        let state = EngineState::default();
+        let began = std::time::Instant::now();
+        assert!(state.shutdown(std::time::Duration::from_secs(2)));
+        assert!(began.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    /// The 1.2.5 hang, in miniature: a lock held for longer than quitting may
+    /// wait. The old `unload` blocked until it was let go; this gives up on
+    /// time and says so, so the caller can end the process instead of hanging.
+    #[test]
+    fn a_held_lock_cannot_make_shutdown_wait_past_its_deadline() {
+        let state = std::sync::Arc::new(EngineState::default());
+        let held = state.clone();
+        let (locked, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let holder = std::thread::spawn(move || {
+            let _guard = held.inner.lock().unwrap();
+            locked.0.send(()).unwrap();
+            release.1.recv().unwrap();
+        });
+        locked.1.recv().unwrap();
+
+        let began = std::time::Instant::now();
+        let clean = state.shutdown(std::time::Duration::from_millis(300));
+        let waited = began.elapsed();
+        assert!(!clean, "reported clean while the model lock was held");
+        assert!(waited < std::time::Duration::from_millis(600), "waited {waited:?}");
+
+        release.0.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(state.shutdown(std::time::Duration::from_millis(300)), "clean once released");
+    }
+
+    /// A decode in flight keeps its model alive through its own state, so a
+    /// clear slot is not yet a released model.
+    #[test]
+    fn shutdown_waits_for_a_decode_to_return() {
+        let state = EngineState::default();
+        let busy = InFlight::enter(&state.running);
+        assert!(!state.shutdown(std::time::Duration::from_millis(100)));
+        drop(busy);
+        assert!(state.shutdown(std::time::Duration::from_millis(100)));
+    }
+
+    /// Quitting really does stop a decode partway, rather than waiting it out.
+    ///
+    /// Ignored by default, and run on its own, because the flag it sets is the
+    /// whole process's: any other decode running alongside would stop too.
+    ///
+    ///     VOICEDUMPS_MODEL_DIR=models cargo test --release --no-default-features \
+    ///       quitting_stops_a_decode -- --ignored --test-threads=1
+    #[test]
+    #[ignore = "needs models; sets the process-wide quit flag"]
+    fn quitting_stops_a_decode() {
+        let Ok(models) = std::env::var("VOICEDUMPS_MODEL_DIR") else {
+            return;
+        };
+        let ctx = WhisperContext::new_with_params(
+            Path::new(&models).join(ModelSize::Small.file_name()).to_string_lossy().as_ref(),
+            WhisperContextParameters::default(),
+        )
+        .expect("load model");
+        // Five minutes of a tone: long enough that finishing it would take far
+        // longer than the abort should.
+        let samples: Vec<f32> = (0..SAMPLE_RATE as usize * 300)
+            .map(|i| (i as f32 * 0.05).sin() * 0.3)
+            .collect();
+        let mut st = ctx.create_state().unwrap();
+        let quitter = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            begin_quit();
+        });
+        let began = std::time::Instant::now();
+        let result = st.full(decoding(), &samples);
+        let took = began.elapsed();
+        quitter.join().unwrap();
+        QUITTING.store(false, Ordering::SeqCst);
+        println!("decode returned {:?} after {took:?}", result.is_ok());
+        assert!(result.is_err(), "the decode ran to the end instead of stopping");
+        assert!(took < std::time::Duration::from_secs(5), "took {took:?} to stop");
+    }
+
     use super::*;
 
     fn word(text: &str, start: f64, end: f64) -> Value {
